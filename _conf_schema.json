@@ -1,0 +1,72 @@
+{
+  "kb_name": {
+    "description": "记忆知识库",
+    "type": "string",
+    "default": "",
+    "_special": "select_knowledgebase",
+    "hint": "选择用于存储长期记忆的知识库（必填，请先在知识库管理中创建，知识库需配置嵌入模型）"
+  },
+  "extraction_provider_id": {
+    "description": "记忆提取模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于从对话中提取记忆的LLM模型（留空则使用会话主LLM）"
+  },
+  "summarization_provider_id": {
+    "description": "记忆总结模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于记忆合并、压缩等总结操作的LLM模型（留空则使用会话主LLM）"
+  },
+  "auto_memorize": {
+    "description": "自动记忆模式",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会在对话后自动提取并存储记忆"
+  },
+  "extraction_interval": {
+    "description": "记忆提取间隔(轮)",
+    "type": "int",
+    "default": 20,
+    "hint": "每N轮对话后触发一次记忆提取，对这N轮对话内容进行总结",
+    "slider": {"min": 5, "max": 200, "step": 1}
+  },
+  "extraction_min_content_length": {
+    "description": "最小提取内容长度",
+    "type": "int",
+    "default": 500,
+    "hint": "对话总内容低于此字符数时跳过记忆提取，避免无意义短对话被记忆"
+  },
+  "global_memory": {
+    "description": "全局记忆模式",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后跨会话召回记忆；关闭后仅召回当前会话的记忆"
+  },
+  "max_memories_per_inject": {
+    "description": "每次注入的记忆数量",
+    "type": "int",
+    "default": 5,
+    "hint": "LLM请求时注入的最大记忆条数"
+  },
+  "max_memories_per_recall": {
+    "description": "记忆召回数量",
+    "type": "int",
+    "default": 10,
+    "hint": "搜索记忆时返回的最大条数"
+  },
+  "memory_domains": {
+    "description": "记忆域配置",
+    "type": "list",
+    "default": ["user_profile", "preferences", "facts", "events", "context"],
+    "hint": "记忆分类域，用于组织不同类型的记忆"
+  },
+  "memory_ttl_days": {
+    "description": "记忆生命周期(天)",
+    "type": "int",
+    "default": 30,
+    "hint": "超过此天数的低频记忆将被压缩为印象"
+  }
+}
