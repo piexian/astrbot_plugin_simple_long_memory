@@ -130,7 +130,8 @@ class MemoryManager:
         Raises:
             ValueError: 知识库未配置或不存在
         """
-        kb_name = self.config.get("kb_name", "")
+        kb_name_raw = self.config.get("kb_name", [])
+        kb_name = kb_name_raw[0] if isinstance(kb_name_raw, list) and kb_name_raw else kb_name_raw
         if not kb_name:
             raise ValueError("记忆知识库未配置，请在插件设置中选择一个知识库")
 
@@ -289,7 +290,7 @@ class MemoryManager:
             记忆列表，每项包含 'text' 和 'metadata'
         """
         if top_k is None:
-            top_k = self.config.get("max_memories_per_recall", 10)
+            top_k = self.config.get("max_memories_per_inject", 5)
 
         global_memory = self.config.get("global_memory", True)
 

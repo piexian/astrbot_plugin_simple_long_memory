@@ -128,9 +128,9 @@ class MemoryPlugin(Star):
     # 请求快照过期时间（秒）
     SNAPSHOT_TTL = 300  # 5 分钟
 
-    def __init__(self, context: Context):
-        super().__init__(context)
-        self.config: dict[str, Any] = {}
+    def __init__(self, context: Context, config=None):
+        super().__init__(context, config)
+        self.config = config or {}
         self.memory_mgr: MemoryManager | None = None
         # 实例级请求快照字典，按 session_key 键控，避免跨用户污染
         # 结构: {session_key: {"snapshots": [...], "timestamp": float}}
@@ -141,11 +141,9 @@ class MemoryPlugin(Star):
 
     async def initialize(self):
         """插件初始化"""
-        # 获取插件配置
-        self.config = self._get_plugin_config() or {}
-
         # 验证必要配置
-        kb_name = self.config.get("kb_name", "")
+        kb_name_raw = self.config.get("kb_name", [])
+        kb_name = kb_name_raw[0] if isinstance(kb_name_raw, list) and kb_name_raw else kb_name_raw
 
         if not kb_name:
             logger.error("[长期记忆] 未配置记忆知识库，插件将不会工作")
@@ -162,15 +160,6 @@ class MemoryPlugin(Star):
         except Exception as e:
             logger.error(f"[长期记忆] 初始化失败: {e}")
             self.memory_mgr = None
-
-    def _get_plugin_config(self) -> dict[str, Any] | None:
-        """获取插件配置"""
-        # 从 context 获取配置
-        if hasattr(self.context, "_config"):
-            config = self.context._config
-            if hasattr(config, "get"):
-                return config.get("astrbot_plugin_simple_long_memory", {})
-        return None
 
     async def terminate(self):
         """插件销毁"""

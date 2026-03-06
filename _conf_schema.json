@@ -1,8 +1,9 @@
 {
   "kb_name": {
     "description": "记忆知识库",
-    "type": "string",
-    "default": "",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
     "_special": "select_knowledgebase",
     "hint": "选择用于存储长期记忆的知识库（必填，请先在知识库管理中创建，知识库需配置嵌入模型）"
   },
@@ -50,12 +51,6 @@
     "type": "int",
     "default": 5,
     "hint": "LLM请求时注入的最大记忆条数"
-  },
-  "max_memories_per_recall": {
-    "description": "记忆召回数量",
-    "type": "int",
-    "default": 10,
-    "hint": "搜索记忆时返回的最大条数"
   },
   "memory_domains": {
     "description": "记忆域配置",
