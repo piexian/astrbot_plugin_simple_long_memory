@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -123,24 +124,37 @@ class MemoryManager:
         self.kb_mgr = kb_mgr
         self.config = config
         self._kb_helper: KBHelper | None = None
+        self._kb_name: str = ""
 
-    async def initialize(self) -> None:
-        """初始化记忆管理器
+    def initialize(self) -> None:
+        """初始化记忆管理器（仅校验配置，不连接 KB）
 
         Raises:
-            ValueError: 知识库未配置或不存在
+            ValueError: 知识库未配置
         """
         kb_name_raw = self.config.get("kb_name", [])
-        kb_name = kb_name_raw[0] if isinstance(kb_name_raw, list) and kb_name_raw else kb_name_raw
+        kb_name = (
+            kb_name_raw[0]
+            if isinstance(kb_name_raw, list) and kb_name_raw
+            else kb_name_raw
+        )
         if not kb_name:
             raise ValueError("记忆知识库未配置，请在插件设置中选择一个知识库")
 
-        kb = await self.kb_mgr.get_kb_by_name(kb_name)
+        self._kb_name = kb_name
+
+    async def connect_kb(self) -> None:
+        """连接知识库（需在 KB 模块就绪后调用）
+
+        Raises:
+            ValueError: 知识库不存在
+        """
+        kb = await self.kb_mgr.get_kb_by_name(self._kb_name)
         if not kb:
-            raise ValueError(f"知识库 '{kb_name}' 不存在，请先在知识库管理中创建")
+            raise ValueError(f"知识库 '{self._kb_name}' 不存在，请先在知识库管理中创建")
 
         self._kb_helper = kb
-        logger.info(f"[长期记忆] 已连接知识库: {kb_name}")
+        logger.info(f"[简单长期记忆] 已连接知识库: {self._kb_name}")
 
     @property
     def vec_db(self):
@@ -148,6 +162,50 @@ class MemoryManager:
         if not self._kb_helper:
             raise RuntimeError("记忆管理器未初始化")
         return self._kb_helper.vec_db
+
+    # ==================== KB 文档注册 ====================
+
+    async def _register_kb_document(
+        self, doc_id: str, doc_name: str, content_size: int
+    ) -> None:
+        """将记忆注册为 KB 文档，使其在知识库界面可见"""
+        from astrbot.core.knowledge_base.models import KBDocument
+
+        doc = KBDocument(
+            doc_id=doc_id,
+            kb_id=self._kb_helper.kb.kb_id,
+            doc_name=doc_name,
+            file_type="memory",
+            file_size=content_size,
+            file_path="",
+            chunk_count=1,
+            media_count=0,
+        )
+        async with self._kb_helper.kb_db.get_db() as session:
+            async with session.begin():
+                session.add(doc)
+                await session.commit()
+
+    async def _unregister_kb_documents(self, doc_ids: list[str]) -> None:
+        """批量移除 KB 文档记录"""
+        if not doc_ids:
+            return
+        from astrbot.core.knowledge_base.models import KBDocument
+        from sqlmodel import col, delete
+
+        async with self._kb_helper.kb_db.get_db() as session:
+            async with session.begin():
+                stmt = delete(KBDocument).where(col(KBDocument.doc_id).in_(doc_ids))
+                await session.execute(stmt)
+                await session.commit()
+
+    async def _sync_kb_stats(self) -> None:
+        """同步知识库统计数据"""
+        await self._kb_helper.kb_db.update_kb_stats(
+            kb_id=self._kb_helper.kb.kb_id,
+            vec_db=self.vec_db,
+        )
+        await self._kb_helper.refresh_kb()
 
     def _build_user_filter(self, event: AstrMessageEvent) -> dict[str, Any]:
         """构建用户隔离的 metadata 过滤器
@@ -259,6 +317,11 @@ class MemoryManager:
             importance=importance,
         )
 
+        # 生成 KB 文档 ID 并关联到向量条目
+        doc_id = str(uuid.uuid4())
+        metadata["kb_doc_id"] = doc_id
+        metadata["kb_id"] = self._kb_helper.kb.kb_id
+
         # 格式化内容
         formatted_content = format_memory_content(content, metadata)
 
@@ -268,7 +331,14 @@ class MemoryManager:
             metadata=metadata,
         )
 
-        logger.debug(f"[长期记忆] 存储记忆: {uri}, 用户: {metadata['user_id']}")
+        # 注册为 KB 文档（界面可见）
+        try:
+            await self._register_kb_document(doc_id, uri, len(formatted_content))
+            await self._sync_kb_stats()
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] KB 文档注册失败（不影响记忆功能）: {e}")
+
+        logger.debug(f"[简单长期记忆] 存储记忆: {uri}, 用户: {metadata['user_id']}")
         return uri
 
     async def recall_memories(
@@ -301,10 +371,12 @@ class MemoryManager:
         if domain:
             filters["domain"] = domain
 
-        # 调用向量检索
+        # 调用向量检索（若知识库配置了重排序模型则自动启用）
+        use_rerank = self.config.get("use_reranker", True)
         results = await self.vec_db.retrieve(
             query=query,
             k=top_k,
+            rerank=use_rerank,
             metadata_filters=filters,
         )
 
@@ -322,7 +394,7 @@ class MemoryManager:
                 }
             )
 
-        logger.debug(f"[长期记忆] 召回 {len(memories)} 条记忆")
+        logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
 
     async def forget_memory(
@@ -342,8 +414,29 @@ class MemoryManager:
         filters = self._build_user_filter(event)
         filters["uri"] = uri
 
+        # 查询 kb_doc_id 以便同步删除 KB 文档记录
+        doc_ids = []
+        try:
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters, limit=10
+            )
+            for doc in docs:
+                md = _safe_parse_metadata(doc.get("metadata", {}))
+                if md.get("kb_doc_id"):
+                    doc_ids.append(md["kb_doc_id"])
+        except Exception:
+            pass
+
         await self.vec_db.delete_documents(metadata_filters=filters)
-        logger.info(f"[长期记忆] 删除记忆: {uri}")
+
+        # 同步删除 KB 文档记录
+        try:
+            await self._unregister_kb_documents(doc_ids)
+            await self._sync_kb_stats()
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] KB 文档删除失败: {e}")
+
+        logger.info(f"[简单长期记忆] 删除记忆: {uri}")
         return True
 
     async def clear_memories(
@@ -364,30 +457,50 @@ class MemoryManager:
         if domain:
             filters["domain"] = domain
 
-        # 先统计数量
-        count = await self.vec_db.count_documents(metadata_filter=filters)
+        # 查询 kb_doc_id 列表
+        doc_ids = []
+        try:
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters, limit=10000
+            )
+            count = len(docs)
+            for doc in docs:
+                md = _safe_parse_metadata(doc.get("metadata", {}))
+                if md.get("kb_doc_id"):
+                    doc_ids.append(md["kb_doc_id"])
+        except Exception:
+            count = await self.vec_db.count_documents(metadata_filter=filters)
 
         # 执行删除
         await self.vec_db.delete_documents(metadata_filters=filters)
 
-        logger.info(f"[长期记忆] 清空 {count} 条记忆, 用户: {filters['user_id']}")
+        # 同步删除 KB 文档记录
+        try:
+            await self._unregister_kb_documents(doc_ids)
+            await self._sync_kb_stats()
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] KB 文档批量删除失败: {e}")
+
+        logger.info(f"[简单长期记忆] 清空 {count} 条记忆, 用户: {filters['user_id']}")
         return count
 
     async def list_memories(
         self,
         event: AstrMessageEvent,
         domain: str | None = None,
-        limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        """列出用户的所有记忆
+        page: int = 1,
+        page_size: int = 10,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """列出用户的记忆（分页）
 
         Args:
             event: 消息事件
             domain: 记忆域过滤（可选）
-            limit: 最大返回数量
+            page: 页码（从 1 开始）
+            page_size: 每页数量
 
         Returns:
-            记忆列表
+            (记忆列表, 总数)
         """
         filters = self._build_user_filter(event)
         filters["deprecated"] = False
@@ -395,10 +508,13 @@ class MemoryManager:
         if domain:
             filters["domain"] = domain
 
-        # 使用 document_storage 直接查询
+        total = await self.vec_db.count_documents(metadata_filter=filters)
+        offset = (page - 1) * page_size
+
         docs = await self.vec_db.document_storage.get_documents(
             metadata_filters=filters,
-            limit=limit,
+            offset=offset,
+            limit=page_size,
         )
 
         memories = []
@@ -412,7 +528,7 @@ class MemoryManager:
                 }
             )
 
-        return memories
+        return memories, total
 
     async def get_memory_by_uri(
         self,
@@ -486,7 +602,9 @@ class MemoryManager:
         if best_match:
             # 高相似度：创建新版本（简化处理，不自动合并）
             old_uri = best_match["metadata"].get("uri", "")
-            logger.info(f"[长期记忆] 发现相似记忆: {old_uri}, 相似度: {best_score:.2f}")
+            logger.info(
+                f"[简单长期记忆] 发现相似记忆: {old_uri}, 相似度: {best_score:.2f}"
+            )
             # 返回提示，让调用方决定是否合并
             return f"found_similar:{old_uri}:{best_score:.2f}"
         else:

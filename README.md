@@ -4,11 +4,12 @@
 
 ## 功能特性
 
-- **记忆存储与召回**：自动在 LLM 请求前注入相关记忆上下文
-- **用户隔离**：每个用户的记忆完全隔离，互不干扰
+- **自动记忆提取**：每隔 N 轮对话自动调用 LLM 从对话中提取值得记忆的信息
+- **记忆注入**：在每次 LLM 请求前，自动召回相关记忆并注入到对话上下文
+- **用户隔离**：通过 `user_id` 实现用户级记忆隔离，互不干扰
 - **全局/会话记忆**：支持跨会话的全局记忆模式和仅当前会话的记忆模式
 - **LLM 工具**：提供 `memory_recall`、`memory_store`、`memory_forget` 工具供 AI 主动操作
-- **用户命令**：通过 `/memory` 命令管理记忆
+- **用户命令**：通过 `/memory` 指令组管理记忆
 
 ## 安装
 
@@ -19,54 +20,79 @@
 
 ## 配置说明
 
-| 配置项 | 说明 | 必填 |
-|--------|------|------|
-| kb_name | 记忆知识库 | 是 |
-| extraction_provider_id | 记忆提取模型（留空使用会话主LLM） | 否 |
-| summarization_provider_id | 记忆总结模型（留空使用会话主LLM） | 否 |
-| auto_memorize | 自动记忆模式开关 | 否 |
-| extraction_interval | 记忆提取间隔（每N轮对话提取一次，范围5-200，默认20） | 否 |
-| extraction_min_content_length | 最小提取内容长度（低于此值跳过提取，默认500） | 否 |
-| global_memory | 全局记忆模式 | 否 |
-| max_memories_per_inject | 每次注入的记忆数量 | 否 |
-| max_memories_per_recall | 记忆召回数量 | 否 |
-| memory_domains | 记忆域配置 | 否 |
-| memory_ttl_days | 记忆生命周期(天) | 否 |
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| kb_name | 记忆知识库（必填） | — |
+| extraction_provider_id | 记忆提取 LLM 模型 | 留空使用会话主 LLM |
+| summarization_provider_id | 记忆总结 LLM 模型（预留） | 留空使用会话主 LLM |
+| auto_memorize | 自动记忆模式开关 | `true` |
+| extraction_interval | 每 N 轮对话触发一次记忆提取 | `20` |
+| extraction_min_content_length | 对话总长度低于此值时跳过提取 | `500` |
+| global_memory | 全局记忆模式（跨会话召回） | `true` |
+| max_memories_per_inject | 每次 LLM 请求注入的最大记忆条数 | `5` |
+| memory_domains | 记忆分类域 | `["user_profile", "preferences", "facts", "events", "context"]` |
+| memory_ttl_days | 记忆生命周期（天） | `30` |
+| install_skill | 安装 AI 记忆指南 Skill | `false` |
+| use_reranker | 记忆召回时启用重排序（需知识库已配置重排序模型） | `true` |
 
 ## 使用方法
 
 ### 用户命令
 
 ```
-/memory list [domain]    - 列出记忆
-/memory search <query>   - 搜索记忆
-/memory forget <uri>     - 删除记忆
-/memory clear            - 清空所有记忆
-/memory stats            - 查看统计
+/memory list [页码]      - 列出记忆（支持翻页）
+/memory search <关键词>  - 搜索记忆
+/memory stats            - 查看记忆统计
+/memory test             - 测试记忆读写功能
+/memory forget <uri>     - 删除指定记忆（管理员）
+/memory clear            - 清空所有记忆（管理员）
 ```
+
+> `forget` 和 `clear` 需要管理员权限。
 
 ### LLM 工具
 
 AI 可以通过以下工具主动操作记忆：
 
-- `memory_recall(query)` - 搜索长期记忆
-- `memory_store(content, memory_type, disclosure)` - 存储记忆
-- `memory_forget(uri)` - 删除记忆
+- `memory_recall(query)` — 搜索长期记忆
+- `memory_store(content, memory_type, disclosure)` — 存储记忆
+- `memory_forget(uri)` — 删除记忆
+
+### 记忆类型
+
+| memory_type | 说明 |
+|-------------|------|
+| `fact` | 用户主动告知的客观信息 |
+| `preference` | 用户表达的喜好、习惯、风格 |
+| `event` | 计划、纪念日、里程碑等事件 |
+| `context` | 正在进行的项目或当前状况 |
 
 ## 工作原理
 
-1. **记忆注入**：在每次 LLM 请求前，根据用户输入召回相关记忆并注入到用户消息的最前面（prompt 前置）
-2. **用户隔离**：通过 metadata 中的 `user_id` 字段实现用户级别的记忆隔离
-3. **记忆存储**：记忆以向量形式存储在知识库中，支持语义检索
+1. **记忆注入**：在每次 LLM 请求前，根据用户输入通过 embedding 检索召回相关记忆，以 `user` 角色注入到对话上下文顶部（不占用 system prompt）
+2. **自动提取**：每隔 `extraction_interval` 轮对话，将累积的对话内容发送给 LLM 提取值得记忆的信息并自动存储
+3. **用户隔离**：所有记忆操作通过 metadata 中的 `user_id` 字段过滤，确保用户间记忆完全隔离
+4. **记忆存储**：记忆以向量形式存储在知识库中，支持语义检索
 
 ## 注意事项
 
 - 请确保先创建知识库并配置嵌入模型
 - 记忆数据存储在知识库中，删除知识库将丢失所有记忆
+- **请勿将记忆知识库挂载到 AstrBot 全局知识库配置中**。本插件通过 `user_id` 实现用户级记忆隔离，而 AstrBot 原生知识库检索不支持用户隔离，挂载后会导致所有用户共享彼此的记忆。仅个人独占使用时可忽略此限制
+
+## AI 记忆 Skill（可选）
+
+本插件内置了一个 Skill 文件，可引导 AI 主动使用记忆工具（而非被动等待调用）。
+
+### 启用方法
+
+1. 在「使用电脑能力」中将运行环境设置为 `local` 或 `sandbox`
+2. 在本插件配置中开启 **安装记忆 Skill**
+3. 重启或重载插件，Skill 将自动安装到 AstrBot 的 skills 目录并激活
 
 
 <div align="center">
 
-**如果这个插件对你有帮助，请给个 ⭐ Star 支持一下！**
+**如果这个插件对你有帮助，请给个 Star 支持一下！**
 
 </div>
