@@ -139,6 +139,69 @@ def _build_recall_query(prompt: str, contexts: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
+    """从 event.message_str 提取命令名之后的原始参数文本
+
+    AstrBot 在进入 handler 前已剥离 wake prefix（如 /），
+    因此 event.message_str 实际格式为 "memory list 1" 而非 "/memory list 1"。
+    内部先做与 AstrBot 一致的空白规范化再截断命令名。
+    """
+    msg = re.sub(r"\s+", " ", event.message_str.strip())
+    if msg.startswith(full_cmd):
+        remainder = msg[len(full_cmd) :].strip()
+        return remainder
+    return msg
+
+
+def _parse_memory_flags(args_text: str) -> dict[str, Any]:
+    """解析 --all / --user <id> / --to <name> / --clear-cache 标志
+
+    Returns:
+        {"all": bool, "user": str, "to": str, "clear_cache": bool,
+         "positional": str,
+         "user_missing_value": bool, "to_missing_value": bool,
+         "unknown_flags": list[str]}
+    """
+    result: dict[str, Any] = {
+        "all": False,
+        "user": "",
+        "to": "",
+        "clear_cache": False,
+        "positional": "",
+        "user_missing_value": False,
+        "to_missing_value": False,
+        "unknown_flags": [],
+    }
+    tokens = args_text.split()
+    i = 0
+    positional_parts = []
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--all":
+            result["all"] = True
+        elif token == "--user":
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                result["user"] = tokens[i]
+            else:
+                result["user_missing_value"] = True
+        elif token == "--to":
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                result["to"] = tokens[i]
+            else:
+                result["to_missing_value"] = True
+        elif token == "--clear-cache":
+            result["clear_cache"] = True
+        elif token.startswith("--"):
+            result["unknown_flags"].append(token)
+        else:
+            positional_parts.append(token)
+        i += 1
+    result["positional"] = " ".join(positional_parts).strip()
+    return result
+
+
 class MemoryPlugin(Star):
     """长期记忆插件"""
 
@@ -162,6 +225,9 @@ class MemoryPlugin(Star):
             self.memory_mgr = MemoryManager(
                 kb_mgr=self.context.kb_manager,
                 config=self.config,
+                kv_put=self.put_kv_data,
+                kv_get=self.get_kv_data,
+                kv_delete=self.delete_kv_data,
             )
             self.memory_mgr.initialize()
         except Exception as e:
@@ -182,6 +248,9 @@ class MemoryPlugin(Star):
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         if not self.memory_mgr or self.memory_mgr._kb_helper is not None:
+            # KB 已连接（热重载场景），但仍需检查中断恢复
+            if self.memory_mgr:
+                await self._recover_interrupted_rebuild()
             return
         try:
             await self.memory_mgr.connect_kb()
@@ -193,6 +262,71 @@ class MemoryPlugin(Star):
 
         if self.config.get("install_skill", False):
             self._install_skill()
+
+        # 检测上次中断的重建：恢复缓冲写入
+        await self._recover_interrupted_rebuild()
+
+    async def _recover_interrupted_rebuild(self) -> None:
+        """启动时检测并恢复上次中断的重建
+
+        恢复优先级：
+        1. 主数据快照 (rebuild_memory_records) — 从中断点继续重建
+        2. 缓冲写入 (rebuild_pending_writes) — flush 未处理的写入
+        无论主数据快照是否恢复成功，都继续处理缓冲写入。
+        """
+        if not self.memory_mgr:
+            return
+
+        # 优先恢复主数据快照（更严重的崩溃场景）
+        try:
+            rebuild_status = await self.get_kv_data("rebuild_status", None)
+            memory_records = await self.get_kv_data("rebuild_memory_records", None)
+
+            if (
+                rebuild_status in {"in_progress", "interrupted"}
+                and memory_records
+                and isinstance(memory_records, list)
+            ):
+                logger.warning(
+                    f"[简单长期记忆] 检测到未完成的重建，"
+                    f"状态: {rebuild_status}, "
+                    f"主数据快照 {len(memory_records)} 条，正在恢复..."
+                )
+                # 从 KV 快照继续重建（不重新拉取源 KB，因为可能已被清空）
+                recovery_result = await self.memory_mgr._resume_rebuild_from_snapshot(
+                    memory_records
+                )
+                recovered = recovery_result["success"]
+                remaining_records = recovery_result["remaining_records"]
+
+                if recovered:
+                    logger.info(f"[简单长期记忆] 主数据快照恢复完成: {recovered} 条")
+
+                if remaining_records:
+                    logger.warning(
+                        f"[简单长期记忆] 仍有 {len(remaining_records)} 条快照"
+                        "未恢复，已保留到 KV，等待下次继续恢复"
+                    )
+                    await self.put_kv_data("rebuild_memory_records", remaining_records)
+                else:
+                    await self.delete_kv_data("rebuild_memory_records")
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 恢复主数据快照失败: {e}")
+
+        # 无论主数据快照是否恢复成功，都继续恢复缓冲写入
+        try:
+            pending = await self.get_kv_data("rebuild_pending_writes", None)
+            if not pending or not isinstance(pending, list):
+                return
+            self.memory_mgr._pending_writes = pending
+            flushed = await self.memory_mgr._flush_pending_writes()
+            if flushed:
+                logger.info(
+                    f"[简单长期记忆] 已恢复上次中断的缓冲写入: "
+                    f"{len(pending)} 条中写入 {flushed} 条"
+                )
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 恢复缓冲写入失败: {e}")
 
     def _install_skill(self) -> None:
         """安装记忆 Skill 到 AstrBot skills 目录"""
@@ -223,6 +357,16 @@ class MemoryPlugin(Star):
     async def terminate(self):
         """插件销毁"""
         logger.info("[简单长期记忆] 插件已卸载")
+
+    def _get_cmd_prefix(self) -> str:
+        """从 AstrBot 配置读取命令前缀，默认 /"""
+        try:
+            prefixes = self.context.astrbot_config.get("wake_prefix", [])
+            if prefixes and isinstance(prefixes, list):
+                return prefixes[0]
+        except Exception:
+            pass
+        return "/"
 
     async def _get_llm_provider_id(
         self, event: AstrMessageEvent, provider_type: str
@@ -651,43 +795,105 @@ class MemoryPlugin(Star):
         pass
 
     @memory_group.command("list")
-    async def cmd_list(self, event: AstrMessageEvent, page: int = 1):
-        """列出记忆 /memory list [页码]"""
+    async def cmd_list(self, event: AstrMessageEvent):
+        """列出记忆 /memory list [--all] [页码]"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
             return
-        page = max(1, page)
+        args = _parse_memory_flags(_parse_command_args(event, "memory list"))
+        if args["user_missing_value"]:
+            yield event.plain_result("--user 需要指定用户 ID")
+            return
+        if args["unknown_flags"]:
+            yield event.plain_result(f"未知参数: {', '.join(args['unknown_flags'])}")
+            return
+        if args["user"]:
+            yield event.plain_result("list 命令不支持 --user 参数")
+            return
+        all_users = args["all"]
+        if all_users and not event.is_admin():
+            yield event.plain_result("--all 标志需要管理员权限")
+            return
+        # 解析页码
+        page = 1
+        positional = args["positional"]
+        if positional:
+            try:
+                page = max(1, int(positional))
+            except ValueError:
+                pass
         page_size = 10
         memories, total = await self.memory_mgr.list_memories(
-            event, page=page, page_size=page_size
+            event, page=page, page_size=page_size, all_users=all_users
         )
+        scope = "全局" if all_users else "个人"
         result = format_memory_for_user(
-            memories, page=page, total=total, page_size=page_size
+            memories,
+            page=page,
+            total=total,
+            page_size=page_size,
+            all_mode=all_users,
+            cmd_prefix=self._get_cmd_prefix(),
         )
-        yield event.plain_result(result)
+        yield event.plain_result(f"[{scope}记忆]\n{result}")
 
     @memory_group.command("search")
-    async def cmd_search(self, event: AstrMessageEvent, query: str = ""):
-        """搜索记忆 /memory search <关键词>"""
+    async def cmd_search(self, event: AstrMessageEvent):
+        """搜索记忆 /memory search [--all] <关键词>"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
             return
+        args = _parse_memory_flags(_parse_command_args(event, "memory search"))
+        if args["user_missing_value"]:
+            yield event.plain_result("--user 需要指定用户 ID")
+            return
+        if args["unknown_flags"]:
+            yield event.plain_result(f"未知参数: {', '.join(args['unknown_flags'])}")
+            return
+        if args["user"]:
+            yield event.plain_result("search 命令不支持 --user 参数")
+            return
+        all_users = args["all"]
+        if all_users and not event.is_admin():
+            yield event.plain_result("--all 标志需要管理员权限")
+            return
+        query = args["positional"]
         if not query:
             yield event.plain_result("请提供搜索关键词")
             return
-        memories = await self.memory_mgr.recall_memories(event, query)
-        result = format_memory_for_user(memories, total=len(memories))
-        yield event.plain_result(result)
+        memories = await self.memory_mgr.recall_memories(
+            event, query, all_users=all_users
+        )
+        scope = "全局" if all_users else "个人"
+        result = format_memory_for_user(
+            memories, total=len(memories), cmd_prefix=self._get_cmd_prefix()
+        )
+        yield event.plain_result(f"[{scope}搜索]\n{result}")
 
     @memory_group.command("stats")
     async def cmd_stats(self, event: AstrMessageEvent):
-        """查看记忆统计 /memory stats"""
+        """查看记忆统计 /memory stats [--all]"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
             return
-        stats = await self.memory_mgr.get_memory_stats(event)
+        args = _parse_memory_flags(_parse_command_args(event, "memory stats"))
+        if args["user_missing_value"]:
+            yield event.plain_result("--user 需要指定用户 ID")
+            return
+        if args["unknown_flags"]:
+            yield event.plain_result(f"未知参数: {', '.join(args['unknown_flags'])}")
+            return
+        if args["user"]:
+            yield event.plain_result("stats 命令不支持 --user 参数")
+            return
+        all_users = args["all"]
+        if all_users and not event.is_admin():
+            yield event.plain_result("--all 标志需要管理员权限")
+            return
+        stats = await self.memory_mgr.get_memory_stats(event, all_users=all_users)
+        scope = "全局" if all_users else "个人"
         result = (
-            f"记忆统计:\n"
+            f"[{scope}记忆统计]\n"
             f"  总数: {stats['total']}\n"
             f"  永久记忆: {stats['permanent']}\n"
             f"  普通记忆: {stats['normal']}\n"
@@ -697,38 +903,223 @@ class MemoryPlugin(Star):
 
     @memory_group.command("test")
     async def cmd_test(self, event: AstrMessageEvent):
-        """测试记忆读写 /memory test"""
+        """测试记忆读写（管理员）/memory test"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
+            return
+        args_text = _parse_command_args(event, "memory test")
+        if args_text:
+            yield event.plain_result(f"未知参数: {args_text}")
+            return
+        if not event.is_admin():
+            yield event.plain_result("该操作需要管理员权限")
             return
         yield event.plain_result(await self._run_memory_test(event))
 
     @memory_group.command("forget")
-    async def cmd_forget(self, event: AstrMessageEvent, uri: str = ""):
-        """删除记忆（管理员）/memory forget <uri>"""
+    async def cmd_forget(self, event: AstrMessageEvent):
+        """删除记忆（管理员）/memory forget <uri> [--user <id>]"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
             return
         if not event.is_admin():
             yield event.plain_result("该操作需要管理员权限")
             return
+        args = _parse_memory_flags(_parse_command_args(event, "memory forget"))
+        if args["user_missing_value"]:
+            yield event.plain_result("--user 需要指定用户 ID")
+            return
+        if args["unknown_flags"]:
+            yield event.plain_result(f"未知参数: {', '.join(args['unknown_flags'])}")
+            return
+        target_user_id = args["user"]
+        uri = args["positional"]
         if not uri:
             yield event.plain_result("请提供要删除的记忆 URI")
             return
-        await self.memory_mgr.forget_memory(event, uri)
-        yield event.plain_result(f"已删除记忆: {uri}")
+        if target_user_id:
+            await self.memory_mgr.forget_memory_by_user(event, uri, target_user_id)
+            yield event.plain_result(f"已删除用户 {target_user_id} 的记忆: {uri}")
+        else:
+            await self.memory_mgr.forget_memory(event, uri)
+            yield event.plain_result(f"已删除记忆: {uri}")
 
     @memory_group.command("clear")
     async def cmd_clear(self, event: AstrMessageEvent):
-        """清空所有记忆（管理员）/memory clear"""
+        """清空记忆（管理员）/memory clear [--all] [--user <id>]"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
             return
         if not event.is_admin():
             yield event.plain_result("该操作需要管理员权限")
             return
-        count = await self.memory_mgr.clear_memories(event)
-        yield event.plain_result(f"已清空 {count} 条记忆")
+        args = _parse_memory_flags(_parse_command_args(event, "memory clear"))
+        if args["user_missing_value"]:
+            yield event.plain_result("--user 需要指定用户 ID")
+            return
+        if args["unknown_flags"]:
+            yield event.plain_result(f"未知参数: {', '.join(args['unknown_flags'])}")
+            return
+        if args["positional"]:
+            yield event.plain_result(f"未知参数: {args['positional']}")
+            return
+        if args["all"] and args["user"]:
+            yield event.plain_result("--all 与 --user 不可同时使用")
+            return
+        if args["all"]:
+            count = await self.memory_mgr.clear_memories(event, all_users=True)
+            yield event.plain_result(f"已清空全部 {count} 条记忆")
+        elif args["user"]:
+            target_user_id = args["user"]
+            count = await self.memory_mgr.clear_memories_by_user(event, target_user_id)
+            yield event.plain_result(f"已清空用户 {target_user_id} 的 {count} 条记忆")
+        else:
+            count = await self.memory_mgr.clear_memories(event)
+            yield event.plain_result(f"已清空 {count} 条记忆")
+
+    @memory_group.command("rebuild")
+    async def cmd_rebuild(self, event: AstrMessageEvent):
+        """重建或迁移记忆（管理员）/memory rebuild [--to <知识库名>] [--clear-cache]"""
+        if not self.memory_mgr:
+            yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
+            return
+        if not event.is_admin():
+            yield event.plain_result("该操作需要管理员权限")
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory rebuild"))
+        if args["user_missing_value"]:
+            yield event.plain_result("--user 需要指定用户 ID")
+            return
+        if args["to_missing_value"]:
+            yield event.plain_result(
+                "需要指定知识库名称，用法: /memory rebuild --to <知识库名>"
+            )
+            return
+        if args["unknown_flags"]:
+            yield event.plain_result(f"未知参数: {', '.join(args['unknown_flags'])}")
+            return
+        if args["positional"]:
+            yield event.plain_result(f"未知参数: {args['positional']}")
+            return
+        if args["all"] or args["user"]:
+            yield event.plain_result("rebuild 命令不支持 --all 或 --user 参数")
+            return
+
+        # --clear-cache: 清理重建缓存
+        if args["clear_cache"]:
+            if args["to"]:
+                yield event.plain_result("--clear-cache 不能与 --to 同时使用")
+                return
+            cache_status = await self.memory_mgr.get_rebuild_cache_status()
+            result = await self.memory_mgr.clear_rebuild_cache()
+            report = "[清理重建缓存]\n"
+            report += f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
+            report += f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
+            report += f"  上次状态: {cache_status.get('status', '无')}\n"
+            report += "  清理结果:\n"
+            for key, ok in result.items():
+                report += f"    {key}: {'成功' if ok else '失败'}\n"
+            yield event.plain_result(report)
+            return
+
+        target_kb_name = args["to"] or None
+
+        # --to 与当前 KB 同名时视为原地重建
+        if target_kb_name and self.memory_mgr._kb_name == target_kb_name:
+            target_kb_name = None
+
+        if target_kb_name:
+            yield event.plain_result(
+                f"正在迁移记忆到知识库 '{target_kb_name}'，请稍候..."
+            )
+        else:
+            yield event.plain_result("正在当前知识库重建所有记忆，请稍候...")
+
+        try:
+            result = await self.memory_mgr.rebuild_memories(
+                target_kb_name=target_kb_name,
+            )
+            status = result.get("status", "completed")
+            is_interrupted = status == "interrupted"
+
+            if is_interrupted:
+                # 失败路径：明确告知异常终止
+                mode = "迁移" if result["is_migration"] else "重建"
+                error_msg = result.get("error", "未知错误")
+                report = (
+                    f"[{mode}异常终止]\n"
+                    f"  原因: {error_msg}\n"
+                    f"  已处理: {result['success']} 条\n"
+                    f"  缓冲写入: {result.get('pending_flushed', 0)} 条"
+                )
+                report += (
+                    "\n\n  重建缓存已保留，请排查问题后重试。"
+                    "\n  确认无需恢复后可执行:"
+                    "\n  /memory rebuild --clear-cache"
+                )
+                yield event.plain_result(report)
+                return
+
+            mode = "迁移" if result["is_migration"] else "重建"
+            report = (
+                f"[{mode}完成]\n"
+                f"  目标知识库: {result['target_kb']}\n"
+                f"  总计: {result['total']}\n"
+                f"  成功: {result['success']}\n"
+                f"  失败: {result['failed']}"
+            )
+            if result["pending_flushed"]:
+                report += f"\n  缓冲写入: {result['pending_flushed']} 条"
+
+            # 完整性校验结果
+            v = result.get("verification", {})
+            if v:
+                report += "\n\n[完整性校验]"
+                if v.get("error"):
+                    report += f"\n  校验异常: {v['error']}"
+                elif v["passed"]:
+                    report += (
+                        f"\n  状态: 通过"
+                        f"\n  预期: {v['expected']} 条, "
+                        f"实际: {v['actual']} 条"
+                    )
+                else:
+                    report += (
+                        f"\n  状态: 不一致"
+                        f"\n  预期: {v['expected']} 条, "
+                        f"实际: {v['actual']} 条, "
+                        f"差异: {v['diff']:+d} 条"
+                    )
+
+            # 迁移提示：仅当实际提交成功时显示切换信息
+            if result["is_migration"]:
+                committed = result.get("migration_committed", False)
+                if committed:
+                    report += f"\n\n  插件已切换到知识库: {result['target_kb']}"
+                    report += (
+                        "\n  注意: 请同步更新插件配置中的知识库选项，"
+                        "否则重启后将回退到旧知识库"
+                    )
+                else:
+                    report += "\n\n  迁移未完成（存在失败），插件仍使用原知识库"
+
+            if v and v.get("passed"):
+                report += (
+                    "\n\n  数据校验通过，请确认记忆无误后执行:"
+                    "\n  /memory rebuild --clear-cache"
+                )
+            elif v and not v.get("passed") and not v.get("error"):
+                report += (
+                    "\n\n  数据校验未通过，请排查后重试。"
+                    "重建缓存已保留，可执行:"
+                    "\n  /memory rebuild --clear-cache 清理缓存"
+                )
+
+            yield event.plain_result(report)
+        except ValueError as e:
+            yield event.plain_result(str(e))
+        except Exception as e:
+            yield event.plain_result(f"重建失败: {e}")
 
     async def _run_memory_test(self, event: AstrMessageEvent) -> str:
         """执行一次记忆写入-读取测试并返回报告"""

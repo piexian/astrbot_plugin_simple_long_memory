@@ -292,6 +292,8 @@ def format_memory_for_user(
     page: int = 1,
     total: int = 0,
     page_size: int = 10,
+    all_mode: bool = False,
+    cmd_prefix: str = "/",
 ) -> str:
     """格式化记忆用于用户展示
 
@@ -300,6 +302,8 @@ def format_memory_for_user(
         page: 当前页码
         total: 总记忆数
         page_size: 每页数量
+        all_mode: 是否为全局模式（--all）
+        cmd_prefix: 命令前缀
 
     Returns:
         格式化后的记忆列表
@@ -330,6 +334,7 @@ def format_memory_for_user(
             lines.append(f"   召回: {meta.recall_count}次")
 
     if total_pages > 1:
-        lines.append(f"\n提示: /memory list {page + 1} 查看下一页")
+        all_flag = " --all" if all_mode else ""
+        lines.append(f"\n提示: {cmd_prefix}memory list{all_flag} {page + 1} 查看下一页")
 
     return "\n".join(lines)
