@@ -170,6 +170,35 @@ class MemoryManager:
 
         self._kb_helper = kb
         logger.info(f"[简单长期记忆] 已连接知识库: {self._kb_name}")
+        await self._migrate_patch_chunk_index()
+
+    async def _migrate_patch_chunk_index(self) -> None:
+        """迁移补丁：为缺少 chunk_index 字段的旧记忆条目写入默认值 0。
+
+        旧版插件直接写入 vec_db 时未设置 chunk_index，导致 AstrBot 知识库检索
+        界面调用稀疏检索时抛出 KeyError: 'chunk_index'。
+        通过 SQLite json_set 原地修改 metadata，无需重新嵌入向量。
+        """
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session, session.begin():
+                from sqlalchemy import text as sa_text
+
+                result = await session.execute(
+                    sa_text(
+                        "UPDATE documents "
+                        "SET metadata = json_set(metadata, '$.chunk_index', 0) "
+                        "WHERE json_extract(metadata, '$.is_memory_record') = 1 "
+                        "  AND json_extract(metadata, '$.chunk_index') IS NULL"
+                    )
+                )
+                patched = result.rowcount
+                if patched:
+                    logger.info(
+                        f"[简单长期记忆] 迁移补丁：已为 {patched} 条旧记忆补写 chunk_index=0"
+                    )
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 迁移补丁执行失败（不影响功能）: {e}")
 
     @property
     def vec_db(self):
