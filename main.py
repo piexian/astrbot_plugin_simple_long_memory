@@ -918,12 +918,9 @@ class MemoryPlugin(Star):
 
     @memory_group.command("forget")
     async def cmd_forget(self, event: AstrMessageEvent):
-        """删除记忆（管理员）/memory forget <uri> [--user <id>]"""
+        """删除记忆 /memory forget <uri> [--user <id>]"""
         if not self.memory_mgr:
             yield event.plain_result("长期记忆插件未正确初始化，请检查配置")
-            return
-        if not event.is_admin():
-            yield event.plain_result("该操作需要管理员权限")
             return
         args = _parse_memory_flags(_parse_command_args(event, "memory forget"))
         if args["user_missing_value"]:
@@ -937,12 +934,40 @@ class MemoryPlugin(Star):
         if not uri:
             yield event.plain_result("请提供要删除的记忆 URI")
             return
+
+        is_admin = event.is_admin()
+
+        if target_user_id and not is_admin:
+            yield event.plain_result("--user 参数仅管理员可用")
+            return
+
         if target_user_id:
-            await self.memory_mgr.forget_memory_by_user(event, uri, target_user_id)
-            yield event.plain_result(f"已删除用户 {target_user_id} 的记忆: {uri}")
+            # 管理员删除指定用户的记忆
+            deleted = await self.memory_mgr.forget_memory_by_user(
+                event, uri, target_user_id
+            )
+            if deleted == 0:
+                yield event.plain_result(f"未找到用户 {target_user_id} 的记忆: {uri}")
+            else:
+                yield event.plain_result(
+                    f"已删除用户 {target_user_id} 的 {deleted} 条记忆: {uri}"
+                )
+        elif is_admin:
+            # 管理员按 URI 删除所有用户
+            deleted = await self.memory_mgr.forget_memory_by_uri(uri)
+            if deleted == 0:
+                yield event.plain_result(f"未找到匹配的记忆: {uri}")
+            else:
+                yield event.plain_result(f"已删除 {deleted} 条记忆: {uri}")
         else:
-            await self.memory_mgr.forget_memory(event, uri)
-            yield event.plain_result(f"已删除记忆: {uri}")
+            # 普通用户只能删自己的
+            deleted, owned_by_other = await self.memory_mgr.forget_memory(event, uri)
+            if deleted > 0:
+                yield event.plain_result(f"已删除记忆: {uri}")
+            elif owned_by_other:
+                yield event.plain_result("该记忆不属于你，无法删除")
+            else:
+                yield event.plain_result(f"未找到记忆: {uri}")
 
     @memory_group.command("clear")
     async def cmd_clear(self, event: AstrMessageEvent):
@@ -1232,5 +1257,9 @@ class MemoryPlugin(Star):
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
-        await self.memory_mgr.forget_memory(event, uri)
-        return f"Memory deleted: {uri}"
+        deleted, owned_by_other = await self.memory_mgr.forget_memory(event, uri)
+        if deleted == 0:
+            if owned_by_other:
+                return f"Cannot delete memory {uri}: it belongs to another user. Ask an admin to delete it."
+            return f"Memory not found: {uri}"
+        return f"Memory deleted: {uri} ({deleted} record(s))"

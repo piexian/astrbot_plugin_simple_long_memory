@@ -178,6 +178,7 @@ class MemoryManager:
         旧版插件直接写入 vec_db 时未设置 chunk_index，导致 AstrBot 知识库检索
         界面调用稀疏检索时抛出 KeyError: 'chunk_index'。
         通过 SQLite json_set 原地修改 metadata，无需重新嵌入向量。
+        覆盖范围：有 is_memory_record 标记的新版记录 + 有 uri 但无标记的更早记录。
         """
         try:
             doc_storage = self.vec_db.document_storage
@@ -188,8 +189,9 @@ class MemoryManager:
                     sa_text(
                         "UPDATE documents "
                         "SET metadata = json_set(metadata, '$.chunk_index', 0) "
-                        "WHERE json_extract(metadata, '$.is_memory_record') = 1 "
-                        "  AND json_extract(metadata, '$.chunk_index') IS NULL"
+                        "WHERE json_extract(metadata, '$.chunk_index') IS NULL "
+                        "  AND (json_extract(metadata, '$.is_memory_record') = 1 "
+                        "       OR json_extract(metadata, '$.uri') IS NOT NULL)"
                     )
                 )
                 patched = result.rowcount
@@ -389,6 +391,18 @@ class MemoryManager:
         if uri is None:
             uri = str(MemoryURI.generate(domain))
 
+        # URI 去重：同名 URI 已存在时，内容相同则跳过，内容不同则换新 URI
+        existing = await self.vec_db.document_storage.get_documents(
+            metadata_filters={"uri": uri}, limit=1
+        )
+        if existing:
+            old_text = existing[0].get("text", "")
+            if old_text.strip() == content.strip():
+                logger.debug(f"[简单长期记忆] 内容重复，跳过写入: {uri}")
+                return uri
+            uri = str(MemoryURI.generate(domain))
+            logger.debug(f"[简单长期记忆] URI 冲突且内容不同，已重新生成: {uri}")
+
         metadata = self._build_memory_metadata(
             event,
             domain=domain,
@@ -494,24 +508,51 @@ class MemoryManager:
         self,
         event: AstrMessageEvent,
         uri: str,
-    ) -> bool:
-        """删除指定 URI 的记忆
+    ) -> tuple[int, bool]:
+        """删除当前用户指定 URI 的记忆（LLM 工具用，按 user_id 隔离）
 
         Args:
             event: 消息事件
             uri: 记忆 URI
 
         Returns:
-            是否删除成功
+            (删除数, URI是否存在但属于其他用户)
         """
         filters = self._build_user_filter(event)
         filters["uri"] = uri
+        deleted = await self._delete_by_filters(filters, uri)
+        if deleted > 0:
+            return (deleted, False)
+        # 检查该 URI 是否存在（属于其他用户）
+        exists = await self.vec_db.count_documents(metadata_filter={"uri": uri})
+        return (0, exists > 0)
 
-        # 查询 kb_doc_id 以便同步删除 KB 文档记录
-        doc_ids = []
+    async def forget_memory_by_uri(self, uri: str) -> int:
+        """管理员按 URI 删除所有匹配的记忆（不限用户）
+
+        Args:
+            uri: 记忆 URI
+
+        Returns:
+            实际删除的记录数
+        """
+        return await self._delete_by_filters({"uri": uri}, uri)
+
+    async def _delete_by_filters(self, filters: dict[str, Any], uri: str) -> int:
+        """按 filters 删除记忆并同步清理 KB 文档记录
+
+        Args:
+            filters: metadata 过滤条件
+            uri: 用于日志的记忆 URI
+
+        Returns:
+            实际删除的记录数
+        """
+        # 查询匹配记录的 kb_doc_id 以便同步删除 KB 文档记录
+        doc_ids: list[str] = []
         try:
             docs = await self.vec_db.document_storage.get_documents(
-                metadata_filters=filters, limit=10
+                metadata_filters=filters, limit=100
             )
             for doc in docs:
                 md = _safe_parse_metadata(doc.get("metadata", {}))
@@ -519,6 +560,8 @@ class MemoryManager:
                     doc_ids.append(md["kb_doc_id"])
         except Exception:
             pass
+
+        deleted = len(docs)
 
         await self.vec_db.delete_documents(metadata_filters=filters)
 
@@ -529,8 +572,8 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档删除失败: {e}")
 
-        logger.info(f"[简单长期记忆] 删除记忆: {uri}")
-        return True
+        logger.info(f"[简单长期记忆] 删除记忆: {uri}, 实际删除 {deleted} 条")
+        return deleted
 
     async def clear_memories(
         self,
@@ -779,7 +822,7 @@ class MemoryManager:
         event: AstrMessageEvent,
         uri: str,
         target_user_id: str,
-    ) -> bool:
+    ) -> int:
         """按 user_id + uri 删除指定用户的记忆
 
         Args:
@@ -788,38 +831,14 @@ class MemoryManager:
             target_user_id: 目标用户 ID
 
         Returns:
-            是否删除成功
+            实际删除的记录数
         """
         filters: dict[str, Any] = {
             "user_id": target_user_id,
             "uri": uri,
             "is_memory_record": True,
         }
-
-        # 查询 kb_doc_id 以便同步删除 KB 文档记录
-        doc_ids = []
-        try:
-            docs = await self.vec_db.document_storage.get_documents(
-                metadata_filters=filters, limit=10
-            )
-            for doc in docs:
-                md = _safe_parse_metadata(doc.get("metadata", {}))
-                if md.get("kb_doc_id"):
-                    doc_ids.append(md["kb_doc_id"])
-        except Exception:
-            pass
-
-        await self.vec_db.delete_documents(metadata_filters=filters)
-
-        # 同步删除 KB 文档记录
-        try:
-            await self._unregister_kb_documents(doc_ids)
-            await self._sync_kb_stats()
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] KB 文档删除失败: {e}")
-
-        logger.info(f"[简单长期记忆] 管理员删除记忆: {uri}, 目标用户: {target_user_id}")
-        return True
+        return await self._delete_by_filters(filters, uri)
 
     async def clear_memories_by_user(
         self,

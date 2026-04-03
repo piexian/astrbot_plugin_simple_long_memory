@@ -10,6 +10,7 @@
 - **全局/会话记忆**：支持跨会话的全局记忆模式和仅当前会话的记忆模式
 - **LLM 工具**：提供 `memory_recall`、`memory_store`、`memory_forget` 工具供 AI 主动操作
 - **用户命令**：通过 `/memory` 指令组管理记忆
+- **知识库管理**：记忆直接存储在 AstrBot 内置知识库中，可在知识库管理界面直接查看、检索、删除记忆，无需额外 WebUI
 
 ## 安装
 
@@ -45,13 +46,14 @@
 /memory search [--all] <关键词>        - 搜索记忆
 /memory stats [--all]                  - 查看记忆统计
 /memory test                           - 测试记忆读写功能（管理员）
-/memory forget <uri> [--user <用户ID>] - 删除指定记忆（管理员）
+/memory forget <uri> [--user <用户ID>] - 删除指定记忆
 /memory clear [--all] [--user <用户ID>]- 清空记忆（管理员）
 /memory rebuild [--to <知识库名>]      - 重建或迁移记忆（管理员）
 /memory rebuild --clear-cache          - 清理重建缓存（管理员）
 ```
 
-- `test`、`forget`、`clear`、`rebuild` 需要管理员权限
+- `test`、`clear`、`rebuild` 需要管理员权限
+- `forget`：普通用户可删除自己的记忆，管理员可删除任意记忆
 - `--all`：管理员可查看/搜索/统计/清空所有用户的记忆
 - `--user <用户ID>`：管理员可删除/清空指定用户的记忆（`--all` 与 `--user` 不可同时使用）
 - 无标志时行为不变，仅操作当前用户数据
