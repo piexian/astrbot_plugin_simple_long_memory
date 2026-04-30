@@ -15,7 +15,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .memory_protocol import (
@@ -140,6 +140,21 @@ class MemoryManager:
         self._kv_put = kv_put
         self._kv_get = kv_get
         self._kv_delete = kv_delete
+
+    # ---------- public state accessors ----------
+    @property
+    def is_kb_connected(self) -> bool:
+        """KB 是否已连接"""
+        return self._kb_helper is not None
+
+    @property
+    def current_kb_name(self) -> str:
+        """当前绑定的 KB 名称"""
+        return self._kb_name
+
+    def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
+        """从外部恢复重建期间未落盘的写入缓冲（启动恢复用）"""
+        self._pending_writes = list(records)
 
     def initialize(self) -> None:
         """初始化记忆管理器（仅校验配置，不连接 KB）
@@ -299,6 +314,39 @@ class MemoryManager:
 
         return filters
 
+    def _build_query_filter(
+        self,
+        event: AstrMessageEvent | None,
+        *,
+        all_users: bool,
+        domain: str | None = None,
+        include_deprecated: bool = False,
+        respect_global: bool = False,
+    ) -> dict[str, Any]:
+        """统一构建查询/列表/清空使用的 metadata 过滤器。
+
+        Args:
+            event: 消息事件（all_users 为 True 时可为 None）
+            all_users: True 时跳过用户隔离，使用 is_memory_record 标记
+            domain: 可选记忆域过滤
+            include_deprecated: 为 False 时排除 deprecated=True 的记忆
+            respect_global: True 时按 self.config['global_memory'] 决定是否限定 umo
+        """
+        if all_users:
+            filters: dict[str, Any] = {"is_memory_record": True}
+        else:
+            assert event is not None, "非 all_users 模式需要传入 event"
+            if respect_global:
+                global_memory = self.config.get("global_memory", True)
+                filters = self._build_memory_filter(event, global_memory)
+            else:
+                filters = self._build_user_filter(event)
+        if not include_deprecated:
+            filters["deprecated"] = False
+        if domain:
+            filters["domain"] = domain
+        return filters
+
     def _build_memory_metadata(
         self,
         event: AstrMessageEvent,
@@ -324,8 +372,8 @@ class MemoryManager:
             "umo": umo,
             "session_type": parsed.session_type,
             "session_id": parsed.session_id,
-            "created_at": datetime.utcnow().isoformat(),
-            "last_recalled_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_recalled_at": datetime.now(timezone.utc).isoformat(),
             "recall_count": 0,
             "compressed": False,
             **extra,
@@ -387,9 +435,6 @@ class MemoryManager:
                 await self._kv_put("rebuild_pending_writes", self._pending_writes)
             logger.debug(f"[简单长期记忆] 重建进行中，已缓冲记忆: {uri}")
             return uri
-
-        if uri is None:
-            uri = str(MemoryURI.generate(domain))
 
         # URI 去重：同名 URI 已存在时，内容相同则跳过，内容不同则换新 URI
         existing = await self.vec_db.document_storage.get_documents(
@@ -464,19 +509,12 @@ class MemoryManager:
             top_k = self.config.get("max_memories_per_inject", 5)
 
         # 构建过滤器
-        if all_users:
-            filters: dict[str, Any] = {
-                "is_memory_record": True,
-                "deprecated": False,
-            }
-            if domain:
-                filters["domain"] = domain
-        else:
-            global_memory = self.config.get("global_memory", True)
-            filters = self._build_memory_filter(event, global_memory)
-            filters["deprecated"] = False  # 排除废弃的记忆
-            if domain:
-                filters["domain"] = domain
+        filters = self._build_query_filter(
+            event,
+            all_users=all_users,
+            domain=domain,
+            respect_global=not all_users,
+        )
 
         # 调用向量检索（若知识库配置了重排序模型则自动启用）
         use_rerank = self.config.get("use_reranker", True)
@@ -550,6 +588,7 @@ class MemoryManager:
         """
         # 查询匹配记录的 kb_doc_id 以便同步删除 KB 文档记录
         doc_ids: list[str] = []
+        docs: list[dict[str, Any]] = []
         try:
             docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters=filters, limit=100
@@ -558,8 +597,8 @@ class MemoryManager:
                 md = _safe_parse_metadata(doc.get("metadata", {}))
                 if md.get("kb_doc_id"):
                     doc_ids.append(md["kb_doc_id"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
 
         deleted = len(docs)
 
@@ -591,15 +630,21 @@ class MemoryManager:
         Returns:
             删除的记忆数量
         """
-        if all_users:
-            filters: dict[str, Any] = {"is_memory_record": True}
-        else:
-            filters = self._build_user_filter(event)
-        if domain:
-            filters["domain"] = domain
+        filters = self._build_query_filter(
+            event,
+            all_users=all_users,
+            domain=domain,
+            include_deprecated=True,
+        )
+        scope = "全部" if all_users else filters.get("user_id", "unknown")
+        return await self._clear_by_filters(filters, scope_label=scope)
 
-        # 查询 kb_doc_id 列表
-        doc_ids = []
+    async def _clear_by_filters(
+        self, filters: dict[str, Any], *, scope_label: str
+    ) -> int:
+        """底层清空逻辑：查询 doc_ids → 删除 → 反注册 → 同步统计"""
+        doc_ids: list[str] = []
+        count = 0
         try:
             docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters=filters, limit=10000
@@ -612,20 +657,15 @@ class MemoryManager:
         except Exception:
             count = await self.vec_db.count_documents(metadata_filter=filters)
 
-        # 执行删除
         await self.vec_db.delete_documents(metadata_filters=filters)
 
-        # 同步删除 KB 文档记录
         try:
             await self._unregister_kb_documents(doc_ids)
             await self._sync_kb_stats()
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档批量删除失败: {e}")
 
-        logger.info(
-            f"[简单长期记忆] 清空 {count} 条记忆, "
-            f"用户: {'全部' if all_users else filters.get('user_id', 'unknown')}"
-        )
+        logger.info(f"[简单长期记忆] 清空 {count} 条记忆, 范围: {scope_label}")
         return count
 
     async def list_memories(
@@ -648,18 +688,11 @@ class MemoryManager:
         Returns:
             (记忆列表, 总数)
         """
-        if all_users:
-            filters: dict[str, Any] = {
-                "is_memory_record": True,
-                "deprecated": False,
-            }
-            if domain:
-                filters["domain"] = domain
-        else:
-            filters = self._build_user_filter(event)
-            filters["deprecated"] = False
-            if domain:
-                filters["domain"] = domain
+        filters = self._build_query_filter(
+            event,
+            all_users=all_users,
+            domain=domain,
+        )
 
         total = await self.vec_db.count_documents(metadata_filter=filters)
         offset = (page - 1) * page_size
@@ -786,11 +819,9 @@ class MemoryManager:
             统计信息字典
         """
         if all_users:
-            filters: dict[str, Any] = {
-                "is_memory_record": True,
-                "deprecated": False,
-            }
+            filters = self._build_query_filter(None, all_users=True)
         else:
+            # 原行为：非 all_users 模式下不加 deprecated 过滤
             filters = self._build_user_filter(event)
 
         # 总数
@@ -862,35 +893,9 @@ class MemoryManager:
         }
         if domain:
             filters["domain"] = domain
-
-        # 查询 kb_doc_id 列表
-        doc_ids = []
-        try:
-            docs = await self.vec_db.document_storage.get_documents(
-                metadata_filters=filters, limit=10000
-            )
-            count = len(docs)
-            for doc in docs:
-                md = _safe_parse_metadata(doc.get("metadata", {}))
-                if md.get("kb_doc_id"):
-                    doc_ids.append(md["kb_doc_id"])
-        except Exception:
-            count = await self.vec_db.count_documents(metadata_filter=filters)
-
-        # 执行删除
-        await self.vec_db.delete_documents(metadata_filters=filters)
-
-        # 同步删除 KB 文档记录
-        try:
-            await self._unregister_kb_documents(doc_ids)
-            await self._sync_kb_stats()
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] KB 文档批量删除失败: {e}")
-
-        logger.info(
-            f"[简单长期记忆] 管理员清空 {count} 条记忆, 目标用户: {target_user_id}"
+        return await self._clear_by_filters(
+            filters, scope_label=f"管理员清空用户 {target_user_id}"
         )
-        return count
 
     async def _resume_rebuild_from_snapshot(
         self, memory_records: list[dict[str, Any]]
@@ -1347,7 +1352,7 @@ class MemoryManager:
                     continue
 
                 # 构建完整 metadata 并写入
-                now = datetime.utcnow().isoformat()
+                now = datetime.now(timezone.utc).isoformat()
                 metadata = {
                     "user_id": item["user_id"],
                     "platform_id": item["platform_id"],
