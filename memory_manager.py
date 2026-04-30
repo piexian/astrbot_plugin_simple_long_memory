@@ -335,7 +335,8 @@ class MemoryManager:
         if all_users:
             filters: dict[str, Any] = {"is_memory_record": True}
         else:
-            assert event is not None, "非 all_users 模式需要传入 event"
+            if event is None:
+                raise ValueError("非 all_users 模式需要传入 event")
             if respect_global:
                 global_memory = self.config.get("global_memory", True)
                 filters = self._build_memory_filter(event, global_memory)
@@ -588,19 +589,22 @@ class MemoryManager:
         """
         # 查询匹配记录的 kb_doc_id 以便同步删除 KB 文档记录
         doc_ids: list[str] = []
-        docs: list[dict[str, Any]] = []
+        deleted = 0
         try:
             docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters=filters, limit=100
             )
+            deleted = len(docs)
             for doc in docs:
                 md = _safe_parse_metadata(doc.get("metadata", {}))
                 if md.get("kb_doc_id"):
                     doc_ids.append(md["kb_doc_id"])
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
-
-        deleted = len(docs)
+            try:
+                deleted = await self.vec_db.count_documents(metadata_filter=filters)
+            except Exception as ce:
+                logger.warning(f"[简单长期记忆] 统计待删除文档失败: {ce}")
 
         await self.vec_db.delete_documents(metadata_filters=filters)
 

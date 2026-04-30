@@ -37,7 +37,7 @@
   "extraction_min_content_length": {
     "description": "最小提取内容长度",
     "type": "int",
-    "default": 500,
+    "default": 150,
     "hint": "对话总内容低于此字符数时跳过记忆提取，避免无意义短对话被记忆"
   },
   "global_memory": {

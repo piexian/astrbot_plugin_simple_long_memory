@@ -24,7 +24,7 @@ jobs:
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          pip install ruff
+          python -m pip install "ruff==0.13.2"
 
       - name: Ruff lint
         run: |
@@ -67,7 +67,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install PyYAML
-        run: pip install pyyaml
+        run: python -m pip install "pyyaml==6.0.2"
 
       - name: Validate metadata.yaml
         run: |

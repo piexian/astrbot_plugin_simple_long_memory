@@ -133,7 +133,7 @@ def _parse_memory_flags(args_text: str) -> dict[str, Any]:
     return result
 
 
-def _ensure_initialized(memory_mgr) -> str | None:
+def _ensure_initialized(memory_mgr: MemoryManager | None) -> str | None:
     """检查记忆管理器是否就绪，返回错误消息或 None"""
     if not memory_mgr:
         return "长期记忆插件未正确初始化，请检查配置"
@@ -161,7 +161,9 @@ def _validate_command(
         return f"未知参数: {', '.join(args['unknown_flags'])}"
     if args["user_missing_value"]:
         return "--user 需要指定用户 ID"
-    if allow_to and args["to_missing_value"]:
+    if args["to_missing_value"]:
+        if not allow_to:
+            return f"{cmd_name} 命令不支持 --to 参数"
         return "需要指定知识库名称，用法: /memory rebuild --to <知识库名>"
     if not allow_user and args["user"]:
         return f"{cmd_name} 命令不支持 --user 参数"
@@ -661,7 +663,7 @@ class MemoryPlugin(Star):
             conversation = self._build_conversation_from_snapshots(snapshots)
 
             # 检查最小内容长度
-            min_length = self.config.get("extraction_min_content_length", 500)
+            min_length = self.config.get("extraction_min_content_length", 150)
             if len(conversation) < min_length:
                 logger.debug(
                     f"[简单长期记忆] 对话总长度 {len(conversation)} < {min_length}，跳过提取"
