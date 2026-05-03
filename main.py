@@ -149,6 +149,12 @@ def _read_positive_int(value: Any, default: int) -> int:
     return max(0, parsed)
 
 
+def _confirmation_code(action: str, target: str = "") -> str:
+    seed = f"{action}:{target}".encode("utf-8")
+    checksum = sum(seed) % 10000
+    return f"{action}-{checksum:04d}"
+
+
 def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
     """从 event.message_str 提取命令名之后的原始参数文本
 
@@ -164,11 +170,11 @@ def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
 
 
 def _parse_memory_flags(args_text: str) -> dict[str, Any]:
-    """解析 --all / --user <id> / --to <name> / --clear-cache 标志
+    """解析 --all / --user <id> / --to <name> / --clear-cache / --confirm 标志
 
     Returns:
         {"all": bool, "user": str, "to": str, "clear_cache": bool,
-         "positional": str,
+         "confirm": str, "positional": str,
          "user_missing_value": bool, "to_missing_value": bool,
          "unknown_flags": list[str]}
     """
@@ -177,9 +183,11 @@ def _parse_memory_flags(args_text: str) -> dict[str, Any]:
         "user": "",
         "to": "",
         "clear_cache": False,
+        "confirm": "",
         "positional": "",
         "user_missing_value": False,
         "to_missing_value": False,
+        "confirm_missing_value": False,
         "unknown_flags": [],
     }
     tokens = args_text.split()
@@ -203,6 +211,12 @@ def _parse_memory_flags(args_text: str) -> dict[str, Any]:
                 result["to_missing_value"] = True
         elif token == "--clear-cache":
             result["clear_cache"] = True
+        elif token == "--confirm":
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                result["confirm"] = tokens[i]
+            else:
+                result["confirm_missing_value"] = True
         elif token.startswith("--"):
             result["unknown_flags"].append(token)
         else:
@@ -229,6 +243,7 @@ def _validate_command(
     allow_user: bool = False,
     allow_to: bool = False,
     allow_clear_cache: bool = False,
+    allow_confirm: bool = False,
     allow_positional: bool = True,
 ) -> str | None:
     """统一的命令参数校验，返回首个错误消息或 None。
@@ -244,12 +259,18 @@ def _validate_command(
         if not allow_to:
             return f"{cmd_name} 命令不支持 --to 参数"
         return "需要指定知识库名称，用法: /memory rebuild --to <知识库名>"
+    if args["confirm_missing_value"]:
+        if not allow_confirm:
+            return f"{cmd_name} 命令不支持 --confirm 参数"
+        return "--confirm 需要指定确认码"
     if not allow_user and args["user"]:
         return f"{cmd_name} 命令不支持 --user 参数"
     if not allow_to and args["to"]:
         return f"{cmd_name} 命令不支持 --to 参数"
     if not allow_clear_cache and args["clear_cache"]:
         return f"{cmd_name} 命令不支持 --clear-cache 参数"
+    if not allow_confirm and args["confirm"]:
+        return f"{cmd_name} 命令不支持 --confirm 参数"
     if not allow_all and args["all"]:
         return f"{cmd_name} 命令不支持 --all 参数"
     if not allow_positional and args["positional"]:
@@ -344,6 +365,7 @@ class MemoryPlugin(Star):
         try:
             rebuild_status = await self.get_kv_data("rebuild_status", None)
             memory_records = await self.get_kv_data("rebuild_memory_records", None)
+            rebuild_context = await self.get_kv_data("rebuild_context", None)
 
             if (
                 rebuild_status in {"in_progress", "interrupted"}
@@ -357,7 +379,8 @@ class MemoryPlugin(Star):
                 )
                 # 从 KV 快照继续重建（不重新拉取源 KB，因为可能已被清空）
                 recovery_result = await self.memory_mgr._resume_rebuild_from_snapshot(
-                    memory_records
+                    memory_records,
+                    rebuild_context if isinstance(rebuild_context, dict) else None,
                 )
                 recovered = recovery_result["success"]
                 remaining_records = recovery_result["remaining_records"]
@@ -1065,12 +1088,43 @@ class MemoryPlugin(Star):
             require_admin=True,
             allow_all=True,
             allow_user=True,
+            allow_confirm=True,
             allow_positional=False,
         ):
             yield event.plain_result(err)
             return
         if args["all"] and args["user"]:
             yield event.plain_result("--all 与 --user 不可同时使用")
+            return
+        if args["all"]:
+            target_label = "all"
+        elif args["user"]:
+            target_label = f"user:{args['user']}"
+        else:
+            target_label = f"current:{event.get_sender_id()}"
+        confirm_code = _confirmation_code("clear", target_label)
+        if args["confirm"] != confirm_code:
+            if args["all"]:
+                preview = await self.memory_mgr.count_clear_memories(
+                    event, all_users=True
+                )
+                scope = "全部记忆"
+            elif args["user"]:
+                preview = await self.memory_mgr.count_clear_memories_by_user(
+                    event, args["user"]
+                )
+                scope = f"用户 {args['user']} 的记忆"
+            else:
+                preview = await self.memory_mgr.count_clear_memories(event)
+                scope = "当前用户记忆"
+            yield event.plain_result(
+                "[清空确认]\n"
+                f"  范围: {scope}\n"
+                f"  预计影响: {preview} 条\n"
+                f"  确认执行: /memory clear --confirm {confirm_code}"
+                + (" --all" if args["all"] else "")
+                + (f" --user {args['user']}" if args["user"] else "")
+            )
             return
         if args["all"]:
             count = await self.memory_mgr.clear_memories(event, all_users=True)
@@ -1097,6 +1151,7 @@ class MemoryPlugin(Star):
             require_admin=True,
             allow_to=True,
             allow_clear_cache=True,
+            allow_confirm=True,
             allow_positional=False,
         ):
             yield event.plain_result(err)
@@ -1108,11 +1163,25 @@ class MemoryPlugin(Star):
                 yield event.plain_result("--clear-cache 不能与 --to 同时使用")
                 return
             cache_status = await self.memory_mgr.get_rebuild_cache_status()
+            confirm_code = _confirmation_code("clear-cache", "rebuild")
+            if args["confirm"] != confirm_code:
+                yield event.plain_result(
+                    "[清理重建缓存确认]\n"
+                    f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
+                    f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
+                    f"  上次状态: {cache_status.get('status', '无')}\n"
+                    f"  源知识库: {cache_status.get('source_kb', '无')}\n"
+                    f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
+                    f"  确认执行: /memory rebuild --clear-cache --confirm {confirm_code}"
+                )
+                return
             result = await self.memory_mgr.clear_rebuild_cache()
             report = "[清理重建缓存]\n"
             report += f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
             report += f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
             report += f"  上次状态: {cache_status.get('status', '无')}\n"
+            report += f"  源知识库: {cache_status.get('source_kb', '无')}\n"
+            report += f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
             report += "  清理结果:\n"
             for key, ok in result.items():
                 report += f"    {key}: {'成功' if ok else '失败'}\n"
@@ -1124,6 +1193,42 @@ class MemoryPlugin(Star):
         # --to 与当前 KB 同名时视为原地重建
         if target_kb_name and self.memory_mgr.current_kb_name == target_kb_name:
             target_kb_name = None
+
+        action_target = target_kb_name or self.memory_mgr.current_kb_name
+        confirm_code = _confirmation_code("rebuild", action_target)
+        if args["confirm"] != confirm_code:
+            source_count = await self.memory_mgr.count_kb_memory_records_by_name(
+                self.memory_mgr.current_kb_name
+            )
+            target_count = (
+                await self.memory_mgr.count_kb_memory_records_by_name(target_kb_name)
+                if target_kb_name
+                else source_count
+            )
+            target_missing = (
+                target_kb_name is not None
+                and not await self.memory_mgr.kb_exists(target_kb_name)
+            )
+            mode = "迁移" if target_kb_name else "重建"
+            report = (
+                f"[{mode}确认]\n"
+                f"  当前知识库: {self.memory_mgr.current_kb_name}\n"
+                f"  目标知识库: {target_kb_name or self.memory_mgr.current_kb_name}\n"
+                f"  当前记忆数: {source_count}\n"
+            )
+            if target_kb_name:
+                if target_missing:
+                    report += "  目标知识库不存在，请检查名称\n"
+                    yield event.plain_result(report)
+                    return
+                report += f"  目标已有记忆数: {target_count}\n"
+                if target_count > 0:
+                    report += "  目标知识库已有记忆，执行前需要先清空或更换目标\n"
+            report += f"  确认执行: /memory rebuild --confirm {confirm_code}" + (
+                f" --to {target_kb_name}" if target_kb_name else ""
+            )
+            yield event.plain_result(report)
+            return
 
         if target_kb_name:
             yield event.plain_result(
