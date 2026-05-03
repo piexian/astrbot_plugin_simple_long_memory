@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -661,18 +662,19 @@ class MemoryManager:
             memory_scope=memory_scope,
         )
 
-        results = []
-        for filters, legacy_personal, owner_user_id, require_owner_list in filters_list:
-            results.extend(
-                await self._retrieve_with_filter(
-                    query,
-                    top_k,
-                    filters,
-                    legacy_personal=legacy_personal,
-                    owner_user_id=owner_user_id,
-                    require_owner_list=require_owner_list,
-                )
+        tasks = [
+            self._retrieve_with_filter(
+                query,
+                top_k,
+                filters,
+                legacy_personal=legacy_personal,
+                owner_user_id=owner_user_id,
+                require_owner_list=require_owner_list,
             )
+            for filters, legacy_personal, owner_user_id, require_owner_list in filters_list
+        ]
+        results_list = await asyncio.gather(*tasks)
+        results = [item for sublist in results_list for item in sublist]
 
         memories = self._dedupe_memories(results)[:top_k]
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
@@ -692,10 +694,11 @@ class MemoryManager:
             if memory_scope
             else [MemoryScope.PERSONAL]
         )
-        if not memory_scope and parsed.session_type == "group":
-            scopes.extend([MemoryScope.GROUP, MemoryScope.CONVERSATION])
-        elif not memory_scope and not global_memory:
-            scopes.append(MemoryScope.CONVERSATION)
+        if not memory_scope:
+            if parsed.session_type == "group":
+                scopes.extend([MemoryScope.GROUP, MemoryScope.CONVERSATION])
+            else:
+                scopes.append(MemoryScope.CONVERSATION)
 
         filters_list = []
         for scope in scopes:
@@ -771,6 +774,8 @@ class MemoryManager:
         scope = metadata.get("memory_scope")
         if scope not in (None, "", MemoryScope.PERSONAL):
             return False
+        if metadata.get("visibility") == MemoryVisibility.GROUP:
+            return True
         owner_user_ids = metadata.get("owner_user_ids")
         if isinstance(owner_user_ids, list) and owner_user_ids:
             return owner_user_id in owner_user_ids if owner_user_id else True
@@ -926,7 +931,7 @@ class MemoryManager:
         page: int = 1,
         page_size: int = 10,
         all_users: bool = False,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, bool]:
         """列出用户的记忆（分页）
 
         Args:
@@ -937,8 +942,9 @@ class MemoryManager:
             all_users: 为 True 时跳过用户过滤
 
         Returns:
-            (记忆列表, 总数)
+            (记忆列表, 总数, 总数是否被扫描上限截断)
         """
+        truncated = False
         if all_users:
             filters: dict[str, Any] = {
                 "is_memory_record": True,
@@ -954,12 +960,23 @@ class MemoryManager:
                 limit=page_size,
             )
         else:
-            docs = await self._list_visible_user_documents(
-                event, domain, page=page, page_size=page_size
-            )
-            total = len(docs)
+            parsed = UMOInfo.parse(event.unified_msg_origin)
             offset = (page - 1) * page_size
-            docs = docs[offset : offset + page_size]
+            if parsed.session_type == "group":
+                docs, total, truncated = await self._list_visible_user_documents(
+                    event, domain, page=page, page_size=page_size
+                )
+            else:
+                filters = self._build_user_filter(event)
+                filters["deprecated"] = False
+                if domain:
+                    filters["domain"] = domain
+                total = await self.vec_db.count_documents(metadata_filter=filters)
+                docs = await self.vec_db.document_storage.get_documents(
+                    metadata_filters=filters,
+                    offset=offset,
+                    limit=page_size,
+                )
 
         memories = []
         for doc in docs:
@@ -972,7 +989,7 @@ class MemoryManager:
                 }
             )
 
-        return memories, total
+        return memories, total, truncated
 
     async def _list_visible_user_documents(
         self,
@@ -981,51 +998,85 @@ class MemoryManager:
         *,
         page: int = 1,
         page_size: int = 10,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], int, bool]:
         parsed = UMOInfo.parse(event.unified_msg_origin)
         current_user_id = build_user_id(parsed.platform_id, event.get_sender_id())
         scan_limit = self._memory_list_scan_limit(page, page_size)
-        filters = self._build_user_filter(event)
-        filters["deprecated"] = False
+        source_specs = [
+            (
+                self._scope_filter(event, MemoryScope.PERSONAL),
+                True,
+                False,
+            ),
+            (
+                self._legacy_personal_filter(event),
+                True,
+                False,
+            ),
+            (
+                {
+                    "memory_scope": MemoryScope.PERSONAL,
+                    "owner_session_id": build_session_id(
+                        parsed.platform_id, parsed.session_id
+                    ),
+                    "visibility": MemoryVisibility.GROUP,
+                    "is_memory_record": True,
+                    "deprecated": False,
+                },
+                True,
+                True,
+            ),
+            (
+                self._scope_filter(event, MemoryScope.GROUP),
+                False,
+                False,
+            ),
+            (
+                self._scope_filter(event, MemoryScope.CONVERSATION),
+                False,
+                False,
+            ),
+        ]
         if domain:
-            filters["domain"] = domain
+            for filters, _, _ in source_specs:
+                filters["domain"] = domain
 
-        docs = await self.vec_db.document_storage.get_documents(
-            metadata_filters=filters,
-            limit=scan_limit,
-        )
-        if parsed.session_type != "group":
-            return docs
-
-        group_filters = {
-            "memory_scope": MemoryScope.PERSONAL,
-            "owner_session_id": build_session_id(parsed.platform_id, parsed.session_id),
-            "visibility": MemoryVisibility.GROUP,
-            "is_memory_record": True,
-            "deprecated": False,
-        }
-        if domain:
-            group_filters["domain"] = domain
-        group_docs = await self.vec_db.document_storage.get_documents(
-            metadata_filters=group_filters,
-            limit=scan_limit,
+        docs_by_source = await asyncio.gather(
+            *(
+                self.vec_db.document_storage.get_documents(
+                    metadata_filters=filters,
+                    limit=scan_limit + 1,
+                )
+                for filters, _, _ in source_specs
+            )
         )
 
         visible = []
         seen = set()
-        for doc in [*docs, *group_docs]:
-            metadata = _safe_parse_metadata(doc.get("metadata", {}))
-            uri = metadata.get("uri") or doc.get("text", "")
-            if uri in seen:
-                continue
-            if self._is_visible_personal_memory(
-                metadata,
-                current_user_id,
-                require_owner_list=doc in group_docs,
-            ):
+        scanned_all_sources = True
+        for docs, (_, is_personal_source, require_owner_list) in zip(
+            docs_by_source, source_specs, strict=False
+        ):
+            if len(docs) > scan_limit:
+                scanned_all_sources = False
+            for doc in docs[:scan_limit]:
+                metadata = _safe_parse_metadata(doc.get("metadata", {}))
+                uri = metadata.get("uri") or doc.get("text", "")
+                if uri in seen:
+                    continue
+                if is_personal_source and not self._is_visible_personal_memory(
+                    metadata,
+                    current_user_id,
+                    require_owner_list=require_owner_list,
+                ):
+                    continue
                 visible.append(doc)
                 seen.add(uri)
-        return visible
+
+        truncated = not scanned_all_sources
+        total = len(visible) if not truncated else max(len(visible), scan_limit + 1)
+        offset = (page - 1) * page_size
+        return visible[offset : offset + page_size], total, truncated
 
     def _memory_list_scan_limit(self, page: int, page_size: int) -> int:
         try:
@@ -1034,7 +1085,7 @@ class MemoryManager:
             configured = 200
         configured = max(1, configured)
         needed = max(1, page) * max(1, page_size)
-        return min(configured, needed)
+        return max(configured, needed)
 
     async def get_memory_by_uri(
         self,
@@ -1120,7 +1171,7 @@ class MemoryManager:
                 content=content,
                 domain=domain,
                 uri=str(MemoryURI.generate(domain)),
-                memory_type=domain,
+                memory_type=MemoryType.NORMAL,
             )
             return f"created:{uri}"
 
@@ -1654,12 +1705,23 @@ class MemoryManager:
             content = item["content"]
             try:
                 # 语义去重：召回相似记忆，高相似度则跳过
+                memory_scope = normalize_memory_scope(
+                    item.get("memory_scope", MemoryScope.PERSONAL)
+                )
                 filters: dict[str, Any] = {
-                    "user_id": item["user_id"],
-                    "memory_scope": item.get("memory_scope", MemoryScope.PERSONAL),
+                    "memory_scope": memory_scope,
+                    "domain": item["domain"],
                     "is_memory_record": True,
                     "deprecated": False,
                 }
+                if memory_scope == MemoryScope.GROUP:
+                    filters["owner_session_id"] = item.get("owner_session_id", "")
+                elif memory_scope == MemoryScope.CONVERSATION:
+                    filters["umo"] = item["umo"]
+                else:
+                    filters["owner_user_id"] = item.get(
+                        "owner_user_id", item["user_id"]
+                    )
                 candidates = await write_kb.vec_db.retrieve(
                     query=content,
                     k=1,

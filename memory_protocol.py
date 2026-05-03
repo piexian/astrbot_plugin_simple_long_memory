@@ -138,6 +138,14 @@ def normalize_memory_scope(scope: str) -> str:
     return MemoryScope.PERSONAL
 
 
+def normalize_visibility(visibility: Any) -> str:
+    """标准化记忆可见性，非法或空值默认私有"""
+    visibility = str(visibility or "").lower().strip()
+    if visibility in (MemoryVisibility.PRIVATE, MemoryVisibility.GROUP):
+        return visibility
+    return MemoryVisibility.PRIVATE
+
+
 def build_session_id(platform_id: str, session_id: str) -> str:
     """构建会话唯一标识"""
     return f"{platform_id}_{session_id}"
@@ -213,6 +221,7 @@ class MemoryMetadata:
         values["speaker_id"] = values.get("speaker_id") or values.get("sender_id", "")
         values["entities"] = _normalize_string_list(values.get("entities", []))
         values["topics"] = _normalize_string_list(values.get("topics", []))
+        values["visibility"] = normalize_visibility(values.get("visibility", ""))
         return cls(**values)
 
 
@@ -271,22 +280,15 @@ def format_memory_content(
     domain_label = domain_labels.get(meta.domain, meta.domain)
 
     lines = [
-        f"scope: {meta.memory_scope}",
         f"domain: {domain_label}",
-        f"visibility: {meta.visibility}",
         f"memory: {content}",
     ]
-    if meta.subject:
-        lines.append(f"subject: {meta.subject}")
-    if meta.owner_user_ids:
-        lines.append(f"owners: {', '.join(meta.owner_user_ids)}")
     if meta.disclosure:
         lines.append(f"recall_when: {meta.disclosure}")
     if meta.entities:
         lines.append(f"entities: {', '.join(meta.entities)}")
     if meta.topics:
         lines.append(f"topics: {', '.join(meta.topics)}")
-    lines.append(f"importance: {meta.importance}")
     return "\n".join(lines)
 
 

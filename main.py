@@ -24,6 +24,7 @@ from astrbot.api.star import Context, Star
 from .memory_manager import MemoryManager, normalize_domain
 from .memory_protocol import (
     MemoryScope,
+    MemoryType,
     MemoryURI,
     UMOInfo,
     format_memory_for_injection,
@@ -75,11 +76,17 @@ def _normalize_subject_id(subject: str) -> str:
 
 
 def _normalize_subject_ids(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
     raw_values = value if isinstance(value, list) else str(value).split(",")
     subjects = []
     for item in raw_values:
         subject = _normalize_subject_id(_sanitize_memory_content(str(item))[:120])
-        if subject and subject not in {"current_sender", "group", "conversation"}:
+        if (
+            subject
+            and subject.lower() != "none"
+            and subject not in {"current_sender", "group", "conversation"}
+        ):
             subjects.append(subject)
     return list(dict.fromkeys(subjects))
 
@@ -807,7 +814,7 @@ class MemoryPlugin(Star):
 
             # 存储提取的记忆
             for mem in memories:
-                mem_type = mem.get("type", "fact")
+                memory_domain = mem.get("type", "fact")
                 scope = mem.get("scope", MemoryScope.PERSONAL)
                 content = mem.get("content", "")
                 subject = mem.get("subject", "") or _current_speaker_subject(
@@ -825,13 +832,13 @@ class MemoryPlugin(Star):
                 if not content:
                     continue
 
-                domain = normalize_domain(mem_type)
+                domain = normalize_domain(memory_domain)
 
                 uri = await self.memory_mgr.store_memory(
                     event=event,
                     content=content,
                     domain=domain,
-                    memory_type=mem_type,
+                    memory_type=MemoryType.NORMAL,
                     disclosure=disclosure,
                     importance=importance,
                     memory_scope=scope,
@@ -876,7 +883,7 @@ class MemoryPlugin(Star):
             except ValueError:
                 pass
         page_size = 10
-        memories, total = await self.memory_mgr.list_memories(
+        memories, total, truncated = await self.memory_mgr.list_memories(
             event, page=page, page_size=page_size, all_users=all_users
         )
         scope = "全局" if all_users else "个人"
@@ -888,6 +895,10 @@ class MemoryPlugin(Star):
             all_mode=all_users,
             cmd_prefix=self._get_cmd_prefix(),
         )
+        if truncated:
+            result += (
+                "\n\n提示: 群聊可见记忆较多，当前总数受扫描上限影响，可能还有更多记录。"
+            )
         yield event.plain_result(f"[{scope}记忆]\n{result}")
 
     @memory_group.command("search")
@@ -1184,7 +1195,7 @@ class MemoryPlugin(Star):
                 content=test_content,
                 domain=test_domain,
                 uri=uri,
-                memory_type="fact",
+                memory_type=MemoryType.NORMAL,
                 disclosure="测试",
                 importance=1,
             )
@@ -1266,7 +1277,7 @@ class MemoryPlugin(Star):
             content=content,
             domain=domain,
             uri=uri,
-            memory_type=memory_type,
+            memory_type=MemoryType.NORMAL,
             disclosure=disclosure[:200] if disclosure else "",
         )
         return f"Memory stored: {uri}"
