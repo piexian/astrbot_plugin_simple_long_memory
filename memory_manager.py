@@ -20,11 +20,11 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .memory_protocol import (
+    MemoryMetadata,
     MemoryScope,
     MemoryType,
     MemoryURI,
     MemoryVisibility,
-    MemoryMetadata,
     UMOInfo,
     build_session_id,
     build_user_id,
