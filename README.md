@@ -32,7 +32,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | summarization_provider_id | 记忆总结 LLM 模型（预留） | 留空使用会话主 LLM |
 | auto_memorize | 自动记忆模式开关 | `true` |
 | extraction_interval | 每 N 轮对话触发一次记忆提取 | `20` |
-| extraction_min_content_length | 对话总长度低于此值时跳过提取 | `500` |
+| extraction_min_content_length | 对话总长度低于此值时跳过提取 | `150` |
 | global_memory | 全局记忆模式（跨会话召回） | `true` |
 | max_memories_per_inject | 每次 LLM 请求注入的最大记忆条数 | `5` |
 | memory_ttl_days | 记忆生命周期（天） | `30` |
