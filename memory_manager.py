@@ -19,11 +19,14 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from .memory_protocol import (
+    MemoryScope,
     MemoryType,
     MemoryURI,
     UMOInfo,
+    build_session_id,
     build_user_id,
     format_memory_content,
+    normalize_memory_scope,
 )
 
 if TYPE_CHECKING:
@@ -109,6 +112,24 @@ def normalize_memory_type(memory_type: str) -> str:
     if memory_type in _ALLOWED_MEMORY_TYPES:
         return memory_type
     return MemoryType.NORMAL
+
+
+def normalize_visibility(visibility: str, memory_scope: str) -> str:
+    """标准化记忆可见性"""
+    visibility = (visibility or "").lower().strip()
+    if visibility in ("private", "group"):
+        return visibility
+    return "group" if memory_scope == MemoryScope.GROUP else "private"
+
+
+def _normalize_sender_ids(sender_ids: list[str] | None, fallback: str) -> list[str]:
+    values = sender_ids or [fallback]
+    result = []
+    for sender_id in values:
+        text = str(sender_id).strip()
+        if text:
+            result.append(text)
+    return list(dict.fromkeys(result))
 
 
 def _clamp_importance(importance: int) -> int:
@@ -277,6 +298,20 @@ class MemoryManager:
             "user_id": build_user_id(event.get_platform_id(), event.get_sender_id()),
         }
 
+    def _event_scope_ids(
+        self, event: AstrMessageEvent, owner_sender_id: str | None = None
+    ) -> tuple[UMOInfo, str, str]:
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        sender_id = owner_sender_id or event.get_sender_id()
+        owner_user_id = build_user_id(parsed.platform_id, sender_id)
+        owner_session_id = build_session_id(parsed.platform_id, parsed.session_id)
+        return parsed, owner_user_id, owner_session_id
+
+    def _build_owner_user_ids(
+        self, platform_id: str, owner_sender_ids: list[str]
+    ) -> list[str]:
+        return [build_user_id(platform_id, sender_id) for sender_id in owner_sender_ids]
+
     def _build_memory_filter(
         self,
         event: AstrMessageEvent,
@@ -299,6 +334,47 @@ class MemoryManager:
 
         return filters
 
+    def _scope_filter(
+        self,
+        event: AstrMessageEvent,
+        memory_scope: str,
+        global_memory: bool = True,
+    ) -> dict[str, Any]:
+        _, owner_user_id, owner_session_id = self._event_scope_ids(event)
+        scope = normalize_memory_scope(memory_scope)
+
+        if scope == MemoryScope.GROUP:
+            filters = {
+                "memory_scope": MemoryScope.GROUP,
+                "owner_session_id": owner_session_id,
+            }
+        elif scope == MemoryScope.CONVERSATION:
+            filters = {
+                "memory_scope": MemoryScope.CONVERSATION,
+                "umo": event.unified_msg_origin,
+            }
+        else:
+            filters = {
+                "memory_scope": MemoryScope.PERSONAL,
+                "owner_user_id": owner_user_id,
+            }
+            if not global_memory:
+                filters["umo"] = event.unified_msg_origin
+
+        filters["is_memory_record"] = True
+        filters["deprecated"] = False
+        return filters
+
+    def _legacy_personal_filter(
+        self,
+        event: AstrMessageEvent,
+        global_memory: bool = True,
+    ) -> dict[str, Any]:
+        filters = self._build_memory_filter(event, global_memory)
+        filters["is_memory_record"] = True
+        filters["deprecated"] = False
+        return filters
+
     def _build_memory_metadata(
         self,
         event: AstrMessageEvent,
@@ -314,16 +390,34 @@ class MemoryManager:
             完整的元数据字典
         """
         umo = event.unified_msg_origin
-        parsed = UMOInfo.parse(umo)
-        user_id = build_user_id(parsed.platform_id, event.get_sender_id())
+        memory_scope = normalize_memory_scope(extra.pop("memory_scope", ""))
+        visibility = normalize_visibility(extra.pop("visibility", ""), memory_scope)
+        speaker_id = extra.pop("speaker_id", event.get_sender_id())
+        owner_sender_id = extra.pop("owner_sender_id", None)
+        owner_sender_ids = _normalize_sender_ids(
+            extra.pop("owner_sender_ids", None),
+            owner_sender_id or event.get_sender_id(),
+        )
+        parsed, owner_user_id, owner_session_id = self._event_scope_ids(
+            event, owner_sender_ids[0]
+        )
+        owner_user_ids = self._build_owner_user_ids(
+            parsed.platform_id, owner_sender_ids
+        )
 
         return {
-            "user_id": user_id,
+            "user_id": owner_user_id,
             "platform_id": parsed.platform_id,
-            "sender_id": event.get_sender_id(),
+            "sender_id": owner_sender_ids[0],
             "umo": umo,
             "session_type": parsed.session_type,
             "session_id": parsed.session_id,
+            "memory_scope": memory_scope,
+            "owner_user_id": owner_user_id,
+            "owner_user_ids": owner_user_ids,
+            "owner_session_id": owner_session_id,
+            "visibility": visibility,
+            "speaker_id": speaker_id,
             "created_at": datetime.utcnow().isoformat(),
             "last_recalled_at": datetime.utcnow().isoformat(),
             "recall_count": 0,
@@ -340,6 +434,13 @@ class MemoryManager:
         memory_type: str = MemoryType.NORMAL,
         disclosure: str = "",
         importance: int = 3,
+        memory_scope: str = MemoryScope.PERSONAL,
+        visibility: str = "",
+        subject: str = "",
+        entities: list[str] | None = None,
+        topics: list[str] | None = None,
+        owner_sender_id: str | None = None,
+        owner_sender_ids: list[str] | None = None,
     ) -> str:
         """存储记忆到知识库
 
@@ -359,6 +460,15 @@ class MemoryManager:
         domain = normalize_domain(domain)
         memory_type = normalize_memory_type(memory_type)
         importance = _clamp_importance(importance)
+        memory_scope = normalize_memory_scope(memory_scope)
+        visibility = normalize_visibility(visibility, memory_scope)
+        entities = entities or []
+        topics = topics or []
+        owner_sender_ids = _normalize_sender_ids(
+            owner_sender_ids, owner_sender_id or event.get_sender_id()
+        )
+        if memory_scope == MemoryScope.PERSONAL and len(owner_sender_ids) > 1:
+            visibility = "group"
 
         if uri is None:
             uri = str(MemoryURI.generate(domain))
@@ -366,7 +476,12 @@ class MemoryManager:
         # 重建/迁移期间：暂存到本地缓冲区并持久化到 KV，完成后批量处理
         if self._rebuilding:
             umo = event.unified_msg_origin
-            parsed = UMOInfo.parse(umo)
+            parsed, owner_user_id, owner_session_id = self._event_scope_ids(
+                event, owner_sender_ids[0]
+            )
+            owner_user_ids = self._build_owner_user_ids(
+                parsed.platform_id, owner_sender_ids
+            )
             item = {
                 "content": content,
                 "domain": domain,
@@ -374,12 +489,21 @@ class MemoryManager:
                 "memory_type": memory_type,
                 "disclosure": disclosure,
                 "importance": importance,
-                "user_id": build_user_id(parsed.platform_id, event.get_sender_id()),
+                "user_id": owner_user_id,
+                "owner_user_ids": owner_user_ids,
                 "platform_id": parsed.platform_id,
-                "sender_id": event.get_sender_id(),
+                "sender_id": owner_sender_ids[0],
                 "umo": umo,
                 "session_type": parsed.session_type,
                 "session_id": parsed.session_id,
+                "memory_scope": memory_scope,
+                "owner_user_id": owner_user_id,
+                "owner_session_id": owner_session_id,
+                "visibility": visibility,
+                "speaker_id": owner_sender_ids[0],
+                "subject": subject,
+                "entities": entities,
+                "topics": topics,
             }
             self._pending_writes.append(item)
             # 持久化缓冲区到 KV，防进程重启丢失
@@ -412,6 +536,14 @@ class MemoryManager:
             memory_type=memory_type,
             disclosure=disclosure,
             importance=importance,
+            memory_scope=memory_scope,
+            visibility=visibility,
+            subject=subject,
+            entities=entities,
+            topics=topics,
+            memory_content=content,
+            owner_sender_ids=owner_sender_ids,
+            speaker_id=owner_sender_ids[0],
         )
 
         # 生成 KB 文档 ID 并关联到向量条目
@@ -447,6 +579,7 @@ class MemoryManager:
         domain: str | None = None,
         top_k: int | None = None,
         all_users: bool = False,
+        memory_scope: str | None = None,
     ) -> list[dict[str, Any]]:
         """召回相关记忆（自动按用户隔离）
 
@@ -463,22 +596,93 @@ class MemoryManager:
         if top_k is None:
             top_k = self.config.get("max_memories_per_inject", 5)
 
-        # 构建过滤器
         if all_users:
-            filters: dict[str, Any] = {
-                "is_memory_record": True,
-                "deprecated": False,
-            }
+            filters = {"is_memory_record": True, "deprecated": False}
             if domain:
                 filters["domain"] = domain
-        else:
-            global_memory = self.config.get("global_memory", True)
-            filters = self._build_memory_filter(event, global_memory)
-            filters["deprecated"] = False  # 排除废弃的记忆
-            if domain:
-                filters["domain"] = domain
+            return await self._retrieve_with_filter(query, top_k, filters)
 
-        # 调用向量检索（若知识库配置了重排序模型则自动启用）
+        global_memory = self.config.get("global_memory", True)
+        filters_list = self._build_recall_filters(
+            event,
+            global_memory=global_memory,
+            domain=domain,
+            memory_scope=memory_scope,
+        )
+
+        results = []
+        for filters, legacy_personal, owner_user_id, require_owner_list in filters_list:
+            results.extend(
+                await self._retrieve_with_filter(
+                    query,
+                    top_k,
+                    filters,
+                    legacy_personal=legacy_personal,
+                    owner_user_id=owner_user_id,
+                    require_owner_list=require_owner_list,
+                )
+            )
+
+        memories = self._dedupe_memories(results)[:top_k]
+        logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
+        return memories
+
+    def _build_recall_filters(
+        self,
+        event: AstrMessageEvent,
+        global_memory: bool,
+        domain: str | None = None,
+        memory_scope: str | None = None,
+    ) -> list[tuple[dict[str, Any], bool, str | None, bool]]:
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        current_user_id = build_user_id(parsed.platform_id, event.get_sender_id())
+        scopes = (
+            [normalize_memory_scope(memory_scope)]
+            if memory_scope
+            else [MemoryScope.PERSONAL]
+        )
+        if not memory_scope and parsed.session_type == "group":
+            scopes.extend([MemoryScope.GROUP, MemoryScope.CONVERSATION])
+        elif not memory_scope and not global_memory:
+            scopes.append(MemoryScope.CONVERSATION)
+
+        filters_list = []
+        for scope in scopes:
+            filters = self._scope_filter(event, scope, global_memory)
+            if domain:
+                filters["domain"] = domain
+            filters_list.append((filters, False, None, False))
+            if scope == MemoryScope.PERSONAL:
+                legacy_filters = self._legacy_personal_filter(event, global_memory)
+                if domain:
+                    legacy_filters["domain"] = domain
+                filters_list.append((legacy_filters, True, current_user_id, False))
+                if parsed.session_type == "group":
+                    group_personal_filters = {
+                        "memory_scope": MemoryScope.PERSONAL,
+                        "owner_session_id": build_session_id(
+                            parsed.platform_id, parsed.session_id
+                        ),
+                        "visibility": "group",
+                        "is_memory_record": True,
+                        "deprecated": False,
+                    }
+                    if domain:
+                        group_personal_filters["domain"] = domain
+                    filters_list.append(
+                        (group_personal_filters, True, current_user_id, True)
+                    )
+        return filters_list
+
+    async def _retrieve_with_filter(
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any],
+        legacy_personal: bool = False,
+        owner_user_id: str | None = None,
+        require_owner_list: bool = False,
+    ) -> list[dict[str, Any]]:
         use_rerank = self.config.get("use_reranker", True)
         results = await self.vec_db.retrieve(
             query=query,
@@ -492,6 +696,10 @@ class MemoryManager:
         for result in results:
             data = result.data
             metadata = _safe_parse_metadata(data.get("metadata", {}))
+            if legacy_personal and not self._is_visible_personal_memory(
+                metadata, owner_user_id, require_owner_list
+            ):
+                continue
 
             memories.append(
                 {
@@ -501,8 +709,35 @@ class MemoryManager:
                 }
             )
 
-        logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
+
+    def _is_visible_personal_memory(
+        self,
+        metadata: dict[str, Any],
+        owner_user_id: str | None,
+        require_owner_list: bool = False,
+    ) -> bool:
+        scope = metadata.get("memory_scope")
+        if scope not in (None, "", MemoryScope.PERSONAL):
+            return False
+        owner_user_ids = metadata.get("owner_user_ids")
+        if isinstance(owner_user_ids, list) and owner_user_ids:
+            return owner_user_id in owner_user_ids if owner_user_id else True
+        if require_owner_list:
+            return False
+        return metadata.get("owner_user_id", metadata.get("user_id")) == owner_user_id
+
+    def _dedupe_memories(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen = set()
+        deduped = []
+        for mem in sorted(memories, key=lambda m: m.get("similarity", 0), reverse=True):
+            metadata = mem.get("metadata", {})
+            key = metadata.get("uri") or mem.get("text", "")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(mem)
+        return deduped
 
     async def forget_memory(
         self,
@@ -655,20 +890,18 @@ class MemoryManager:
             }
             if domain:
                 filters["domain"] = domain
+            total = await self.vec_db.count_documents(metadata_filter=filters)
+            offset = (page - 1) * page_size
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters,
+                offset=offset,
+                limit=page_size,
+            )
         else:
-            filters = self._build_user_filter(event)
-            filters["deprecated"] = False
-            if domain:
-                filters["domain"] = domain
-
-        total = await self.vec_db.count_documents(metadata_filter=filters)
-        offset = (page - 1) * page_size
-
-        docs = await self.vec_db.document_storage.get_documents(
-            metadata_filters=filters,
-            offset=offset,
-            limit=page_size,
-        )
+            docs = await self._list_visible_user_documents(event, domain)
+            total = len(docs)
+            offset = (page - 1) * page_size
+            docs = docs[offset : offset + page_size]
 
         memories = []
         for doc in docs:
@@ -682,6 +915,53 @@ class MemoryManager:
             )
 
         return memories, total
+
+    async def _list_visible_user_documents(
+        self, event: AstrMessageEvent, domain: str | None = None
+    ) -> list[dict[str, Any]]:
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        current_user_id = build_user_id(parsed.platform_id, event.get_sender_id())
+        filters = self._build_user_filter(event)
+        filters["deprecated"] = False
+        if domain:
+            filters["domain"] = domain
+
+        docs = await self.vec_db.document_storage.get_documents(
+            metadata_filters=filters,
+            limit=10000,
+        )
+        if parsed.session_type != "group":
+            return docs
+
+        group_filters = {
+            "memory_scope": MemoryScope.PERSONAL,
+            "owner_session_id": build_session_id(parsed.platform_id, parsed.session_id),
+            "visibility": "group",
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        if domain:
+            group_filters["domain"] = domain
+        group_docs = await self.vec_db.document_storage.get_documents(
+            metadata_filters=group_filters,
+            limit=10000,
+        )
+
+        visible = []
+        seen = set()
+        for doc in [*docs, *group_docs]:
+            metadata = _safe_parse_metadata(doc.get("metadata", {}))
+            uri = metadata.get("uri") or doc.get("text", "")
+            if uri in seen:
+                continue
+            if self._is_visible_personal_memory(
+                metadata,
+                current_user_id,
+                require_owner_list=doc in group_docs,
+            ):
+                visible.append(doc)
+                seen.add(uri)
+        return visible
 
     async def get_memory_by_uri(
         self,
@@ -1331,6 +1611,7 @@ class MemoryManager:
                 # 语义去重：召回相似记忆，高相似度则跳过
                 filters: dict[str, Any] = {
                     "user_id": item["user_id"],
+                    "memory_scope": item.get("memory_scope", MemoryScope.PERSONAL),
                     "is_memory_record": True,
                     "deprecated": False,
                 }
@@ -1359,6 +1640,12 @@ class MemoryManager:
                     "last_recalled_at": now,
                     "recall_count": 0,
                     "compressed": False,
+                    "memory_scope": item.get("memory_scope", MemoryScope.PERSONAL),
+                    "owner_user_id": item.get("owner_user_id", item["user_id"]),
+                    "owner_user_ids": item.get("owner_user_ids", [item["user_id"]]),
+                    "owner_session_id": item.get("owner_session_id", ""),
+                    "visibility": item.get("visibility", "private"),
+                    "speaker_id": item.get("speaker_id", item["sender_id"]),
                     "domain": item["domain"],
                     "uri": item["uri"],
                     "version": 1,
@@ -1366,6 +1653,10 @@ class MemoryManager:
                     "memory_type": item["memory_type"],
                     "disclosure": item["disclosure"],
                     "importance": item["importance"],
+                    "subject": item.get("subject", ""),
+                    "entities": item.get("entities", []),
+                    "topics": item.get("topics", []),
+                    "memory_content": content,
                 }
 
                 doc_id = str(uuid.uuid4())
