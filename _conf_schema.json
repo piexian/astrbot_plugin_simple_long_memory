@@ -59,6 +59,13 @@
     "hint": "限制 /memory list 为计算当前用户可见记忆而扫描的最大记录数。实际扫描量会按当前页码和每页数量推导，并不会超过此上限",
     "slider": {"min": 20, "max": 2000, "step": 20}
   },
+  "memory_delete_scan_page_size": {
+    "description": "记忆删除扫描分页大小",
+    "type": "int",
+    "default": 1000,
+    "hint": "删除或清空记忆前，每页扫描多少条匹配记录用于同步清理知识库文档记录。数值越大速度越快但单次内存占用更高",
+    "slider": {"min": 100, "max": 5000, "step": 100}
+  },
   "memory_ttl_days": {
     "description": "记忆生命周期(天)",
     "type": "int",

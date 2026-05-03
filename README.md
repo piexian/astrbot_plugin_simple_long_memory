@@ -36,6 +36,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | global_memory | 全局记忆模式（跨会话召回） | `true` |
 | max_memories_per_inject | 每次 LLM 请求注入的最大记忆条数 | `5` |
 | max_memory_list_scan | 记忆列表扫描上限 | `200` |
+| memory_delete_scan_page_size | 记忆删除扫描分页大小 | `1000` |
 | memory_ttl_days | 记忆生命周期（天） | `30` |
 | install_skill | 安装 AI 记忆指南 Skill | `false` |
 | use_reranker | 记忆召回时启用重排序（需知识库已配置重排序模型） | `true` |
@@ -52,9 +53,9 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 /memory stats [--all]                  - 查看记忆统计
 /memory test                           - 测试记忆读写功能（管理员）
 /memory forget <uri> [--user <用户ID>] - 删除指定记忆
-/memory clear [--all] [--user <用户ID>]- 清空记忆（管理员）
-/memory rebuild [--to <知识库名>]      - 重建或迁移记忆（管理员）
-/memory rebuild --clear-cache          - 清理重建缓存（管理员）
+/memory clear [--all] [--user <用户ID>] [--confirm <确认码>] - 清空记忆（管理员，需确认码）
+/memory rebuild [--to <知识库名>] [--confirm <确认码>] - 重建或迁移记忆（管理员，需确认码）
+/memory rebuild --clear-cache [--confirm <确认码>] - 清理重建缓存（管理员，需确认码）
 ```
 
 - `test`、`clear`、`rebuild` 需要管理员权限

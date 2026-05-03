@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.1 (2026-05-03)
+
+### 新增
+- **破坏性操作确认码**：`/memory clear`、`/memory rebuild`、`/memory rebuild --clear-cache` 需带 `--confirm <code>` 确认码，防止误操作。执行前展示影响范围和预计记录数
+
+### 修复
+- 新增快照上限（MAX_SESSION_SNAPSHOTS=20 / MAX_SNAPSHOT_CHARS=8000），防止长期会话内存膨胀
+- `llm_generate` 参数 `provider_id` → `chat_provider_id`，兼容新版 API
+- forget 不再区分"不存在"和"属于他人"，统一返回无权限，防止泄漏跨用户 URI 存在性
+- UMO 解析改用 `split(":", 2)`，防止含多冒号的 UMO 被错误拆分
+- `_is_visible_shared_personal` 过滤多 owner personal 记忆，确保仅 owner 可见
+- 召回先 `fetch_k=top_k*3` 再过滤去重，提高召回覆盖
+- `_flush_pending_writes` 失败记录进入重试队列，避免静默丢弃
+- 重建迁移时校验目标知识库为空，防止误覆盖
+- 崩溃恢复校验目标 KB 存在性及 ID 一致性，跳过已存在 URI
+- SENSITIVE_PATTERNS 改为预编译 `re.compile`，sanitize 性能优化
+
 ## v0.3.0 (2026-05-03)
 
 ### 新增
@@ -16,11 +33,13 @@
 - **Sender 追踪**：请求快照中记录 `sender_id`，对话历史按发送者标注
 - **检索优化超时配置**：新增 `optimize_recall_query_timeout`，限制检索优化模型调用最长等待时间
 - **列表扫描上限配置**：新增 `max_memory_list_scan`，限制群聊可见记忆列表的扫描量
+- **删除扫描分页配置**：新增 `memory_delete_scan_page_size`，控制删除/清空记忆前同步收集 KB 文档记录的分页大小
 
 ### 变更
 - `/memory list` 群聊中展示当前用户可见的所有记忆（含群组共享）
 - 记忆内容格式化改用结构化 `memory:` 标签行，仅写入 domain、memory、recall_when、entities、topics 等语义检索字段
 - 可见性值改为 `MemoryVisibility` 常量，减少裸字符串重复使用
+- 重建/迁移确认码绑定源/目标 KB ID，缓存清理确认码绑定实际缓存指纹
 
 ## v0.2.2 (2026-04-03)
 

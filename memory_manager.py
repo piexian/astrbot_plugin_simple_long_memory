@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -179,6 +180,11 @@ class MemoryManager:
         """当前绑定的 KB 名称"""
         return self._kb_name
 
+    @property
+    def is_rebuilding(self) -> bool:
+        """当前是否正在执行重建/迁移。"""
+        return self._rebuilding
+
     def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
         """从外部恢复重建期间未落盘的写入缓冲（启动恢复用）"""
         self._pending_writes = list(records)
@@ -278,6 +284,74 @@ class MemoryManager:
             async with session.begin():
                 session.add(doc)
                 await session.commit()
+
+    async def _ensure_kb_document(
+        self,
+        doc_id: str,
+        doc_name: str,
+        content_size: int,
+        kb_helper: KBHelper | None = None,
+    ) -> bool:
+        """确保向量文档对应的 KB 文档记录存在。"""
+        if not doc_id:
+            return False
+
+        kb = kb_helper or self._kb_helper
+        if not kb:
+            return False
+
+        try:
+            existing = await kb.get_document(doc_id)
+            if existing:
+                return True
+            await self._register_kb_document(
+                doc_id,
+                doc_name,
+                content_size,
+                kb_helper=kb,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] KB 文档记录修复失败: {doc_id}, {e}")
+            return False
+
+    async def _find_memory_doc_by_uri(
+        self,
+        kb_helper: KBHelper,
+        uri: str,
+    ) -> dict[str, Any] | None:
+        """按 URI 精确查找目标 KB 中已存在的记忆向量文档。"""
+        if not uri:
+            return None
+        docs = await kb_helper.vec_db.document_storage.get_documents(
+            metadata_filters={
+                "uri": uri,
+                "is_memory_record": True,
+                "kb_id": kb_helper.kb.kb_id,
+            },
+            limit=1,
+        )
+        return docs[0] if docs else None
+
+    async def _repair_kb_document_for_vector_doc(
+        self,
+        kb_helper: KBHelper,
+        doc: dict[str, Any],
+        fallback_name: str,
+    ) -> bool:
+        """向量文档已存在时，补齐缺失的 KB 文档记录。"""
+        metadata = _safe_parse_metadata(doc.get("metadata", {}))
+        doc_id = metadata.get("kb_doc_id")
+        if not doc_id:
+            return False
+        doc_name = metadata.get("uri") or fallback_name or doc_id
+        content_size = len(doc.get("text", "") or "")
+        return await self._ensure_kb_document(
+            doc_id,
+            doc_name,
+            content_size,
+            kb_helper=kb_helper,
+        )
 
     async def _unregister_kb_documents(
         self,
@@ -629,6 +703,7 @@ class MemoryManager:
         await self.vec_db.insert(
             content=formatted_content,
             metadata=metadata,
+            id=doc_id,
         )
 
         # 注册为 KB 文档（界面可见）
@@ -836,18 +911,10 @@ class MemoryManager:
         Returns:
             实际删除的记录数
         """
-        # 查询匹配记录的 kb_doc_id 以便同步删除 KB 文档记录
         doc_ids: list[str] = []
         deleted = 0
         try:
-            docs = await self.vec_db.document_storage.get_documents(
-                metadata_filters=filters, limit=100
-            )
-            deleted = len(docs)
-            for doc in docs:
-                md = _safe_parse_metadata(doc.get("metadata", {}))
-                if md.get("kb_doc_id"):
-                    doc_ids.append(md["kb_doc_id"])
+            doc_ids, deleted = await self._collect_kb_doc_ids_for_filters(filters)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
             try:
@@ -866,6 +933,39 @@ class MemoryManager:
 
         logger.info(f"[简单长期记忆] 删除记忆: {uri}, 实际删除 {deleted} 条")
         return deleted
+
+    async def _collect_kb_doc_ids_for_filters(
+        self,
+        filters: dict[str, Any],
+    ) -> tuple[list[str], int]:
+        """分页收集匹配向量文档的 KB 文档 ID，避免固定上限截断。"""
+        try:
+            page_size = int(self.config.get("memory_delete_scan_page_size", 1000))
+        except (TypeError, ValueError):
+            page_size = 1000
+        page_size = max(1, page_size)
+
+        doc_ids: list[str] = []
+        count = 0
+        offset = 0
+        while True:
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters,
+                offset=offset,
+                limit=page_size,
+            )
+            if not docs:
+                break
+            count += len(docs)
+            offset += len(docs)
+            for doc in docs:
+                md = _safe_parse_metadata(doc.get("metadata", {}))
+                if md.get("kb_doc_id"):
+                    doc_ids.append(md["kb_doc_id"])
+            if len(docs) < page_size:
+                break
+
+        return list(dict.fromkeys(doc_ids)), count
 
     async def clear_memories(
         self,
@@ -914,16 +1014,13 @@ class MemoryManager:
         doc_ids: list[str] = []
         count = 0
         try:
-            docs = await self.vec_db.document_storage.get_documents(
-                metadata_filters=filters, limit=10000
-            )
-            count = len(docs)
-            for doc in docs:
-                md = _safe_parse_metadata(doc.get("metadata", {}))
-                if md.get("kb_doc_id"):
-                    doc_ids.append(md["kb_doc_id"])
-        except Exception:
-            count = await self.vec_db.count_documents(metadata_filter=filters)
+            doc_ids, count = await self._collect_kb_doc_ids_for_filters(filters)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 查询待清空文档失败: {e}")
+            try:
+                count = await self.vec_db.count_documents(metadata_filter=filters)
+            except Exception as ce:
+                logger.warning(f"[简单长期记忆] 统计待清空文档失败: {ce}")
 
         await self.vec_db.delete_documents(metadata_filters=filters)
 
@@ -1280,6 +1377,33 @@ class MemoryManager:
         """检查知识库是否存在。"""
         return bool(await self.kb_mgr.get_kb_by_name(kb_name))
 
+    async def get_kb_id_by_name(self, kb_name: str | None) -> str:
+        """按知识库名称获取稳定 KB ID。"""
+        if not kb_name:
+            return ""
+        kb = await self.kb_mgr.get_kb_by_name(kb_name)
+        return kb.kb.kb_id if kb else ""
+
+    async def _resolve_rebuild_target_kb(
+        self,
+        rebuild_context: dict[str, Any] | None,
+    ) -> KBHelper | None:
+        """从重建上下文解析恢复目标，优先使用稳定 KB ID。"""
+        if not rebuild_context:
+            return self._kb_helper
+
+        target_kb_id = rebuild_context.get("target_kb_id")
+        if target_kb_id:
+            resolved_by_id = await self.kb_mgr.get_kb(target_kb_id)
+            if resolved_by_id:
+                return resolved_by_id
+
+        target_kb_name = rebuild_context.get("target_kb_name")
+        if target_kb_name:
+            return await self.kb_mgr.get_kb_by_name(target_kb_name)
+
+        return self._kb_helper
+
     async def _resume_rebuild_from_snapshot(
         self,
         memory_records: list[dict[str, Any]],
@@ -1296,42 +1420,42 @@ class MemoryManager:
         Returns:
             {"success": int, "failed": int, "remaining_records": list}
         """
-        if not self._kb_helper or not memory_records:
+        if not memory_records:
             return {
                 "success": 0,
                 "failed": 0,
                 "remaining_records": list(memory_records or []),
             }
 
-        target_kb = self._kb_helper
-        if rebuild_context:
-            target_kb_name = rebuild_context.get("target_kb_name")
-            target_kb_id = rebuild_context.get("target_kb_id")
-            if target_kb_name:
-                resolved_kb = await self.kb_mgr.get_kb_by_name(target_kb_name)
-                if not resolved_kb:
-                    logger.warning(
-                        f"[简单长期记忆] 快照恢复目标知识库不存在: {target_kb_name}"
-                    )
-                    return {
-                        "success": 0,
-                        "failed": len(memory_records),
-                        "remaining_records": list(memory_records),
-                        "error": f"目标知识库不存在: {target_kb_name}",
-                    }
-                if target_kb_id and resolved_kb.kb.kb_id != target_kb_id:
-                    logger.warning(
-                        "[简单长期记忆] 快照恢复目标知识库 ID 不匹配: "
-                        f"{target_kb_name}, expected={target_kb_id}, "
-                        f"actual={resolved_kb.kb.kb_id}"
-                    )
-                    return {
-                        "success": 0,
-                        "failed": len(memory_records),
-                        "remaining_records": list(memory_records),
-                        "error": f"目标知识库 ID 不匹配: {target_kb_name}",
-                    }
-                target_kb = resolved_kb
+        target_kb = await self._resolve_rebuild_target_kb(rebuild_context)
+        if not target_kb:
+            target_label = (
+                (rebuild_context or {}).get("target_kb_id")
+                or (rebuild_context or {}).get("target_kb_name")
+                or self._kb_name
+                or "unknown"
+            )
+            logger.warning(f"[简单长期记忆] 快照恢复目标知识库不存在: {target_label}")
+            return {
+                "success": 0,
+                "failed": len(memory_records),
+                "remaining_records": list(memory_records),
+                "error": f"目标知识库不存在: {target_label}",
+            }
+
+        expected_target_kb_id = (rebuild_context or {}).get("target_kb_id")
+        if expected_target_kb_id and target_kb.kb.kb_id != expected_target_kb_id:
+            logger.warning(
+                "[简单长期记忆] 快照恢复目标知识库 ID 不匹配: "
+                f"expected={expected_target_kb_id}, actual={target_kb.kb.kb_id}"
+            )
+            return {
+                "success": 0,
+                "failed": len(memory_records),
+                "remaining_records": list(memory_records),
+                "error": f"目标知识库 ID 不匹配: {target_kb.kb.kb_name}",
+            }
+
         success = 0
         failed = 0
         remaining_records: list[dict[str, Any]] = []
@@ -1348,14 +1472,16 @@ class MemoryManager:
 
             try:
                 if uri:
-                    existing = await target_kb.vec_db.count_documents(
-                        metadata_filter={
-                            "uri": uri,
-                            "is_memory_record": True,
-                            "kb_id": target_kb.kb.kb_id,
-                        }
-                    )
-                    if existing > 0:
+                    existing_doc = await self._find_memory_doc_by_uri(target_kb, uri)
+                    if existing_doc:
+                        if not await self._repair_kb_document_for_vector_doc(
+                            target_kb,
+                            existing_doc,
+                            uri,
+                        ):
+                            failed += 1
+                            remaining_records.append(record)
+                            continue
                         success += 1
                         continue
 
@@ -1373,9 +1499,13 @@ class MemoryManager:
                 await target_kb.vec_db.insert(
                     content=formatted_content,
                     metadata=updated_metadata,
+                    id=new_doc_id,
                 )
-                await self._register_kb_document(
-                    new_doc_id, uri, len(formatted_content), kb_helper=target_kb
+                await self._ensure_kb_document(
+                    new_doc_id,
+                    uri,
+                    len(formatted_content),
+                    kb_helper=target_kb,
                 )
                 success += 1
             except Exception as e:
@@ -1471,8 +1601,16 @@ class MemoryManager:
         self._rebuilding = True
 
         try:
-            if self._kv_put:
-                await self._kv_put("rebuild_status", "in_progress")
+            if self._kv_delete:
+                for key in (
+                    "rebuild_memory_records",
+                    "rebuild_context",
+                    "rebuild_status",
+                ):
+                    try:
+                        await self._kv_delete(key)
+                    except Exception as e:
+                        logger.warning(f"[简单长期记忆] 清理旧重建缓存失败: {key}, {e}")
 
             source_kb = self._kb_helper
             source_kb_name = self._kb_name
@@ -1607,6 +1745,7 @@ class MemoryManager:
             # 持久化拉取的数据到 KV（防进程崩溃丢失）
             if self._kv_put:
                 await self._kv_put("rebuild_memory_records", memory_records)
+                await self._kv_put("rebuild_status", "in_progress")
 
             # ── 阶段 2: 清空源 KB（原地重建时）或 留待后续清理（迁移时） ──
             if not is_migration:
@@ -1652,9 +1791,13 @@ class MemoryManager:
                     await target_kb.vec_db.insert(
                         content=formatted_content,
                         metadata=updated_metadata,
+                        id=new_doc_id,
                     )
-                    await self._register_kb_document(
-                        new_doc_id, uri, len(formatted_content), kb_helper=target_kb
+                    await self._ensure_kb_document(
+                        new_doc_id,
+                        uri,
+                        len(formatted_content),
+                        kb_helper=target_kb,
                     )
 
                     success += 1
@@ -1832,6 +1975,9 @@ class MemoryManager:
             return 0
 
         write_kb = target_kb or self._kb_helper
+        if not write_kb:
+            return 0
+
         pending = list(self._pending_writes)
         self._pending_writes.clear()
         flushed = 0
@@ -1839,7 +1985,20 @@ class MemoryManager:
 
         for item in pending:
             content = item["content"]
+            uri = item.get("uri", "")
             try:
+                existing_doc = await self._find_memory_doc_by_uri(write_kb, uri)
+                if existing_doc:
+                    if await self._repair_kb_document_for_vector_doc(
+                        write_kb,
+                        existing_doc,
+                        uri,
+                    ):
+                        flushed += 1
+                        continue
+                    retry_pending.append(item)
+                    continue
+
                 # 语义去重：召回相似记忆，高相似度则跳过
                 memory_scope = normalize_memory_scope(
                     item.get("memory_scope", MemoryScope.PERSONAL)
@@ -1912,17 +2071,15 @@ class MemoryManager:
                 await write_kb.vec_db.insert(
                     content=formatted_content,
                     metadata=metadata,
+                    id=doc_id,
                 )
 
-                try:
-                    await self._register_kb_document(
-                        doc_id,
-                        item["uri"],
-                        len(formatted_content),
-                        kb_helper=write_kb,
-                    )
-                except Exception as e:
-                    logger.warning(f"[简单长期记忆] 缓冲写入文档注册失败: {e}")
+                if not await self._ensure_kb_document(
+                    doc_id,
+                    item["uri"],
+                    len(formatted_content),
+                    kb_helper=write_kb,
+                ):
                     retry_pending.append(item)
                     continue
 
@@ -1988,6 +2145,29 @@ class MemoryManager:
         logger.info(f"[简单长期记忆] 已清理重建缓存: {result}")
         return result
 
+    def _hash_rebuild_cache_parts(self, *parts: Any) -> str:
+        payload = json.dumps(
+            parts,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+    def rebuild_cache_fingerprint(self, status: dict[str, Any]) -> str:
+        """生成重建缓存确认指纹。"""
+        cached = status.get("fingerprint")
+        if cached:
+            return str(cached)
+        return self._hash_rebuild_cache_parts(
+            status.get("memory_records", 0),
+            status.get("pending_writes", 0),
+            status.get("status"),
+            status.get("source_kb"),
+            status.get("target_kb"),
+            status.get("is_migration"),
+        )
+
     async def get_rebuild_cache_status(self) -> dict[str, Any]:
         """查看重建缓存的当前状态
 
@@ -2007,4 +2187,10 @@ class MemoryManager:
                 status["source_kb"] = rebuild_context.get("source_kb_name", "")
                 status["target_kb"] = rebuild_context.get("target_kb_name", "")
                 status["is_migration"] = bool(rebuild_context.get("is_migration"))
+            status["fingerprint"] = self._hash_rebuild_cache_parts(
+                records or [],
+                pending or [],
+                rebuild_status,
+                rebuild_context or {},
+            )
         return status

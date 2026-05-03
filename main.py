@@ -11,8 +11,10 @@ AstrBot 长期记忆插件主入口
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import shlex
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -151,8 +153,12 @@ def _read_positive_int(value: Any, default: int) -> int:
 
 def _confirmation_code(action: str, target: str = "") -> str:
     seed = f"{action}:{target}".encode("utf-8")
-    checksum = sum(seed) % 10000
-    return f"{action}-{checksum:04d}"
+    digest = hashlib.sha256(seed).hexdigest()[:8]
+    return f"{action}-{digest}"
+
+
+def _render_cmd_prefix(prefix: str) -> str:
+    return prefix or "/"
 
 
 def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
@@ -188,9 +194,14 @@ def _parse_memory_flags(args_text: str) -> dict[str, Any]:
         "user_missing_value": False,
         "to_missing_value": False,
         "confirm_missing_value": False,
+        "parse_error": "",
         "unknown_flags": [],
     }
-    tokens = args_text.split()
+    try:
+        tokens = shlex.split(args_text)
+    except ValueError as e:
+        result["parse_error"] = str(e)
+        return result
     i = 0
     positional_parts = []
     while i < len(tokens):
@@ -253,6 +264,8 @@ def _validate_command(
     """
     if args["unknown_flags"]:
         return f"未知参数: {', '.join(args['unknown_flags'])}"
+    if args["parse_error"]:
+        return f"参数解析失败: {args['parse_error']}"
     if args["user_missing_value"]:
         return "--user 需要指定用户 ID"
     if args["to_missing_value"]:
@@ -336,19 +349,24 @@ class MemoryPlugin(Star):
             if self.memory_mgr:
                 await self._recover_interrupted_rebuild()
             return
+        connected = False
         try:
             await self.memory_mgr.connect_kb()
+            connected = True
             logger.info("[简单长期记忆] 插件初始化成功")
         except Exception as e:
-            logger.error(f"[简单长期记忆] 连接知识库失败: {e}")
+            logger.error(f"[简单长期记忆] 连接知识库失败，将先尝试恢复重建缓存: {e}")
+
+        # 检测上次中断的重建：主快照可按缓存中的目标 KB ID 恢复，
+        # 不强依赖当前配置的源 KB 仍然可连接。
+        await self._recover_interrupted_rebuild()
+
+        if not connected:
             self.memory_mgr = None
             return
 
         if self.config.get("install_skill", False):
             self._install_skill()
-
-        # 检测上次中断的重建：恢复缓冲写入
-        await self._recover_interrupted_rebuild()
 
     async def _recover_interrupted_rebuild(self) -> None:
         """启动时检测并恢复上次中断的重建
@@ -366,6 +384,14 @@ class MemoryPlugin(Star):
             rebuild_status = await self.get_kv_data("rebuild_status", None)
             memory_records = await self.get_kv_data("rebuild_memory_records", None)
             rebuild_context = await self.get_kv_data("rebuild_context", None)
+
+            if (
+                rebuild_status == "in_progress"
+                and not memory_records
+                and not self.memory_mgr.is_rebuilding
+            ):
+                await self.put_kv_data("rebuild_status", "interrupted")
+                rebuild_status = "interrupted"
 
             if (
                 rebuild_status in {"in_progress", "interrupted"}
@@ -394,10 +420,16 @@ class MemoryPlugin(Star):
                         "未恢复，已保留到 KV，等待下次继续恢复"
                     )
                     await self.put_kv_data("rebuild_memory_records", remaining_records)
+                    await self.put_kv_data("rebuild_status", "interrupted")
                 else:
                     await self.delete_kv_data("rebuild_memory_records")
+                    await self.put_kv_data("rebuild_status", "completed")
         except Exception as e:
             logger.warning(f"[简单长期记忆] 恢复主数据快照失败: {e}")
+            try:
+                await self.put_kv_data("rebuild_status", "interrupted")
+            except Exception:
+                pass
 
         # 无论主数据快照是否恢复成功，都继续恢复缓冲写入
         try:
@@ -1103,6 +1135,7 @@ class MemoryPlugin(Star):
         else:
             target_label = f"current:{event.get_sender_id()}"
         confirm_code = _confirmation_code("clear", target_label)
+        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
         if args["confirm"] != confirm_code:
             if args["all"]:
                 preview = await self.memory_mgr.count_clear_memories(
@@ -1121,7 +1154,7 @@ class MemoryPlugin(Star):
                 "[清空确认]\n"
                 f"  范围: {scope}\n"
                 f"  预计影响: {preview} 条\n"
-                f"  确认执行: /memory clear --confirm {confirm_code}"
+                f"  确认执行: {cmd_prefix}memory clear --confirm {confirm_code}"
                 + (" --all" if args["all"] else "")
                 + (f" --user {args['user']}" if args["user"] else "")
             )
@@ -1163,7 +1196,15 @@ class MemoryPlugin(Star):
                 yield event.plain_result("--clear-cache 不能与 --to 同时使用")
                 return
             cache_status = await self.memory_mgr.get_rebuild_cache_status()
-            confirm_code = _confirmation_code("clear-cache", "rebuild")
+            if (
+                self.memory_mgr.is_rebuilding
+                or cache_status.get("status") == "in_progress"
+            ):
+                yield event.plain_result("重建/迁移正在进行中，不能清理缓存")
+                return
+            cache_fingerprint = self.memory_mgr.rebuild_cache_fingerprint(cache_status)
+            confirm_code = _confirmation_code("clear-cache", cache_fingerprint)
+            cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
             if args["confirm"] != confirm_code:
                 yield event.plain_result(
                     "[清理重建缓存确认]\n"
@@ -1172,8 +1213,15 @@ class MemoryPlugin(Star):
                     f"  上次状态: {cache_status.get('status', '无')}\n"
                     f"  源知识库: {cache_status.get('source_kb', '无')}\n"
                     f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
-                    f"  确认执行: /memory rebuild --clear-cache --confirm {confirm_code}"
+                    f"  确认执行: {cmd_prefix}memory rebuild --clear-cache --confirm {confirm_code}"
                 )
+                return
+            current_status = await self.memory_mgr.get_rebuild_cache_status()
+            if (
+                self.memory_mgr.rebuild_cache_fingerprint(current_status)
+                != cache_fingerprint
+            ):
+                yield event.plain_result("重建缓存状态已变化，请重新预览确认")
                 return
             result = await self.memory_mgr.clear_rebuild_cache()
             report = "[清理重建缓存]\n"
@@ -1195,7 +1243,17 @@ class MemoryPlugin(Star):
             target_kb_name = None
 
         action_target = target_kb_name or self.memory_mgr.current_kb_name
-        confirm_code = _confirmation_code("rebuild", action_target)
+        source_kb_id = await self.memory_mgr.get_kb_id_by_name(
+            self.memory_mgr.current_kb_name
+        )
+        target_kb_id = (
+            await self.memory_mgr.get_kb_id_by_name(target_kb_name)
+            if target_kb_name
+            else source_kb_id
+        )
+        action_fingerprint = f"{action_target}:{source_kb_id}:{target_kb_id}"
+        confirm_code = _confirmation_code("rebuild", action_fingerprint)
+        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
         if args["confirm"] != confirm_code:
             source_count = await self.memory_mgr.count_kb_memory_records_by_name(
                 self.memory_mgr.current_kb_name
@@ -1205,10 +1263,7 @@ class MemoryPlugin(Star):
                 if target_kb_name
                 else source_count
             )
-            target_missing = (
-                target_kb_name is not None
-                and not await self.memory_mgr.kb_exists(target_kb_name)
-            )
+            target_missing = target_kb_name is not None and not target_kb_id
             mode = "迁移" if target_kb_name else "重建"
             report = (
                 f"[{mode}确认]\n"
@@ -1224,10 +1279,17 @@ class MemoryPlugin(Star):
                 report += f"  目标已有记忆数: {target_count}\n"
                 if target_count > 0:
                     report += "  目标知识库已有记忆，执行前需要先清空或更换目标\n"
-            report += f"  确认执行: /memory rebuild --confirm {confirm_code}" + (
-                f" --to {target_kb_name}" if target_kb_name else ""
+            report += (
+                f"  确认执行: {cmd_prefix}memory rebuild --confirm {confirm_code}"
+                + (f" --to {shlex.quote(target_kb_name)}" if target_kb_name else "")
             )
             yield event.plain_result(report)
+            return
+        if not source_kb_id:
+            yield event.plain_result("当前知识库不存在，请检查配置")
+            return
+        if target_kb_name and not target_kb_id:
+            yield event.plain_result("目标知识库不存在，请重新预览确认")
             return
 
         if target_kb_name:
@@ -1261,7 +1323,7 @@ class MemoryPlugin(Star):
                 report += (
                     "\n\n  重建缓存已保留，请排查问题后重试。"
                     "\n  确认无需恢复后可执行:"
-                    "\n  /memory rebuild --clear-cache"
+                    f"\n  {cmd_prefix}memory rebuild --clear-cache"
                 )
                 yield event.plain_result(report)
                 return
