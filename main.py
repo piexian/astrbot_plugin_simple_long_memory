@@ -664,7 +664,7 @@ class MemoryPlugin(Star):
                 optimized = " ".join(str(k) for k in keywords[:5])
                 logger.debug(f"[简单长期记忆] 检索优化: {optimized}")
                 return optimized
-        except TimeoutError:
+        except asyncio.TimeoutError:
             logger.debug("[简单长期记忆] 检索优化超时，使用原始查询")
         except Exception as e:
             logger.debug(f"[简单长期记忆] 检索优化失败，使用原始查询: {e}")

@@ -123,6 +123,13 @@ class MemoryScope:
     CONVERSATION = "conversation"
 
 
+class MemoryVisibility:
+    """记忆可见性枚举"""
+
+    PRIVATE = "private"
+    GROUP = "group"
+
+
 def normalize_memory_scope(scope: str) -> str:
     """标准化记忆作用域"""
     scope = (scope or "").lower().strip()
@@ -177,7 +184,7 @@ class MemoryMetadata:
     owner_user_id: str = ""
     owner_user_ids: list[str] = field(default_factory=list)
     owner_session_id: str = ""
-    visibility: str = "private"
+    visibility: str = MemoryVisibility.PRIVATE
     speaker_id: str = ""
     subject: str = ""
     entities: list[str] = field(default_factory=list)

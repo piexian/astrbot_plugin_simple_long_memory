@@ -15,10 +15,12 @@
 - **记忆提取增强**：LLM 提取 prompt 新增会话作用域信息、`scope`/`subject`/`subjects`/`entities`/`topics` 字段，支持群聊下多人记忆归属标注
 - **Sender 追踪**：请求快照中记录 `sender_id`，对话历史按发送者标注
 - **检索优化超时配置**：新增 `optimize_recall_query_timeout`，限制检索优化模型调用最长等待时间
+- **列表扫描上限配置**：新增 `max_memory_list_scan`，限制群聊可见记忆列表的扫描量
 
 ### 变更
 - `/memory list` 群聊中展示当前用户可见的所有记忆（含群组共享）
 - 记忆内容格式化改用结构化 `memory:` 标签行，新增 `subject`/`owners`/`entities`/`topics` 等展示字段
+- 可见性值改为 `MemoryVisibility` 常量，减少裸字符串重复使用
 
 ## v0.2.2 (2026-04-03)
 

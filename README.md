@@ -35,6 +35,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | extraction_min_content_length | 对话总长度低于此值时跳过提取 | `150` |
 | global_memory | 全局记忆模式（跨会话召回） | `true` |
 | max_memories_per_inject | 每次 LLM 请求注入的最大记忆条数 | `5` |
+| max_memory_list_scan | 记忆列表扫描上限 | `200` |
 | memory_ttl_days | 记忆生命周期（天） | `30` |
 | install_skill | 安装 AI 记忆指南 Skill | `false` |
 | use_reranker | 记忆召回时启用重排序（需知识库已配置重排序模型） | `true` |

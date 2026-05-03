@@ -52,6 +52,13 @@
     "default": 5,
     "hint": "LLM请求时注入的最大记忆条数"
   },
+  "max_memory_list_scan": {
+    "description": "记忆列表扫描上限",
+    "type": "int",
+    "default": 200,
+    "hint": "限制 /memory list 为计算当前用户可见记忆而扫描的最大记录数。实际扫描量会按当前页码和每页数量推导，并不会超过此上限",
+    "slider": {"min": 20, "max": 2000, "step": 20}
+  },
   "memory_ttl_days": {
     "description": "记忆生命周期(天)",
     "type": "int",

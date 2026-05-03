@@ -22,6 +22,7 @@ from .memory_protocol import (
     MemoryScope,
     MemoryType,
     MemoryURI,
+    MemoryVisibility,
     UMOInfo,
     build_session_id,
     build_user_id,
@@ -117,9 +118,13 @@ def normalize_memory_type(memory_type: str) -> str:
 def normalize_visibility(visibility: str, memory_scope: str) -> str:
     """标准化记忆可见性"""
     visibility = (visibility or "").lower().strip()
-    if visibility in ("private", "group"):
+    if visibility in (MemoryVisibility.PRIVATE, MemoryVisibility.GROUP):
         return visibility
-    return "group" if memory_scope == MemoryScope.GROUP else "private"
+    return (
+        MemoryVisibility.GROUP
+        if memory_scope == MemoryScope.GROUP
+        else MemoryVisibility.PRIVATE
+    )
 
 
 def _normalize_sender_ids(sender_ids: list[str] | None, fallback: str) -> list[str]:
@@ -517,7 +522,7 @@ class MemoryManager:
             owner_sender_ids, owner_sender_id or event.get_sender_id()
         )
         if memory_scope == MemoryScope.PERSONAL and len(owner_sender_ids) > 1:
-            visibility = "group"
+            visibility = MemoryVisibility.GROUP
 
         if uri is None:
             uri = str(MemoryURI.generate(domain))
@@ -709,7 +714,7 @@ class MemoryManager:
                         "owner_session_id": build_session_id(
                             parsed.platform_id, parsed.session_id
                         ),
-                        "visibility": "group",
+                        "visibility": MemoryVisibility.GROUP,
                         "is_memory_record": True,
                         "deprecated": False,
                     }
@@ -949,7 +954,9 @@ class MemoryManager:
                 limit=page_size,
             )
         else:
-            docs = await self._list_visible_user_documents(event, domain)
+            docs = await self._list_visible_user_documents(
+                event, domain, page=page, page_size=page_size
+            )
             total = len(docs)
             offset = (page - 1) * page_size
             docs = docs[offset : offset + page_size]
@@ -968,10 +975,16 @@ class MemoryManager:
         return memories, total
 
     async def _list_visible_user_documents(
-        self, event: AstrMessageEvent, domain: str | None = None
+        self,
+        event: AstrMessageEvent,
+        domain: str | None = None,
+        *,
+        page: int = 1,
+        page_size: int = 10,
     ) -> list[dict[str, Any]]:
         parsed = UMOInfo.parse(event.unified_msg_origin)
         current_user_id = build_user_id(parsed.platform_id, event.get_sender_id())
+        scan_limit = self._memory_list_scan_limit(page, page_size)
         filters = self._build_user_filter(event)
         filters["deprecated"] = False
         if domain:
@@ -979,7 +992,7 @@ class MemoryManager:
 
         docs = await self.vec_db.document_storage.get_documents(
             metadata_filters=filters,
-            limit=10000,
+            limit=scan_limit,
         )
         if parsed.session_type != "group":
             return docs
@@ -987,7 +1000,7 @@ class MemoryManager:
         group_filters = {
             "memory_scope": MemoryScope.PERSONAL,
             "owner_session_id": build_session_id(parsed.platform_id, parsed.session_id),
-            "visibility": "group",
+            "visibility": MemoryVisibility.GROUP,
             "is_memory_record": True,
             "deprecated": False,
         }
@@ -995,7 +1008,7 @@ class MemoryManager:
             group_filters["domain"] = domain
         group_docs = await self.vec_db.document_storage.get_documents(
             metadata_filters=group_filters,
-            limit=10000,
+            limit=scan_limit,
         )
 
         visible = []
@@ -1013,6 +1026,15 @@ class MemoryManager:
                 visible.append(doc)
                 seen.add(uri)
         return visible
+
+    def _memory_list_scan_limit(self, page: int, page_size: int) -> int:
+        try:
+            configured = int(self.config.get("max_memory_list_scan", 200))
+        except (TypeError, ValueError):
+            configured = 200
+        configured = max(1, configured)
+        needed = max(1, page) * max(1, page_size)
+        return min(configured, needed)
 
     async def get_memory_by_uri(
         self,
@@ -1667,7 +1689,7 @@ class MemoryManager:
                     "owner_user_id": item.get("owner_user_id", item["user_id"]),
                     "owner_user_ids": item.get("owner_user_ids", [item["user_id"]]),
                     "owner_session_id": item.get("owner_session_id", ""),
-                    "visibility": item.get("visibility", "private"),
+                    "visibility": item.get("visibility", MemoryVisibility.PRIVATE),
                     "speaker_id": item.get("speaker_id", item["sender_id"]),
                     "domain": item["domain"],
                     "uri": item["uri"],
