@@ -46,6 +46,8 @@ from .prompts import (
 )
 
 DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT = 10
+DEFAULT_MAX_SESSION_SNAPSHOTS = 20
+DEFAULT_MAX_SNAPSHOT_CHARS = 8000
 
 
 def _sanitize_string_list(value: Any, limit: int = 8) -> list[str]:
@@ -137,6 +139,14 @@ def _clamp_timeout(
     except (TypeError, ValueError):
         timeout = default
     return max(1, min(20, timeout))
+
+
+def _read_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0, parsed)
 
 
 def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
@@ -256,6 +266,9 @@ class MemoryPlugin(Star):
 
     # 请求快照过期时间（秒）
     SNAPSHOT_TTL = 300  # 5 分钟
+    SNAPSHOT_CLEANUP_INTERVAL = 60
+    MAX_SESSION_SNAPSHOTS = DEFAULT_MAX_SESSION_SNAPSHOTS
+    MAX_SNAPSHOT_CHARS = DEFAULT_MAX_SNAPSHOT_CHARS
 
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
@@ -267,6 +280,7 @@ class MemoryPlugin(Star):
         self._request_snapshots: dict[str, dict[str, Any]] = {}
         # 每个会话的对话计数器
         self._session_counters: dict[str, int] = {}
+        self._last_snapshot_cleanup = 0.0
 
     async def initialize(self):
         """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
@@ -405,6 +419,8 @@ class MemoryPlugin(Star):
 
     async def terminate(self):
         """插件销毁"""
+        self._request_snapshots.clear()
+        self._session_counters.clear()
         logger.info("[简单长期记忆] 插件已卸载")
 
     def _get_cmd_prefix(self) -> str:
@@ -458,6 +474,10 @@ class MemoryPlugin(Star):
         self, event: AstrMessageEvent, request: ProviderRequest
     ) -> None:
         """累积请求快照（在请求阶段调用）"""
+        if _read_positive_int(self.config.get("extraction_interval", 20), 20) <= 0:
+            self._discard_session_snapshots(event)
+            return
+
         session_key = self._get_session_key(event)
         current_time = time.time()
 
@@ -469,16 +489,15 @@ class MemoryPlugin(Star):
             }
 
         # 存储待匹配的请求
-        self._request_snapshots[session_key]["pending_prompt"] = request.prompt or ""
-        self._request_snapshots[session_key]["pending_contexts"] = (
-            list(request.contexts) if request.contexts else []
-        )
+        self._request_snapshots[session_key]["pending_prompt"] = (request.prompt or "")[
+            : self.MAX_SNAPSHOT_CHARS
+        ]
         self._request_snapshots[session_key]["pending_sender_id"] = (
             event.get_sender_id()
         )
         self._request_snapshots[session_key]["timestamp"] = current_time
 
-        self._cleanup_expired_snapshots()
+        self._cleanup_expired_snapshots(current_time)
 
     def _complete_snapshot_with_response(
         self, event: AstrMessageEvent, response_text: str
@@ -493,15 +512,15 @@ class MemoryPlugin(Star):
         # 创建完整的快照
         snapshot = {
             "prompt": entry["pending_prompt"],
-            "contexts": entry.get("pending_contexts", []),
-            "response": response_text,
+            "response": response_text[: self.MAX_SNAPSHOT_CHARS],
             "sender_id": entry.get("pending_sender_id", event.get_sender_id()),
         }
         entry["snapshots"].append(snapshot)
+        if len(entry["snapshots"]) > self.MAX_SESSION_SNAPSHOTS:
+            del entry["snapshots"][: -self.MAX_SESSION_SNAPSHOTS]
 
         # 清除待匹配状态
         entry["pending_prompt"] = None
-        entry["pending_contexts"] = []
         entry["pending_sender_id"] = ""
 
     def _get_session_snapshot_count(self, event: AstrMessageEvent) -> int:
@@ -526,15 +545,25 @@ class MemoryPlugin(Star):
         entry["snapshots"] = []
         return snapshots
 
+    def _discard_session_snapshots(self, event: AstrMessageEvent) -> None:
+        """清理当前会话快照和计数器"""
+        session_key = self._get_session_key(event)
+        self._request_snapshots.pop(session_key, None)
+        self._session_counters.pop(session_key, None)
+
     def _increment_session_counter(self, event: AstrMessageEvent) -> int:
         """递增会话对话计数器并返回当前值"""
         key = self._get_session_key(event)
         self._session_counters[key] = self._session_counters.get(key, 0) + 1
         return self._session_counters[key]
 
-    def _cleanup_expired_snapshots(self) -> None:
+    def _cleanup_expired_snapshots(self, current_time: float | None = None) -> None:
         """清理过期的请求快照"""
-        current_time = time.time()
+        current_time = current_time or time.time()
+        if current_time - self._last_snapshot_cleanup < self.SNAPSHOT_CLEANUP_INTERVAL:
+            return
+        self._last_snapshot_cleanup = current_time
+
         expired_keys = [
             key
             for key, entry in self._request_snapshots.items()
@@ -542,6 +571,10 @@ class MemoryPlugin(Star):
         ]
         for key in expired_keys:
             del self._request_snapshots[key]
+            self._session_counters.pop(key, None)
+        for key in list(self._session_counters):
+            if key not in self._request_snapshots:
+                self._session_counters.pop(key, None)
 
     # ==================== JSON 解析辅助 ====================
 
@@ -597,7 +630,9 @@ class MemoryPlugin(Star):
                         continue
                 entities = _sanitize_string_list(item.get("entities", []))
                 topics = _sanitize_string_list(item.get("topics", []))
-                disclosure = str(item.get("disclosure", ""))[:200]  # 限制长度
+                disclosure = _sanitize_memory_content(str(item.get("disclosure", "")))[
+                    :200
+                ]
 
                 try:
                     importance = int(item.get("importance", 3))
@@ -659,7 +694,7 @@ class MemoryPlugin(Star):
             )
             llm_response = await asyncio.wait_for(
                 self.context.llm_generate(
-                    provider_id=provider_id,
+                    chat_provider_id=provider_id,
                     prompt=prompt,
                 ),
                 timeout=timeout,
@@ -740,6 +775,13 @@ class MemoryPlugin(Star):
             return
 
         try:
+            extraction_interval = _read_positive_int(
+                self.config.get("extraction_interval", 20), 20
+            )
+            if extraction_interval <= 0:
+                self._discard_session_snapshots(event)
+                return
+
             # 获取响应文本
             assistant_output = (
                 getattr(response, "completion_text", "")
@@ -754,9 +796,6 @@ class MemoryPlugin(Star):
             current_count = self._increment_session_counter(event)
 
             # 检查是否达到提取间隔
-            extraction_interval = self.config.get("extraction_interval", 20)
-            if extraction_interval <= 0:
-                return
             if current_count % extraction_interval != 0:
                 return
 
@@ -797,7 +836,7 @@ class MemoryPlugin(Star):
             )
             try:
                 llm_response = await self.context.llm_generate(
-                    provider_id=provider_id,
+                    chat_provider_id=provider_id,
                     prompt=prompt,
                 )
                 extraction_result = getattr(llm_response, "completion_text", "") or ""
@@ -1006,13 +1045,11 @@ class MemoryPlugin(Star):
                 yield event.plain_result(f"已删除 {deleted} 条记忆: {uri}")
         else:
             # 普通用户只能删自己的
-            deleted, owned_by_other = await self.memory_mgr.forget_memory(event, uri)
+            deleted = await self.memory_mgr.forget_memory(event, uri)
             if deleted > 0:
                 yield event.plain_result(f"已删除记忆: {uri}")
-            elif owned_by_other:
-                yield event.plain_result("该记忆不属于你，无法删除")
             else:
-                yield event.plain_result(f"未找到记忆: {uri}")
+                yield event.plain_result(f"未找到或无权限删除记忆: {uri}")
 
     @memory_group.command("clear")
     async def cmd_clear(self, event: AstrMessageEvent):
@@ -1106,6 +1143,10 @@ class MemoryPlugin(Star):
                 # 失败路径：明确告知异常终止
                 mode = "迁移" if result["is_migration"] else "重建"
                 error_msg = result.get("error", "未知错误")
+                if result["is_migration"] and result.get("success", 0) > 0:
+                    error_msg += (
+                        "；目标知识库可能已有已写入副本，源知识库未确认清理完成"
+                    )
                 report = (
                     f"[{mode}异常终止]\n"
                     f"  原因: {error_msg}\n"
@@ -1278,7 +1319,7 @@ class MemoryPlugin(Star):
             domain=domain,
             uri=uri,
             memory_type=MemoryType.NORMAL,
-            disclosure=disclosure[:200] if disclosure else "",
+            disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
         )
         return f"Memory stored: {uri}"
 
@@ -1292,9 +1333,7 @@ class MemoryPlugin(Star):
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
-        deleted, owned_by_other = await self.memory_mgr.forget_memory(event, uri)
+        deleted = await self.memory_mgr.forget_memory(event, uri)
         if deleted == 0:
-            if owned_by_other:
-                return f"Cannot delete memory {uri}: it belongs to another user. Ask an admin to delete it."
-            return f"Memory not found: {uri}"
+            return f"Memory not found or not permitted: {uri}"
         return f"Memory deleted: {uri} ({deleted} record(s))"

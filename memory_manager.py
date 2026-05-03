@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+from astrbot.api import logger
 
 from .memory_protocol import (
     MemoryMetadata,
@@ -36,8 +37,6 @@ if TYPE_CHECKING:
     from astrbot.core.knowledge_base.kb_helper import KBHelper
     from astrbot.core.knowledge_base.kb_mgr import KnowledgeBaseManager
     from astrbot.core.platform import AstrMessageEvent
-
-logger = logging.getLogger("astrbot")
 
 # KV 存储回调类型
 KVPutFn = Callable[[str, Any], Any]
@@ -357,6 +356,33 @@ class MemoryManager:
     ) -> list[str]:
         return [build_user_id(platform_id, sender_id) for sender_id in owner_sender_ids]
 
+    def _current_owner_user_id(self, event: AstrMessageEvent) -> str:
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        return build_user_id(parsed.platform_id, event.get_sender_id())
+
+    def _is_visible_shared_personal(
+        self, event: AstrMessageEvent, metadata: dict[str, Any]
+    ) -> bool:
+        """多 owner personal 记忆只对 owner_user_ids 内的用户可见。"""
+        if metadata.get("memory_scope") != MemoryScope.PERSONAL:
+            return True
+        if metadata.get("visibility") != MemoryVisibility.GROUP:
+            return True
+        owner_user_ids = metadata.get("owner_user_ids", [])
+        if not isinstance(owner_user_ids, list):
+            owner_user_ids = []
+        return self._current_owner_user_id(event) in owner_user_ids
+
+    def _filter_visible_shared_personal(
+        self, event: AstrMessageEvent, memories: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        visible = []
+        for memory in memories:
+            metadata = _safe_parse_metadata(memory.get("metadata", {}))
+            if self._is_visible_shared_personal(event, metadata):
+                visible.append(memory)
+        return visible
+
     def _scope_filter(
         self,
         event: AstrMessageEvent,
@@ -638,12 +664,14 @@ class MemoryManager:
         """
         if top_k is None:
             top_k = self.config.get("max_memories_per_inject", 5)
+        fetch_k = max(top_k, min(top_k * 3, 20))
 
         if all_users:
             filters = {"is_memory_record": True, "deprecated": False}
             if domain:
                 filters["domain"] = domain
-            return await self._retrieve_with_filter(query, top_k, filters)
+            memories = await self._retrieve_with_filter(query, fetch_k, filters)
+            return self._dedupe_memories(memories)[:top_k]
 
         global_memory = self.config.get("global_memory", True)
         filters_list = self._build_recall_filters(
@@ -656,13 +684,14 @@ class MemoryManager:
         tasks = [
             self._retrieve_with_filter(
                 query,
-                top_k,
+                fetch_k,
                 filters,
             )
             for filters in filters_list
         ]
         results_list = await asyncio.gather(*tasks)
         results = [item for sublist in results_list for item in sublist]
+        results = self._filter_visible_shared_personal(event, results)
 
         memories = self._dedupe_memories(results)[:top_k]
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
@@ -751,11 +780,7 @@ class MemoryManager:
             deduped.append(mem)
         return deduped
 
-    async def forget_memory(
-        self,
-        event: AstrMessageEvent,
-        uri: str,
-    ) -> tuple[int, bool]:
+    async def forget_memory(self, event: AstrMessageEvent, uri: str) -> int:
         """删除当前用户指定 URI 的记忆（LLM 工具用，按 user_id 隔离）
 
         Args:
@@ -763,16 +788,32 @@ class MemoryManager:
             uri: 记忆 URI
 
         Returns:
-            (删除数, URI是否存在但属于其他用户)
+            删除数。无权限和不存在都返回 0，避免泄漏跨用户 URI 存在性。
         """
         filters = self._build_user_filter(event)
         filters["uri"] = uri
         deleted = await self._delete_by_filters(filters, uri)
         if deleted > 0:
-            return (deleted, False)
-        # 检查该 URI 是否存在（属于其他用户）
-        exists = await self.vec_db.count_documents(metadata_filter={"uri": uri})
-        return (0, exists > 0)
+            return deleted
+
+        shared_docs = await self.vec_db.document_storage.get_documents(
+            metadata_filters={
+                "uri": uri,
+                "memory_scope": MemoryScope.PERSONAL,
+                "visibility": MemoryVisibility.GROUP,
+                "is_memory_record": True,
+                "deprecated": False,
+            },
+            limit=20,
+        )
+        for doc in shared_docs:
+            metadata = _safe_parse_metadata(doc.get("metadata", {}))
+            if self._is_visible_shared_personal(event, metadata):
+                return await self._delete_by_filters(
+                    {"uri": uri, "kb_doc_id": metadata.get("kb_doc_id", "")},
+                    uri,
+                )
+        return 0
 
     async def forget_memory_by_uri(self, uri: str) -> int:
         """管理员按 URI 删除所有匹配的记忆（不限用户）
@@ -993,6 +1034,8 @@ class MemoryManager:
                 scanned_all_sources = False
             for doc in docs[:scan_limit]:
                 metadata = _safe_parse_metadata(doc.get("metadata", {}))
+                if not self._is_visible_shared_personal(event, metadata):
+                    continue
                 uri = metadata.get("uri") or doc.get("text", "")
                 if uri in seen:
                     continue
@@ -1506,6 +1549,7 @@ class MemoryManager:
 
             # ── 阶段 4: 迁移模式 — 仅当全部成功时清空源 KB 并切换 ──
             migration_committed = False
+            migration_commit_error = ""
             if is_migration:
                 if failed == 0 and success > 0:
                     try:
@@ -1521,7 +1565,8 @@ class MemoryManager:
                         migration_committed = True
                         logger.info(f"[简单长期记忆] 已迁移到知识库: {target_kb_name}")
                     except Exception as e:
-                        logger.error(f"[简单长期记忆] 清理源知识库失败: {e}")
+                        migration_commit_error = f"清理源知识库失败: {e}"
+                        logger.error(f"[简单长期记忆] {migration_commit_error}")
                 elif failed > 0:
                     logger.warning(
                         f"[简单长期记忆] 存在 {failed} 条写入失败，"
@@ -1545,6 +1590,8 @@ class MemoryManager:
             pending_flushed = await self._flush_pending_writes(target_kb=flush_target)
 
             final_status = "completed" if failed == 0 else "partial"
+            if migration_commit_error:
+                final_status = "interrupted"
             if self._kv_put:
                 await self._kv_put("rebuild_status", final_status)
 
@@ -1575,6 +1622,7 @@ class MemoryManager:
                 "pending_flushed": pending_flushed,
                 "verification": verification,
                 "migration_committed": migration_committed,
+                "error": migration_commit_error,
             }
         finally:
             self._rebuilding = False

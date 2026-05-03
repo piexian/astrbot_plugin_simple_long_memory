@@ -39,7 +39,7 @@ class UMOInfo:
         Returns:
             UMOInfo 解析结果
         """
-        parts = umo.split(":")
+        parts = umo.split(":", 2)
         return cls(
             platform_id=parts[0] if len(parts) > 0 else "",
             session_type=parts[1] if len(parts) > 1 else "private",

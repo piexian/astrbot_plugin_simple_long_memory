@@ -73,13 +73,16 @@ ALLOWED_MEMORY_TYPES: frozenset[str] = frozenset(
 
 # 需要过滤的敏感指令模式
 SENSITIVE_PATTERNS = [
-    r"ignore\s+(previous|all|above)\s+(instructions?|prompts?)",
-    r"forget\s+(previous|all|above)",
-    r"you\s+are\s+now?",
-    r"act\s+as\s+",
-    r"pretend\s+(to\s+be|you\s+are)",
-    r"disregard\s+",
-    r"override\s+",
+    re.compile(
+        r"ignore\s+(previous|all|above)\s+(instructions?|prompts?)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"forget\s+(previous|all|above)", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now?", re.IGNORECASE),
+    re.compile(r"act\s+as\s+", re.IGNORECASE),
+    re.compile(r"pretend\s+(to\s+be|you\s+are)", re.IGNORECASE),
+    re.compile(r"disregard\s+", re.IGNORECASE),
+    re.compile(r"override\s+", re.IGNORECASE),
 ]
 
 
@@ -94,5 +97,5 @@ def sanitize_memory_content(content: str) -> str:
         return ""
     content = content[:MAX_MEMORY_CONTENT_LENGTH]
     for pattern in SENSITIVE_PATTERNS:
-        content = re.sub(pattern, "[filtered]", content, flags=re.IGNORECASE)
+        content = pattern.sub("[filtered]", content)
     return content.strip()
