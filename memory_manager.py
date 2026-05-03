@@ -24,6 +24,7 @@ from .memory_protocol import (
     MemoryType,
     MemoryURI,
     MemoryVisibility,
+    MemoryMetadata,
     UMOInfo,
     build_session_id,
     build_user_id,
@@ -306,6 +307,29 @@ class MemoryManager:
         )
         await kb.refresh_kb()
 
+    async def _delete_rebuild_source_records(
+        self,
+        kb_helper: KBHelper,
+        memory_records: list[dict[str, Any]],
+    ) -> None:
+        kb_id = kb_helper.kb.kb_id
+        await kb_helper.vec_db.delete_documents(
+            metadata_filters={"is_memory_record": True, "kb_id": kb_id}
+        )
+        legacy_uris: set[str] = set()
+        for record in memory_records:
+            metadata = _safe_parse_metadata(record.get("metadata", {}))
+            if (
+                not metadata.get("is_memory_record")
+                and metadata.get("kb_id") == kb_id
+                and metadata.get("uri")
+            ):
+                legacy_uris.add(metadata["uri"])
+        for uri in legacy_uris:
+            await kb_helper.vec_db.delete_documents(
+                metadata_filters={"uri": uri, "kb_id": kb_id}
+            )
+
     def _build_user_filter(self, event: AstrMessageEvent) -> dict[str, Any]:
         """构建用户隔离的 metadata 过滤器
 
@@ -332,28 +356,6 @@ class MemoryManager:
         self, platform_id: str, owner_sender_ids: list[str]
     ) -> list[str]:
         return [build_user_id(platform_id, sender_id) for sender_id in owner_sender_ids]
-
-    def _build_memory_filter(
-        self,
-        event: AstrMessageEvent,
-        global_memory: bool = True,
-    ) -> dict[str, Any]:
-        """构建记忆召回过滤器
-
-        Args:
-            event: 消息事件
-            global_memory: 是否全局记忆模式
-
-        Returns:
-            metadata 过滤器字典
-        """
-        filters = self._build_user_filter(event)
-
-        if not global_memory:
-            # 非全局模式：仅召回当前会话的记忆
-            filters["umo"] = event.unified_msg_origin
-
-        return filters
 
     def _scope_filter(
         self,
@@ -386,16 +388,6 @@ class MemoryManager:
         filters["deprecated"] = False
         return filters
 
-    def _legacy_personal_filter(
-        self,
-        event: AstrMessageEvent,
-        global_memory: bool = True,
-    ) -> dict[str, Any]:
-        filters = self._build_memory_filter(event, global_memory)
-        filters["is_memory_record"] = True
-        filters["deprecated"] = False
-        return filters
-
     def _build_query_filter(
         self,
         event: AstrMessageEvent | None,
@@ -421,7 +413,7 @@ class MemoryManager:
                 raise ValueError("非 all_users 模式需要传入 event")
             if respect_global:
                 global_memory = self.config.get("global_memory", True)
-                filters = self._build_memory_filter(event, global_memory)
+                filters = self._scope_filter(event, MemoryScope.PERSONAL, global_memory)
             else:
                 filters = self._build_user_filter(event)
         if not include_deprecated:
@@ -595,7 +587,6 @@ class MemoryManager:
             topics=topics,
             memory_content=content,
             owner_sender_ids=owner_sender_ids,
-            speaker_id=owner_sender_ids[0],
         )
 
         # 生成 KB 文档 ID 并关联到向量条目
@@ -667,11 +658,8 @@ class MemoryManager:
                 query,
                 top_k,
                 filters,
-                legacy_personal=legacy_personal,
-                owner_user_id=owner_user_id,
-                require_owner_list=require_owner_list,
             )
-            for filters, legacy_personal, owner_user_id, require_owner_list in filters_list
+            for filters in filters_list
         ]
         results_list = await asyncio.gather(*tasks)
         results = [item for sublist in results_list for item in sublist]
@@ -686,9 +674,8 @@ class MemoryManager:
         global_memory: bool,
         domain: str | None = None,
         memory_scope: str | None = None,
-    ) -> list[tuple[dict[str, Any], bool, str | None, bool]]:
+    ) -> list[dict[str, Any]]:
         parsed = UMOInfo.parse(event.unified_msg_origin)
-        current_user_id = build_user_id(parsed.platform_id, event.get_sender_id())
         scopes = (
             [normalize_memory_scope(memory_scope)]
             if memory_scope
@@ -705,12 +692,8 @@ class MemoryManager:
             filters = self._scope_filter(event, scope, global_memory)
             if domain:
                 filters["domain"] = domain
-            filters_list.append((filters, False, None, False))
+            filters_list.append(filters)
             if scope == MemoryScope.PERSONAL:
-                legacy_filters = self._legacy_personal_filter(event, global_memory)
-                if domain:
-                    legacy_filters["domain"] = domain
-                filters_list.append((legacy_filters, True, current_user_id, False))
                 if parsed.session_type == "group":
                     group_personal_filters = {
                         "memory_scope": MemoryScope.PERSONAL,
@@ -723,9 +706,7 @@ class MemoryManager:
                     }
                     if domain:
                         group_personal_filters["domain"] = domain
-                    filters_list.append(
-                        (group_personal_filters, True, current_user_id, True)
-                    )
+                    filters_list.append(group_personal_filters)
         return filters_list
 
     async def _retrieve_with_filter(
@@ -733,9 +714,6 @@ class MemoryManager:
         query: str,
         top_k: int,
         filters: dict[str, Any],
-        legacy_personal: bool = False,
-        owner_user_id: str | None = None,
-        require_owner_list: bool = False,
     ) -> list[dict[str, Any]]:
         use_rerank = self.config.get("use_reranker", True)
         results = await self.vec_db.retrieve(
@@ -750,10 +728,6 @@ class MemoryManager:
         for result in results:
             data = result.data
             metadata = _safe_parse_metadata(data.get("metadata", {}))
-            if legacy_personal and not self._is_visible_personal_memory(
-                metadata, owner_user_id, require_owner_list
-            ):
-                continue
 
             memories.append(
                 {
@@ -764,24 +738,6 @@ class MemoryManager:
             )
 
         return memories
-
-    def _is_visible_personal_memory(
-        self,
-        metadata: dict[str, Any],
-        owner_user_id: str | None,
-        require_owner_list: bool = False,
-    ) -> bool:
-        scope = metadata.get("memory_scope")
-        if scope not in (None, "", MemoryScope.PERSONAL):
-            return False
-        if metadata.get("visibility") == MemoryVisibility.GROUP:
-            return True
-        owner_user_ids = metadata.get("owner_user_ids")
-        if isinstance(owner_user_ids, list) and owner_user_ids:
-            return owner_user_id in owner_user_ids if owner_user_id else True
-        if require_owner_list:
-            return False
-        return metadata.get("owner_user_id", metadata.get("user_id")) == owner_user_id
 
     def _dedupe_memories(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen = set()
@@ -1000,45 +956,23 @@ class MemoryManager:
         page_size: int = 10,
     ) -> tuple[list[dict[str, Any]], int, bool]:
         parsed = UMOInfo.parse(event.unified_msg_origin)
-        current_user_id = build_user_id(parsed.platform_id, event.get_sender_id())
         scan_limit = self._memory_list_scan_limit(page, page_size)
-        source_specs = [
-            (
-                self._scope_filter(event, MemoryScope.PERSONAL),
-                True,
-                False,
-            ),
-            (
-                self._legacy_personal_filter(event),
-                True,
-                False,
-            ),
-            (
-                {
-                    "memory_scope": MemoryScope.PERSONAL,
-                    "owner_session_id": build_session_id(
-                        parsed.platform_id, parsed.session_id
-                    ),
-                    "visibility": MemoryVisibility.GROUP,
-                    "is_memory_record": True,
-                    "deprecated": False,
-                },
-                True,
-                True,
-            ),
-            (
-                self._scope_filter(event, MemoryScope.GROUP),
-                False,
-                False,
-            ),
-            (
-                self._scope_filter(event, MemoryScope.CONVERSATION),
-                False,
-                False,
-            ),
+        source_filters = [
+            self._scope_filter(event, MemoryScope.PERSONAL),
+            {
+                "memory_scope": MemoryScope.PERSONAL,
+                "owner_session_id": build_session_id(
+                    parsed.platform_id, parsed.session_id
+                ),
+                "visibility": MemoryVisibility.GROUP,
+                "is_memory_record": True,
+                "deprecated": False,
+            },
+            self._scope_filter(event, MemoryScope.GROUP),
+            self._scope_filter(event, MemoryScope.CONVERSATION),
         ]
         if domain:
-            for filters, _, _ in source_specs:
+            for filters in source_filters:
                 filters["domain"] = domain
 
         docs_by_source = await asyncio.gather(
@@ -1047,28 +981,20 @@ class MemoryManager:
                     metadata_filters=filters,
                     limit=scan_limit + 1,
                 )
-                for filters, _, _ in source_specs
+                for filters in source_filters
             )
         )
 
         visible = []
         seen = set()
         scanned_all_sources = True
-        for docs, (_, is_personal_source, require_owner_list) in zip(
-            docs_by_source, source_specs, strict=False
-        ):
+        for docs in docs_by_source:
             if len(docs) > scan_limit:
                 scanned_all_sources = False
             for doc in docs[:scan_limit]:
                 metadata = _safe_parse_metadata(doc.get("metadata", {}))
                 uri = metadata.get("uri") or doc.get("text", "")
                 if uri in seen:
-                    continue
-                if is_personal_source and not self._is_visible_personal_memory(
-                    metadata,
-                    current_user_id,
-                    require_owner_list=require_owner_list,
-                ):
                     continue
                 visible.append(doc)
                 seen.add(uri)
@@ -1085,7 +1011,7 @@ class MemoryManager:
             configured = 200
         configured = max(1, configured)
         needed = max(1, page) * max(1, page_size)
-        return max(configured, needed)
+        return min(configured, needed)
 
     async def get_memory_by_uri(
         self,
@@ -1306,20 +1232,22 @@ class MemoryManager:
 
             try:
                 new_doc_id = str(uuid.uuid4())
-                updated_metadata = {
-                    **metadata,
-                    "kb_doc_id": new_doc_id,
-                    "kb_id": target_kb.kb.kb_id,
-                    "chunk_index": 0,
-                    "is_memory_record": True,
-                }
+                updated_metadata = self._normalize_rebuild_record_metadata(
+                    text,
+                    metadata,
+                    kb_id=target_kb.kb.kb_id,
+                    doc_id=new_doc_id,
+                )
+                content = updated_metadata.get("memory_content", "")
+                uri = updated_metadata.get("uri", uri)
+                formatted_content = format_memory_content(content, updated_metadata)
 
                 await target_kb.vec_db.insert(
-                    content=text,
+                    content=formatted_content,
                     metadata=updated_metadata,
                 )
                 await self._register_kb_document(
-                    new_doc_id, uri, len(text), kb_helper=target_kb
+                    new_doc_id, uri, len(formatted_content), kb_helper=target_kb
                 )
                 success += 1
             except Exception as e:
@@ -1339,6 +1267,51 @@ class MemoryManager:
             "failed": failed,
             "remaining_records": remaining_records,
         }
+
+    def _normalize_rebuild_record_metadata(
+        self,
+        text: str,
+        metadata: dict[str, Any],
+        *,
+        kb_id: str,
+        doc_id: str,
+    ) -> dict[str, Any]:
+        """将重建缓存中的旧记录规范化为当前 metadata 结构。"""
+        meta = MemoryMetadata.from_dict(metadata)
+        content = meta.memory_content or self._memory_content_from_text(text)
+        now = datetime.now(timezone.utc).isoformat()
+        created_at = meta.created_at or now
+        owner_user_id = meta.owner_user_id or meta.user_id
+        owner_user_ids = meta.owner_user_ids or (
+            [owner_user_id] if owner_user_id else []
+        )
+
+        normalized = {
+            **metadata,
+            **meta.to_dict(),
+            "memory_content": content,
+            "created_at": created_at,
+            "last_recalled_at": meta.last_recalled_at or created_at,
+            "memory_scope": normalize_memory_scope(meta.memory_scope),
+            "owner_user_id": owner_user_id,
+            "owner_user_ids": owner_user_ids,
+            "visibility": normalize_visibility(meta.visibility, meta.memory_scope),
+            "speaker_id": meta.speaker_id or meta.sender_id,
+            "kb_doc_id": doc_id,
+            "kb_id": kb_id,
+            "chunk_index": 0,
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        if normalized["memory_scope"] == MemoryScope.GROUP:
+            normalized["visibility"] = MemoryVisibility.GROUP
+        return normalized
+
+    def _memory_content_from_text(self, text: str) -> str:
+        for line in str(text).splitlines():
+            if line.startswith("memory: "):
+                return line.removeprefix("memory: ").strip()
+        return str(text).strip()
 
     async def rebuild_memories(
         self,
@@ -1397,57 +1370,56 @@ class MemoryManager:
             source_doc_ids: list[str] = []
             memory_records: list[dict[str, Any]] = []
 
-            # 分页拉取，兼容新旧格式记忆
-            # 新格式: metadata 含 is_memory_record=True
-            # 旧格式: 无 is_memory_record 字段，但有 uri/domain 等记忆字段
             page_size = 5000
-            offset = 0
-            while True:
-                try:
-                    # 优先按 is_memory_record 拉取
+            seen_records: set[str] = set()
+
+            async def collect_memory_records(metadata_filters: dict[str, Any]) -> None:
+                offset = 0
+                while True:
                     page_docs = await source_kb.vec_db.document_storage.get_documents(
                         offset=offset,
                         limit=page_size,
-                        metadata_filters={"is_memory_record": True},
+                        metadata_filters=metadata_filters,
                     )
                     if not page_docs:
-                        # 回退：按 deprecated=False 拉取（兼容旧格式）
-                        page_docs = (
-                            await source_kb.vec_db.document_storage.get_documents(
-                                offset=offset,
-                                limit=page_size,
-                                metadata_filters={"deprecated": False},
-                            )
+                        break
+                    offset += len(page_docs)
+                    for doc in page_docs:
+                        metadata = _safe_parse_metadata(doc.get("metadata", {}))
+                        if not metadata.get("uri"):
+                            continue
+                        record_key = metadata.get("kb_doc_id") or metadata.get("uri")
+                        if record_key in seen_records:
+                            continue
+                        seen_records.add(record_key)
+                        old_doc_id = metadata.get("kb_doc_id", "")
+                        if old_doc_id:
+                            source_doc_ids.append(old_doc_id)
+                        memory_records.append(
+                            {
+                                "text": doc.get("text", ""),
+                                "metadata": metadata,
+                            }
                         )
-                except Exception as e:
-                    logger.error(
-                        f"[简单长期记忆] 读取源知识库文档失败 (offset={offset}): {e}"
-                    )
-                    return await self._finalize_rebuild(
-                        total=0,
-                        success=0,
-                        failed=0,
-                        target_kb_name=target_kb_name,
-                        is_migration=is_migration,
-                        error=f"读取源知识库失败: {e}",
-                    )
-                if not page_docs:
-                    break
-                offset += len(page_docs)
-                for doc in page_docs:
-                    metadata = _safe_parse_metadata(doc.get("metadata", {}))
-                    # 跳过非记忆文档：必须有 uri 字段才视为记忆
-                    if not metadata.get("uri"):
-                        continue
-                    old_doc_id = metadata.get("kb_doc_id", "")
-                    if old_doc_id:
-                        source_doc_ids.append(old_doc_id)
-                    memory_records.append(
-                        {
-                            "text": doc.get("text", ""),
-                            "metadata": metadata,
-                        }
-                    )
+
+            source_kb_id = source_kb.kb.kb_id
+            try:
+                await collect_memory_records(
+                    {"is_memory_record": True, "kb_id": source_kb_id}
+                )
+                await collect_memory_records(
+                    {"deprecated": False, "kb_id": source_kb_id}
+                )
+            except Exception as e:
+                logger.error(f"[简单长期记忆] 读取源知识库文档失败: {e}")
+                return await self._finalize_rebuild(
+                    total=0,
+                    success=0,
+                    failed=0,
+                    target_kb_name=target_kb_name,
+                    is_migration=is_migration,
+                    error=f"读取源知识库失败: {e}",
+                )
 
             total = len(memory_records)
             logger.info(
@@ -1458,7 +1430,7 @@ class MemoryManager:
             # 安全检查：拉取 0 条但源 KB 有记忆记录时中止，防止误删
             if total == 0:
                 source_count = await source_kb.vec_db.count_documents(
-                    metadata_filter={"is_memory_record": True}
+                    metadata_filter={"is_memory_record": True, "kb_id": source_kb_id}
                 )
                 if source_count > 0:
                     return await self._finalize_rebuild(
@@ -1481,9 +1453,7 @@ class MemoryManager:
             # ── 阶段 2: 清空源 KB（原地重建时）或 留待后续清理（迁移时） ──
             if not is_migration:
                 try:
-                    await source_kb.vec_db.delete_documents(
-                        metadata_filters={"is_memory_record": True}
-                    )
+                    await self._delete_rebuild_source_records(source_kb, memory_records)
                     if source_doc_ids:
                         await self._unregister_kb_documents(
                             source_doc_ids, kb_helper=source_kb
@@ -1511,20 +1481,22 @@ class MemoryManager:
 
                 try:
                     new_doc_id = str(uuid.uuid4())
-                    updated_metadata = {
-                        **metadata,
-                        "kb_doc_id": new_doc_id,
-                        "kb_id": target_kb.kb.kb_id,
-                        "chunk_index": 0,
-                        "is_memory_record": True,
-                    }
+                    updated_metadata = self._normalize_rebuild_record_metadata(
+                        text,
+                        metadata,
+                        kb_id=target_kb.kb.kb_id,
+                        doc_id=new_doc_id,
+                    )
+                    content = updated_metadata.get("memory_content", "")
+                    uri = updated_metadata.get("uri", uri)
+                    formatted_content = format_memory_content(content, updated_metadata)
 
                     await target_kb.vec_db.insert(
-                        content=text,
+                        content=formatted_content,
                         metadata=updated_metadata,
                     )
                     await self._register_kb_document(
-                        new_doc_id, uri, len(text), kb_helper=target_kb
+                        new_doc_id, uri, len(formatted_content), kb_helper=target_kb
                     )
 
                     success += 1
@@ -1537,8 +1509,8 @@ class MemoryManager:
             if is_migration:
                 if failed == 0 and success > 0:
                     try:
-                        await source_kb.vec_db.delete_documents(
-                            metadata_filters={"is_memory_record": True}
+                        await self._delete_rebuild_source_records(
+                            source_kb, memory_records
                         )
                         if source_doc_ids:
                             await self._unregister_kb_documents(
@@ -1625,7 +1597,7 @@ class MemoryManager:
         """
         try:
             actual = await target_kb.vec_db.count_documents(
-                metadata_filter={"is_memory_record": True}
+                metadata_filter={"is_memory_record": True, "kb_id": target_kb.kb.kb_id}
             )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 完整性校验失败: {e}")

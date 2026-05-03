@@ -9,8 +9,8 @@
   - `conversation`：当前会话临时记忆，仅当前会话内召回
 - **可见性模型**：`private`（仅记忆所有者可见）/ `group`（同群组内多人共享），多所有者记忆自动设为 `group` 可见
 - **新元数据字段**：`memory_scope`、`owner_user_id`、`owner_user_ids`、`owner_session_id`、`visibility`、`speaker_id`、`subject`、`entities`、`topics`、`memory_content`
-- **作用域感知召回**：群聊中自动合并 personal + group + conversation 三层记忆，私聊仅召回 personal
-- **旧格式兼容**：无 `memory_scope` 字段的旧记忆自动识别为 personal 并正确过滤
+- **作用域感知召回**：群聊中自动合并 personal + group + conversation 三层记忆，私聊召回 personal，并可使用 conversation 保存当前私聊会话上下文
+- **重建式升级**：运行时不再对旧 metadata 做兼容兜底；从旧版本升级后需执行 `/memory rebuild` 补齐 v0.3 作用域字段
 - **记忆注入格式化**：按作用域分组展示，区分 personal/group/conversation 三类记忆
 - **记忆提取增强**：LLM 提取 prompt 新增会话作用域信息、`scope`/`subject`/`subjects`/`entities`/`topics` 字段，支持群聊下多人记忆归属标注
 - **Sender 追踪**：请求快照中记录 `sender_id`，对话历史按发送者标注
@@ -19,7 +19,7 @@
 
 ### 变更
 - `/memory list` 群聊中展示当前用户可见的所有记忆（含群组共享）
-- 记忆内容格式化改用结构化 `memory:` 标签行，新增 `subject`/`owners`/`entities`/`topics` 等展示字段
+- 记忆内容格式化改用结构化 `memory:` 标签行，仅写入 domain、memory、recall_when、entities、topics 等语义检索字段
 - 可见性值改为 `MemoryVisibility` 常量，减少裸字符串重复使用
 
 ## v0.2.2 (2026-04-03)

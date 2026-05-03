@@ -588,9 +588,9 @@ class MemoryPlugin(Star):
                 scope = _normalize_extracted_scope(
                     str(item.get("scope", "personal")), session_type
                 )
-                subjects = _normalize_subject_ids(
-                    item.get("subjects", item.get("subject", ""))
-                )
+                subjects = _normalize_subject_ids(item.get("subjects"))
+                if not subjects:
+                    subjects = _normalize_subject_ids(item.get("subject", ""))
                 subject = subjects[0] if subjects else ""
                 if session_type == "group" and scope == MemoryScope.PERSONAL:
                     if not subjects:

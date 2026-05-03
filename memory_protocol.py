@@ -255,8 +255,8 @@ def format_memory_content(
 ) -> str:
     """格式化记忆内容用于存储
 
-    仅保留对 embedding 检索有价值的信息，元数据由 metadata 字典承载，
-    不重复写入文本以避免浪费存储和污染向量质量。
+    仅将对 embedding 检索有帮助的语义字段写入文本；
+    权限、归属、可见性等控制字段只保存在 metadata 中。
 
     Args:
         content: 原始记忆内容
