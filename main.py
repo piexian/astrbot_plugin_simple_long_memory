@@ -10,6 +10,7 @@ AstrBot 长期记忆插件主入口
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -22,9 +23,13 @@ from astrbot.api.star import Context, Star
 
 from .memory_manager import MemoryManager, normalize_domain
 from .memory_protocol import (
+    MemoryScope,
+    MemoryType,
     MemoryURI,
+    UMOInfo,
     format_memory_for_injection,
     format_memory_for_user,
+    normalize_memory_scope,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +44,60 @@ from .prompts import (
 from .prompts import (
     sanitize_memory_content as _sanitize_memory_content,
 )
+
+DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT = 10
+
+
+def _sanitize_string_list(value: Any, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    result = []
+    for item in value[:limit]:
+        text = _sanitize_memory_content(str(item))[:80]
+        if text:
+            result.append(text)
+    return result
+
+
+def _normalize_extracted_scope(scope: str, session_type: str) -> str:
+    scope = normalize_memory_scope(scope)
+    if session_type != "group" and scope == MemoryScope.GROUP:
+        return MemoryScope.PERSONAL
+    return scope
+
+
+def _normalize_subject_id(subject: str) -> str:
+    subject = subject.strip()
+    for prefix in ("用户:", "user:", "sender:"):
+        if subject.lower().startswith(prefix):
+            return subject[len(prefix) :].strip()
+    return subject
+
+
+def _normalize_subject_ids(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
+    raw_values = value if isinstance(value, list) else str(value).split(",")
+    subjects = []
+    for item in raw_values:
+        subject = _normalize_subject_id(_sanitize_memory_content(str(item))[:120])
+        if (
+            subject
+            and subject.lower() != "none"
+            and subject not in {"current_sender", "group", "conversation"}
+        ):
+            subjects.append(subject)
+    return list(dict.fromkeys(subjects))
+
+
+def _current_speaker_subject(event: AstrMessageEvent, scope: str) -> str:
+    parsed = UMOInfo.parse(event.unified_msg_origin)
+    if scope == MemoryScope.GROUP:
+        return parsed.session_id
+    if scope == MemoryScope.CONVERSATION:
+        return event.unified_msg_origin
+    return event.get_sender_id()
 
 
 def _flatten_content(content: Any) -> str:
@@ -68,6 +127,16 @@ def _build_recall_query(prompt: str, contexts: list[dict[str, Any]]) -> str:
         if content:
             parts.append(f"[{role}]: {content}")
     return "\n".join(parts)
+
+
+def _clamp_timeout(
+    value: Any, default: int = DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT
+) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(1, min(20, timeout))
 
 
 def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
@@ -404,6 +473,9 @@ class MemoryPlugin(Star):
         self._request_snapshots[session_key]["pending_contexts"] = (
             list(request.contexts) if request.contexts else []
         )
+        self._request_snapshots[session_key]["pending_sender_id"] = (
+            event.get_sender_id()
+        )
         self._request_snapshots[session_key]["timestamp"] = current_time
 
         self._cleanup_expired_snapshots()
@@ -423,12 +495,14 @@ class MemoryPlugin(Star):
             "prompt": entry["pending_prompt"],
             "contexts": entry.get("pending_contexts", []),
             "response": response_text,
+            "sender_id": entry.get("pending_sender_id", event.get_sender_id()),
         }
         entry["snapshots"].append(snapshot)
 
         # 清除待匹配状态
         entry["pending_prompt"] = None
         entry["pending_contexts"] = []
+        entry["pending_sender_id"] = ""
 
     def _get_session_snapshot_count(self, event: AstrMessageEvent) -> int:
         """获取会话的快照数量"""
@@ -480,7 +554,9 @@ class MemoryPlugin(Star):
         text = re.sub(r"\n?```\s*$", "", text)
         return text.strip()
 
-    def _parse_extracted_memories(self, text: str) -> list[dict[str, Any]]:
+    def _parse_extracted_memories(
+        self, text: str, session_type: str = "private"
+    ) -> list[dict[str, Any]]:
         """解析 LLM 返回的记忆 JSON，带校验和上限"""
         text = self._strip_json_fence(text)
         try:
@@ -509,6 +585,18 @@ class MemoryPlugin(Star):
                 if mem_type not in ALLOWED_MEMORY_TYPES:
                     mem_type = "fact"
 
+                scope = _normalize_extracted_scope(
+                    str(item.get("scope", "personal")), session_type
+                )
+                subjects = _normalize_subject_ids(item.get("subjects"))
+                if not subjects:
+                    subjects = _normalize_subject_ids(item.get("subject", ""))
+                subject = subjects[0] if subjects else ""
+                if session_type == "group" and scope == MemoryScope.PERSONAL:
+                    if not subjects:
+                        continue
+                entities = _sanitize_string_list(item.get("entities", []))
+                topics = _sanitize_string_list(item.get("topics", []))
                 disclosure = str(item.get("disclosure", ""))[:200]  # 限制长度
 
                 try:
@@ -519,8 +607,13 @@ class MemoryPlugin(Star):
 
                 validated.append(
                     {
+                        "scope": scope,
                         "type": mem_type,
                         "content": content,
+                        "subject": subject,
+                        "subjects": subjects,
+                        "entities": entities,
+                        "topics": topics,
                         "disclosure": disclosure,
                         "importance": importance,
                     }
@@ -538,8 +631,10 @@ class MemoryPlugin(Star):
         for snapshot in snapshots:
             prompt = snapshot.get("prompt", "")
             response = snapshot.get("response", "")
+            sender_id = snapshot.get("sender_id", "")
             if prompt:
-                lines.append(f"[用户]: {prompt}")
+                sender_label = f"用户:{sender_id}" if sender_id else "用户"
+                lines.append(f"[{sender_label}]: {prompt}")
             if response:
                 lines.append(f"[助手]: {response}")
         return "\n".join(lines)
@@ -556,9 +651,18 @@ class MemoryPlugin(Star):
 
         prompt = RECALL_QUERY_PROMPT.format(context=raw_query[:1000])
         try:
-            llm_response = await self.context.llm_generate(
-                provider_id=provider_id,
-                prompt=prompt,
+            timeout = _clamp_timeout(
+                self.config.get(
+                    "optimize_recall_query_timeout",
+                    DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT,
+                )
+            )
+            llm_response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    provider_id=provider_id,
+                    prompt=prompt,
+                ),
+                timeout=timeout,
             )
             result = getattr(llm_response, "completion_text", "") or ""
             result = self._strip_json_fence(result).strip()
@@ -567,6 +671,8 @@ class MemoryPlugin(Star):
                 optimized = " ".join(str(k) for k in keywords[:5])
                 logger.debug(f"[简单长期记忆] 检索优化: {optimized}")
                 return optimized
+        except asyncio.TimeoutError:
+            logger.debug("[简单长期记忆] 检索优化超时，使用原始查询")
         except Exception as e:
             logger.debug(f"[简单长期记忆] 检索优化失败，使用原始查询: {e}")
 
@@ -679,8 +785,16 @@ class MemoryPlugin(Star):
                 logger.debug("[简单长期记忆] 未配置提取模型，跳过记忆提取")
                 return
 
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+
             # 调用 LLM 提取记忆
-            prompt = MEMORY_EXTRACTION_PROMPT.format(conversation=conversation)
+            prompt = MEMORY_EXTRACTION_PROMPT.format(
+                platform_id=parsed_umo.platform_id,
+                session_type=parsed_umo.session_type,
+                session_id=parsed_umo.session_id,
+                sender_id=event.get_sender_id(),
+                conversation=conversation,
+            )
             try:
                 llm_response = await self.context.llm_generate(
                     provider_id=provider_id,
@@ -692,29 +806,46 @@ class MemoryPlugin(Star):
                 return
 
             # 解析提取结果
-            memories = self._parse_extracted_memories(extraction_result)
+            memories = self._parse_extracted_memories(
+                extraction_result, parsed_umo.session_type
+            )
             if not memories:
                 return
 
             # 存储提取的记忆
             for mem in memories:
-                mem_type = mem.get("type", "fact")
+                memory_domain = mem.get("type", "fact")
+                scope = mem.get("scope", MemoryScope.PERSONAL)
                 content = mem.get("content", "")
+                subject = mem.get("subject", "") or _current_speaker_subject(
+                    event, scope
+                )
+                subjects = mem.get("subjects", [])
+                if not subjects and subject:
+                    subjects = [subject]
+                entities = mem.get("entities", [])
+                topics = mem.get("topics", [])
                 disclosure = mem.get("disclosure", "")
                 importance = mem.get("importance", 3)
+                owner_sender_ids = subjects if scope == MemoryScope.PERSONAL else []
 
                 if not content:
                     continue
 
-                domain = normalize_domain(mem_type)
+                domain = normalize_domain(memory_domain)
 
                 uri = await self.memory_mgr.store_memory(
                     event=event,
                     content=content,
                     domain=domain,
-                    memory_type=mem_type,
+                    memory_type=MemoryType.NORMAL,
                     disclosure=disclosure,
                     importance=importance,
+                    memory_scope=scope,
+                    subject=subject,
+                    entities=entities,
+                    topics=topics,
+                    owner_sender_ids=owner_sender_ids,
                 )
                 logger.debug(f"[简单长期记忆] 提取并存储记忆: {uri}")
 
@@ -752,7 +883,7 @@ class MemoryPlugin(Star):
             except ValueError:
                 pass
         page_size = 10
-        memories, total = await self.memory_mgr.list_memories(
+        memories, total, truncated = await self.memory_mgr.list_memories(
             event, page=page, page_size=page_size, all_users=all_users
         )
         scope = "全局" if all_users else "个人"
@@ -764,6 +895,10 @@ class MemoryPlugin(Star):
             all_mode=all_users,
             cmd_prefix=self._get_cmd_prefix(),
         )
+        if truncated:
+            result += (
+                "\n\n提示: 群聊可见记忆较多，当前总数受扫描上限影响，可能还有更多记录。"
+            )
         yield event.plain_result(f"[{scope}记忆]\n{result}")
 
     @memory_group.command("search")
@@ -1060,7 +1195,7 @@ class MemoryPlugin(Star):
                 content=test_content,
                 domain=test_domain,
                 uri=uri,
-                memory_type="fact",
+                memory_type=MemoryType.NORMAL,
                 disclosure="测试",
                 importance=1,
             )
@@ -1142,7 +1277,7 @@ class MemoryPlugin(Star):
             content=content,
             domain=domain,
             uri=uri,
-            memory_type=memory_type,
+            memory_type=MemoryType.NORMAL,
             disclosure=disclosure[:200] if disclosure else "",
         )
         return f"Memory stored: {uri}"

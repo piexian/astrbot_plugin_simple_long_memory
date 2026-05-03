@@ -105,6 +105,64 @@ class MemoryType:
     PERMANENT = "permanent"  # 永久记忆：不自动压缩删除
 
 
+class MemoryDomain:
+    """记忆域枚举"""
+
+    USER_PROFILE = "user_profile"  # 用户档案
+    PREFERENCES = "preferences"  # 用户偏好
+    FACTS = "facts"  # 事实记忆
+    EVENTS = "events"  # 事件记忆
+    CONTEXT = "context"  # 上下文记忆
+
+
+class MemoryScope:
+    """记忆作用域枚举"""
+
+    PERSONAL = "personal"
+    GROUP = "group"
+    CONVERSATION = "conversation"
+
+
+class MemoryVisibility:
+    """记忆可见性枚举"""
+
+    PRIVATE = "private"
+    GROUP = "group"
+
+
+def normalize_memory_scope(scope: str) -> str:
+    """标准化记忆作用域"""
+    scope = (scope or "").lower().strip()
+    if scope in (MemoryScope.PERSONAL, MemoryScope.GROUP, MemoryScope.CONVERSATION):
+        return scope
+    return MemoryScope.PERSONAL
+
+
+def normalize_visibility(visibility: Any) -> str:
+    """标准化记忆可见性，非法或空值默认私有"""
+    visibility = str(visibility or "").lower().strip()
+    if visibility in (MemoryVisibility.PRIVATE, MemoryVisibility.GROUP):
+        return visibility
+    return MemoryVisibility.PRIVATE
+
+
+def build_session_id(platform_id: str, session_id: str) -> str:
+    """构建会话唯一标识"""
+    return f"{platform_id}_{session_id}"
+
+
+def _normalize_string_list(value: Any, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    result = []
+    for item in value[:limit]:
+        text = str(item).strip()
+        if text:
+            result.append(text[:80])
+    return result
+
+
 @dataclass
 class MemoryMetadata:
     """记忆元数据结构"""
@@ -130,6 +188,16 @@ class MemoryMetadata:
     recall_count: int = 0
     importance: int = 3  # 1-5, 默认中等重要
     compressed: bool = False
+    memory_scope: str = MemoryScope.PERSONAL
+    owner_user_id: str = ""
+    owner_user_ids: list[str] = field(default_factory=list)
+    owner_session_id: str = ""
+    visibility: str = MemoryVisibility.PRIVATE
+    speaker_id: str = ""
+    subject: str = ""
+    entities: list[str] = field(default_factory=list)
+    topics: list[str] = field(default_factory=list)
+    memory_content: str = ""
     impression: str | None = None
     migrated_from: str | None = None
     migrated_to: str | None = None
@@ -142,7 +210,19 @@ class MemoryMetadata:
     def from_dict(cls, data: dict[str, Any]) -> MemoryMetadata:
         """从字典创建实例（自动忽略多余键、缺失键使用默认值）"""
         valid = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in valid})
+        values = {k: v for k, v in data.items() if k in valid}
+        values["memory_scope"] = normalize_memory_scope(values.get("memory_scope", ""))
+        values["owner_user_id"] = values.get("owner_user_id") or values.get(
+            "user_id", ""
+        )
+        values["owner_user_ids"] = _normalize_string_list(
+            values.get("owner_user_ids", [])
+        )
+        values["speaker_id"] = values.get("speaker_id") or values.get("sender_id", "")
+        values["entities"] = _normalize_string_list(values.get("entities", []))
+        values["topics"] = _normalize_string_list(values.get("topics", []))
+        values["visibility"] = normalize_visibility(values.get("visibility", ""))
+        return cls(**values)
 
 
 def build_user_id(platform_id: str, sender_id: str) -> str:
@@ -158,14 +238,25 @@ def build_user_id(platform_id: str, sender_id: str) -> str:
     return f"{platform_id}_{sender_id}"
 
 
+def _memory_display_text(mem: dict[str, Any], meta: MemoryMetadata) -> str:
+    content = meta.memory_content or mem.get("content", "")
+    if content:
+        return str(content)
+    text = str(mem.get("text", ""))
+    for line in text.splitlines():
+        if line.startswith("memory: "):
+            return line.removeprefix("memory: ").strip()
+    return text
+
+
 def format_memory_content(
     content: str,
     metadata: MemoryMetadata | dict[str, Any],
 ) -> str:
     """格式化记忆内容用于存储
 
-    仅保留对 embedding 检索有价值的信息，元数据由 metadata 字典承载，
-    不重复写入文本以避免浪费存储和污染向量质量。
+    仅将对 embedding 检索有帮助的语义字段写入文本；
+    权限、归属、可见性等控制字段只保存在 metadata 中。
 
     Args:
         content: 原始记忆内容
@@ -179,7 +270,26 @@ def format_memory_content(
     else:
         meta = MemoryMetadata.from_dict(metadata)
 
-    return f"[{meta.domain}] {content}"
+    domain_labels = {
+        MemoryDomain.USER_PROFILE: "user_profile",
+        MemoryDomain.PREFERENCES: "preference",
+        MemoryDomain.FACTS: "fact",
+        MemoryDomain.EVENTS: "event",
+        MemoryDomain.CONTEXT: "context",
+    }
+    domain_label = domain_labels.get(meta.domain, meta.domain)
+
+    lines = [
+        f"domain: {domain_label}",
+        f"memory: {content}",
+    ]
+    if meta.disclosure:
+        lines.append(f"recall_when: {meta.disclosure}")
+    if meta.entities:
+        lines.append(f"entities: {', '.join(meta.entities)}")
+    if meta.topics:
+        lines.append(f"topics: {', '.join(meta.topics)}")
+    return "\n".join(lines)
 
 
 def format_memory_for_injection(
@@ -201,19 +311,38 @@ def format_memory_for_injection(
     body_lines: list[str] = []
     total_length = 0
     included_count = 0
+    groups = {
+        MemoryScope.PERSONAL: "Personal memory about the current user",
+        MemoryScope.GROUP: "Group memory for the current chat",
+        MemoryScope.CONVERSATION: "Current conversation memory",
+    }
 
-    for i, mem in enumerate(memories, 1):
-        meta = MemoryMetadata.from_dict(mem.get("metadata", {}))
-        content = mem.get("text", mem.get("content", ""))
+    for scope, title in groups.items():
+        scoped = [
+            mem
+            for mem in memories
+            if MemoryMetadata.from_dict(mem.get("metadata", {})).memory_scope == scope
+        ]
+        if not scoped:
+            continue
 
-        memory_entry = f"[Memory {i}] [{meta.domain}]: {content}"
-
-        if total_length + len(memory_entry) > max_length:
+        header = f"\n[{title}]"
+        if total_length + len(header) > max_length:
             break
+        body_lines.append(header)
+        total_length += len(header)
 
-        body_lines.append(memory_entry)
-        total_length += len(memory_entry)
-        included_count += 1
+        for mem in scoped:
+            meta = MemoryMetadata.from_dict(mem.get("metadata", {}))
+            content = _memory_display_text(mem, meta)
+            memory_entry = f"\n- [{meta.domain}] {content}"
+
+            if total_length + len(memory_entry) > max_length:
+                break
+
+            body_lines.append(memory_entry)
+            total_length += len(memory_entry)
+            included_count += 1
 
     if included_count == 0:
         return ""
@@ -259,7 +388,7 @@ def format_memory_for_user(
     lines = [f"记忆列表（第 {page}/{total_pages} 页，共 {total} 条）："]
     for i, mem in enumerate(memories, start_idx + 1):
         meta = MemoryMetadata.from_dict(mem.get("metadata", {}))
-        content = mem.get("text", mem.get("content", ""))
+        content = _memory_display_text(mem, meta)
 
         # 截取内容预览
         preview = content[:100] + "..." if len(content) > 100 else content
@@ -268,6 +397,7 @@ def format_memory_for_user(
 
         lines.append(f"\n{i}. [{meta.uri}]")
         lines.append(f"   内容: {preview}")
+        lines.append(f"   作用域: {meta.memory_scope}")
         lines.append(f"   创建: {created}")
         if meta.disclosure:
             lines.append(f"   触发: {meta.disclosure}")
