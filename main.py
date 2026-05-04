@@ -152,7 +152,7 @@ def _read_positive_int(value: Any, default: int) -> int:
 
 
 def _confirmation_code(action: str, target: str = "") -> str:
-    seed = f"{action}:{target}".encode("utf-8")
+    seed = f"{action}:{target}".encode()
     digest = hashlib.sha256(seed).hexdigest()[:8]
     return f"{action}-{digest}"
 
@@ -336,8 +336,6 @@ class MemoryPlugin(Star):
         try:
             await self.memory_mgr.connect_kb()
             logger.info("[简单长期记忆] 插件初始化成功")
-            if self.config.get("install_skill", False):
-                self._install_skill()
         except Exception:
             # 首次启动时 KB 尚未就绪，由 on_astrbot_loaded 钩子处理
             logger.info("[简单长期记忆] 配置校验通过，等待知识库就绪")
@@ -364,9 +362,6 @@ class MemoryPlugin(Star):
         if not connected:
             self.memory_mgr = None
             return
-
-        if self.config.get("install_skill", False):
-            self._install_skill()
 
     async def _recover_interrupted_rebuild(self) -> None:
         """启动时检测并恢复上次中断的重建
@@ -445,32 +440,6 @@ class MemoryPlugin(Star):
                 )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 恢复缓冲写入失败: {e}")
-
-    def _install_skill(self) -> None:
-        """安装记忆 Skill 到 AstrBot skills 目录"""
-        import shutil
-        from pathlib import Path
-
-        try:
-            from astrbot.core.skills.skill_manager import SkillManager
-        except ImportError:
-            logger.warning("[简单长期记忆] 无法导入 SkillManager，跳过 Skill 安装")
-            return
-
-        source = Path(__file__).parent / "skills" / "long-term-memory" / "SKILL.md"
-        if not source.exists():
-            logger.warning("[简单长期记忆] SKILL.md 文件不存在，跳过安装")
-            return
-
-        try:
-            sm = SkillManager()
-            target_dir = Path(sm.skills_root) / "long-term-memory"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(source), str(target_dir / "SKILL.md"))
-            sm.set_skill_active("long-term-memory", True)
-            logger.info("[简单长期记忆] 已安装并激活记忆 Skill")
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] Skill 安装失败: {e}")
 
     async def terminate(self):
         """插件销毁"""

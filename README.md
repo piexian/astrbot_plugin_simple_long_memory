@@ -38,7 +38,6 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | max_memory_list_scan | 记忆列表扫描上限 | `200` |
 | memory_delete_scan_page_size | 记忆删除扫描分页大小 | `1000` |
 | memory_ttl_days | 记忆生命周期（天） | `30` |
-| install_skill | 安装 AI 记忆指南 Skill | `false` |
 | use_reranker | 记忆召回时启用重排序（需知识库已配置重排序模型） | `true` |
 | optimize_recall_query | 启用检索优化（LLM 提炼关键词） | `false` |
 | optimize_recall_query_timeout | 检索优化超时（秒） | `10` |

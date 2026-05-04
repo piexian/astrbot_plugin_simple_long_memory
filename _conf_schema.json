@@ -72,12 +72,6 @@
     "default": 30,
     "hint": "超过此天数的低频记忆将被压缩为印象"
   },
-  "install_skill": {
-    "description": "安装记忆 Skill",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后将自动安装 AI 记忆指南 Skill，引导 AI 主动使用记忆工具。前置条件：需在「使用电脑能力」中将运行环境设置为 local 或 sandbox"
-  },
   "use_reranker": {
     "description": "启用重排序",
     "type": "bool",
