@@ -90,5 +90,11 @@
     "default": 10,
     "hint": "限制检索优化模型调用的最长等待时间。超时后将跳过优化并使用原始检索内容，避免阻塞对话响应",
     "slider": {"min": 1, "max": 20, "step": 1}
+  },
+  "enable_admin_global_memory_tool": {
+    "description": "启用管理员全局记忆工具",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后提供 memory_store_global 工具，仅管理员可通过 AI 添加对所有会话生效的全局记忆"
   }
 }

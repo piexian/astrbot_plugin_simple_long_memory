@@ -66,6 +66,8 @@ def _sanitize_string_list(value: Any, limit: int = 8) -> list[str]:
 
 def _normalize_extracted_scope(scope: str, session_type: str) -> str:
     scope = normalize_memory_scope(scope)
+    if scope == MemoryScope.GLOBAL:
+        return MemoryScope.PERSONAL
     if session_type != "group" and scope == MemoryScope.GROUP:
         return MemoryScope.PERSONAL
     return scope
@@ -131,6 +133,54 @@ def _build_recall_query(prompt: str, contexts: list[dict[str, Any]]) -> str:
         if content:
             parts.append(f"[{role}]: {content}")
     return "\n".join(parts)
+
+
+def _make_memory_text_part(content: str) -> Any | None:
+    """构造 AstrBot 用户内容块；新版支持标记为本轮临时内容。"""
+    try:
+        from astrbot.core.agent.message import TextPart
+    except Exception:
+        return None
+
+    part = TextPart(text=content)
+    mark_as_temp = getattr(part, "mark_as_temp", None)
+    if callable(mark_as_temp):
+        marked_part = mark_as_temp()
+        if marked_part is not None:
+            part = marked_part
+    return part
+
+
+def _append_extra_user_content(request: ProviderRequest, content: str) -> bool:
+    """优先使用 AstrBot 动态用户内容块注入记忆。"""
+    if not hasattr(request, "extra_user_content_parts"):
+        return False
+
+    parts = getattr(request, "extra_user_content_parts", None)
+    if parts is None:
+        parts = []
+        request.extra_user_content_parts = parts
+    if not hasattr(parts, "append"):
+        return False
+
+    part = _make_memory_text_part(content)
+    if part is None:
+        return False
+
+    parts.append(part)
+    return True
+
+
+def _inject_memory_context(request: ProviderRequest, content: str) -> str:
+    """注入记忆上下文，返回实际使用的注入位置。"""
+    if _append_extra_user_content(request, content):
+        return "extra_user_content_parts"
+
+    contexts = _normalize_contexts(getattr(request, "contexts", None))
+    memory_msg = {"role": "user", "content": content}
+    # 旧版回退：放在 contexts 最前面，使当前 prompt 仍保持最后、优先级更高。
+    request.contexts = [memory_msg] + contexts
+    return "contexts 底部"
 
 
 def _clamp_timeout(
@@ -770,22 +820,10 @@ class MemoryPlugin(Star):
                 # format_memory_for_injection 已返回含 <user_context_reference> 包装的完整字符串
                 safe_memory_context = format_memory_for_injection(memories)
                 if safe_memory_context:
-                    # 优先注入到 contexts 顶部（如果存在）
-                    # 使用 user 角色而非 system，降低优先级
-                    if contexts:
-                        memory_msg = {"role": "user", "content": safe_memory_context}
-                        request.contexts = [memory_msg] + contexts
-                        logger.debug(
-                            f"[简单长期记忆] 注入 {len(memories)} 条记忆到 contexts 顶部"
-                        )
-                    else:
-                        # 回退：注入到 prompt 前面
-                        request.prompt = (
-                            f"{safe_memory_context}\n\n{request.prompt or ''}"
-                        )
-                        logger.debug(
-                            f"[简单长期记忆] 注入 {len(memories)} 条记忆到 prompt 前"
-                        )
+                    inject_target = _inject_memory_context(request, safe_memory_context)
+                    logger.debug(
+                        f"[简单长期记忆] 注入 {len(memories)} 条记忆到 {inject_target}"
+                    )
 
         except Exception as e:
             logger.warning(f"[简单长期记忆] 注入记忆失败: {e}")
@@ -1458,6 +1496,54 @@ class MemoryPlugin(Star):
             disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
         )
         return f"Memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_store_global")
+    async def tool_store_global(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        memory_type: str = "fact",
+        disclosure: str = "",
+    ) -> str:
+        """Store a global long-term memory visible to all chats.
+
+        Only use this when the current user is an admin and explicitly asks to
+        add a global memory, global rule, shared fact, or bot-wide preference.
+
+        Args:
+            content(string): global content to remember for all users/chats
+            memory_type(string): memory type (fact/preference/event/context)
+            disclosure(string): condition description for triggering recall
+        """
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Global memory tool is disabled in plugin config"
+
+        if not event.is_admin():
+            return "Only administrators can store global memories"
+
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        content = _sanitize_memory_content(content)
+        if not content:
+            return "Invalid memory content"
+
+        domain = normalize_domain(memory_type)
+        uri = str(MemoryURI.generate(domain))
+
+        await self.memory_mgr.store_memory(
+            event=event,
+            content=content,
+            domain=domain,
+            uri=uri,
+            memory_type=MemoryType.PERMANENT,
+            disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
+            importance=5,
+            memory_scope=MemoryScope.GLOBAL,
+            visibility="group",
+            subject="global",
+        )
+        return f"Global memory stored: {uri}"
 
     @filter.llm_tool(name="memory_forget")
     async def tool_forget(self, event: AstrMessageEvent, uri: str) -> str:

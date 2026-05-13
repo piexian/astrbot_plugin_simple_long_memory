@@ -41,6 +41,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | use_reranker | 记忆召回时启用重排序（需知识库已配置重排序模型） | `true` |
 | optimize_recall_query | 启用检索优化（LLM 提炼关键词） | `false` |
 | optimize_recall_query_timeout | 检索优化超时（秒） | `10` |
+| enable_admin_global_memory_tool | 启用管理员全局记忆工具 | `false` |
 
 ## 使用方法
 
@@ -68,6 +69,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 
 | 作用域 | 说明 | 日常例子 |
 |--------|------|----------|
+| `global` | 全局记忆，所有会话可召回（仅管理员工具可写入） | "机器人回答某项目问题时优先使用内部术语表" |
 | `personal` | 个人记忆，仅自己可见 | "我比较喜欢喝拿铁"、"下周要出差" |
 | `group` | 群共享记忆，群友都可见 | "群里约了每周五打游戏"、"这个群的固定梗" |
 | `conversation` | 当前会话临时上下文 | "刚才说的那个 bug 还没修完" |
@@ -109,6 +111,7 @@ AI 可以通过以下工具主动操作记忆：
 
 - `memory_recall(query)` — 搜索长期记忆
 - `memory_store(content, memory_type, disclosure)` — 存储记忆
+- `memory_store_global(content, memory_type, disclosure)` — 存储全局记忆（需开启 `enable_admin_global_memory_tool`，仅管理员可用）
 - `memory_forget(uri)` — 删除记忆
 
 ### 记忆类型
@@ -122,7 +125,7 @@ AI 可以通过以下工具主动操作记忆：
 
 ## 工作原理
 
-1. **记忆注入**：在每次 LLM 请求前，根据用户输入通过 embedding 检索召回相关记忆，以 `user` 角色注入到对话上下文顶部（不占用 system prompt）
+1. **记忆注入**：在每次 LLM 请求前，根据用户输入通过 embedding 检索召回相关记忆；AstrBot v4.24+ 优先注入到临时用户内容区（仅本轮请求生效），旧版回退到最早的 `user` 上下文位置（不占用 system prompt，不覆盖当前输入）
 2. **自动提取**：每隔 `extraction_interval` 轮对话，将累积的对话内容发送给 LLM 提取值得记忆的信息并自动存储
 3. **用户隔离**：所有记忆操作通过 metadata 中的 `user_id` 字段过滤，确保用户间记忆完全隔离
 4. **记忆存储**：记忆以向量形式存储在知识库中，支持语义检索
