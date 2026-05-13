@@ -65,6 +65,10 @@ def _sanitize_string_list(value: Any, limit: int = 8) -> list[str]:
 
 
 def _normalize_extracted_scope(scope: str, session_type: str) -> str:
+    """规范化自动提取的记忆作用域。
+
+    自动提取不能写入全局记忆；全局记忆只能由管理员工具显式创建。
+    """
     scope = normalize_memory_scope(scope)
     if scope == MemoryScope.GLOBAL:
         return MemoryScope.PERSONAL
@@ -180,7 +184,7 @@ def _inject_memory_context(request: ProviderRequest, content: str) -> str:
     memory_msg = {"role": "user", "content": content}
     # 旧版回退：放在 contexts 最前面，使当前 prompt 仍保持最后、优先级更高。
     request.contexts = [memory_msg] + contexts
-    return "contexts 底部"
+    return "contexts 顶部"
 
 
 def _clamp_timeout(
