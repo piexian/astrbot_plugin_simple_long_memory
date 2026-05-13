@@ -124,7 +124,7 @@ def normalize_visibility(visibility: str, memory_scope: str) -> str:
         return visibility
     return (
         MemoryVisibility.GROUP
-        if memory_scope == MemoryScope.GROUP
+        if memory_scope in (MemoryScope.GLOBAL, MemoryScope.GROUP)
         else MemoryVisibility.PRIVATE
     )
 
@@ -466,7 +466,11 @@ class MemoryManager:
         _, owner_user_id, owner_session_id = self._event_scope_ids(event)
         scope = normalize_memory_scope(memory_scope)
 
-        if scope == MemoryScope.GROUP:
+        if scope == MemoryScope.GLOBAL:
+            filters = {
+                "memory_scope": MemoryScope.GLOBAL,
+            }
+        elif scope == MemoryScope.GROUP:
             filters = {
                 "memory_scope": MemoryScope.GROUP,
                 "owner_session_id": owner_session_id,
@@ -783,7 +787,7 @@ class MemoryManager:
         scopes = (
             [normalize_memory_scope(memory_scope)]
             if memory_scope
-            else [MemoryScope.PERSONAL]
+            else [MemoryScope.GLOBAL, MemoryScope.PERSONAL]
         )
         if not memory_scope:
             if parsed.session_type == "group":
@@ -1561,7 +1565,7 @@ class MemoryManager:
             "is_memory_record": True,
             "deprecated": False,
         }
-        if normalized["memory_scope"] == MemoryScope.GROUP:
+        if normalized["memory_scope"] in (MemoryScope.GLOBAL, MemoryScope.GROUP):
             normalized["visibility"] = MemoryVisibility.GROUP
         return normalized
 
@@ -2009,7 +2013,9 @@ class MemoryManager:
                     "is_memory_record": True,
                     "deprecated": False,
                 }
-                if memory_scope == MemoryScope.GROUP:
+                if memory_scope == MemoryScope.GLOBAL:
+                    pass
+                elif memory_scope == MemoryScope.GROUP:
                     filters["owner_session_id"] = item.get("owner_session_id", "")
                 elif memory_scope == MemoryScope.CONVERSATION:
                     filters["umo"] = item["umo"]

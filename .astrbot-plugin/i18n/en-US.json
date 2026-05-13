@@ -1,0 +1,69 @@
+{
+  "metadata": {
+    "display_name": "Simple Long Memory",
+    "short_desc": "Knowledge-base backed long-term memory, recall, and management tools.",
+    "desc": "Adds long-term memory to AstrBot using the built-in knowledge base for user preferences, past interactions, and important facts."
+  },
+  "config": {
+    "kb_name": {
+      "description": "Memory Knowledge Base",
+      "hint": "Select the knowledge base used to store long-term memories. Required. Create one first in Knowledge Base Management and configure an embedding model."
+    },
+    "extraction_provider_id": {
+      "description": "Memory Extraction Model",
+      "hint": "LLM used to extract memories from conversations. Leave empty to use the current chat model."
+    },
+    "summarization_provider_id": {
+      "description": "Memory Summarization Model",
+      "hint": "LLM used for future memory merging and compression. Leave empty to use the current chat model."
+    },
+    "auto_memorize": {
+      "description": "Automatic Memory Mode",
+      "hint": "When enabled, memories are automatically extracted and stored after conversations."
+    },
+    "extraction_interval": {
+      "description": "Extraction Interval (turns)",
+      "hint": "Run memory extraction every N conversation turns and summarize those turns."
+    },
+    "extraction_min_content_length": {
+      "description": "Minimum Extraction Length",
+      "hint": "Skip memory extraction when the accumulated conversation is shorter than this many characters."
+    },
+    "global_memory": {
+      "description": "Cross-Session Personal Recall",
+      "hint": "When enabled, personal memories can be recalled across sessions for the same user. When disabled, only personal memories from the current session are recalled."
+    },
+    "max_memories_per_inject": {
+      "description": "Memories Per Injection",
+      "hint": "Maximum number of memories injected into each LLM request."
+    },
+    "max_memory_list_scan": {
+      "description": "Memory List Scan Limit",
+      "hint": "Limits how many records /memory list scans to calculate memories visible to the current user. The actual scan amount is derived from the page and page size and will not exceed this limit."
+    },
+    "memory_delete_scan_page_size": {
+      "description": "Delete Scan Page Size",
+      "hint": "Number of matched records scanned per page before deleting or clearing memories. Larger values are faster but use more memory per operation."
+    },
+    "memory_ttl_days": {
+      "description": "Memory TTL (days)",
+      "hint": "Low-frequency memories older than this many days may be compressed into impressions."
+    },
+    "use_reranker": {
+      "description": "Enable Reranker",
+      "hint": "Use the knowledge base reranker to improve memory recall ordering. Requires a reranker model configured on the knowledge base."
+    },
+    "optimize_recall_query": {
+      "description": "Optimize Recall Query",
+      "hint": "Before each memory recall, call the extraction model to extract search keywords for better recall accuracy. This runs on every conversation, so use a fast lightweight model."
+    },
+    "optimize_recall_query_timeout": {
+      "description": "Recall Optimization Timeout (seconds)",
+      "hint": "Maximum wait time for recall query optimization. On timeout, the original query is used so conversation responses are not blocked."
+    },
+    "enable_admin_global_memory_tool": {
+      "description": "Enable Admin Global Memory Tool",
+      "hint": "When enabled, provides the memory_store_global tool so administrators can ask AI to add global memories that apply to all chats."
+    }
+  }
+}
