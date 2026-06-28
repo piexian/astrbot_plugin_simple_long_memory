@@ -374,6 +374,7 @@ class MemoryPlugin(Star):
         self._last_snapshot_cleanup = 0.0
         self._last_ttl_expire = 0.0
         self._last_consolidation = 0.0
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def initialize(self):
         """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
@@ -726,8 +727,8 @@ class MemoryPlugin(Star):
             await mgr.store_memory(
                 event=event,
                 content=summary,
-                domain="consolidated",
-                memory_type=MemoryType.CONTEXT,
+                domain="context",
+                memory_type=MemoryType.NORMAL,
                 disclosure="由历史低频记忆巩固而来",
                 importance=4,
                 memory_scope=MemoryScope.PERSONAL,
@@ -906,7 +907,9 @@ class MemoryPlugin(Star):
 
         # P1 生命周期维护（节流；expire 轻量同步，consolidate 含 LLM 调用后台化以免阻塞用户首轮）
         await self._maybe_expire_stale_memories()
-        asyncio.create_task(self._maybe_consolidate_memories(event))
+        task = asyncio.create_task(self._maybe_consolidate_memories(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         try:
             # 累积请求快照（等待响应后完成）

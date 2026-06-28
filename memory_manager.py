@@ -295,8 +295,8 @@ class MemoryManager:
             return
         now = datetime.now(timezone.utc).isoformat()
         set_clause = (
-            "json_set(json_set(metadata, '$.recall_count', "
-            "CAST(COALESCE(json_extract(metadata,'$.recall_count'),0) AS INTEGER) + 1), "
+            "json_set(metadata, '$.recall_count', "
+            "CAST(COALESCE(json_extract(metadata,'$.recall_count'),0) AS INTEGER) + 1, "
             "'$.last_recalled_at', :now)"
         )
         placeholders = ",".join(f":u{i}" for i in range(len(uris)))
@@ -322,7 +322,9 @@ class MemoryManager:
             "json_extract(metadata,'$.is_memory_record') = 1 "
             "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
             "AND json_extract(metadata,'$.kb_id') = :kb_id "
-            "AND json_extract(metadata,'$.created_at') < :cutoff"
+            "AND json_extract(metadata,'$.created_at') < :cutoff "
+            "AND json_extract(metadata,'$.memory_type') != 'permanent' "
+            "AND json_extract(metadata,'$.memory_scope') != 'global'"
         )
         params: dict[str, Any] = {"kb_id": kb_id, "cutoff": cutoff_iso}
         return await self._exec_metadata_update(set_clause, where_clause, params)
@@ -381,8 +383,8 @@ class MemoryManager:
             return []
         candidates: list[dict[str, Any]] = []
         for row in rows:
-            text_val = row[0] if row else ""
-            meta = _safe_parse_metadata(row[1] if len(row) > 1 else {})
+            text_val = getattr(row, "text", "") or ""
+            meta = _safe_parse_metadata(getattr(row, "metadata", {}) or {})
             candidates.append({"text": text_val, "metadata": meta})
         return candidates
 
@@ -391,9 +393,7 @@ class MemoryManager:
         uris = [u for u in uris if u]
         if not uris:
             return 0
-        set_clause = (
-            "json_set(json_set(metadata, '$.deprecated', 1), '$.compressed', 1)"
-        )
+        set_clause = "json_set(metadata, '$.deprecated', 1, '$.compressed', 1)"
         placeholders = ",".join(f":u{i}" for i in range(len(uris)))
         where_clause = (
             f"json_extract(metadata,'$.uri') IN ({placeholders}) "
@@ -417,10 +417,18 @@ class MemoryManager:
 
         def _score(mem: dict[str, Any]) -> float:
             meta = mem.get("metadata", {})
-            importance = (int(meta.get("importance", 3) or 3) - 1) / 4.0
-            frequency = min(
-                math.log1p(int(meta.get("recall_count", 0) or 0)) / 3.0, 1.0
-            )
+            try:
+                _imp = meta.get("importance")
+                _imp = 3 if _imp is None or _imp == "" else _imp
+                importance = (int(float(_imp)) - 1) / 4.0
+            except (ValueError, TypeError):
+                importance = 0.5
+            try:
+                _rc = meta.get("recall_count")
+                _rc = 0 if _rc is None or _rc == "" else _rc
+                frequency = min(math.log1p(max(0, int(float(_rc)))) / 3.0, 1.0)
+            except (ValueError, TypeError):
+                frequency = 0.0
             ts_str = meta.get("last_recalled_at") or meta.get("created_at")
             recency = 0.5
             if ts_str:
@@ -428,7 +436,7 @@ class MemoryManager:
                     ts = datetime.fromisoformat(
                         str(ts_str).replace("Z", "+00:00")
                     ).timestamp()
-                    recency = math.exp(-(now - ts) / half_life)
+                    recency = math.exp(-max(0.0, now - ts) / half_life)
                 except (ValueError, TypeError):
                     recency = 0.5
             return (
