@@ -62,6 +62,21 @@ Rules:
 Example output: ["keyword1", "keyword2", "keyword3"]
 """
 
+
+# 记忆巩固 Prompt（P1.2：低频老记忆 → 压缩摘要）
+MEMORY_CONSOLIDATION_PROMPT = """You are consolidating old, low-frequency memories into one compact summary impression.
+
+Source memories (potentially redundant, overlapping, or outdated):
+{memories}
+
+Task:
+1. Merge related items, deduplicate, and resolve contradictions (prefer the most recent/specific statement).
+2. Produce ONE concise summary paragraph (at most ~300 characters) preserving durable facts, stable preferences, and key context.
+3. Use the SAME language as the source memories.
+4. Output ONLY the summary text. No JSON, no preamble, no bullet list.
+
+Summary:"""
+
 # 提取结果上限配置
 MAX_EXTRACTED_MEMORIES = 10  # 单次提取最大记忆数
 MAX_MEMORY_CONTENT_LENGTH = 500  # 单条记忆内容最大长度

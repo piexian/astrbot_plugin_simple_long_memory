@@ -96,5 +96,59 @@
     "type": "bool",
     "default": false,
     "hint": "开启后提供 memory_store_global 工具，仅管理员可通过 AI 添加对所有会话生效的全局记忆"
+  },
+  "recall_sparse_fusion": {
+    "description": "启用稀疏检索融合",
+    "type": "bool",
+    "default": true,
+    "hint": "召回时在稠密向量之外追加 FTS5 关键词稀疏检索，并用 RRF 融合两路结果，提升关键词/专有名词召回率。依赖知识库 FTS5 索引，不可用时自动回退纯稠密"
+  },
+  "recall_weight_importance": {
+    "description": "召回加权-重要性",
+    "type": "float",
+    "default": 0.4,
+    "hint": "召回结果二次排序中 importance 的权重（0-1）"
+  },
+  "recall_weight_frequency": {
+    "description": "召回加权-召回频次",
+    "type": "float",
+    "default": 0.3,
+    "hint": "召回结果二次排序中 recall_count 频次的权重（0-1）"
+  },
+  "recall_weight_recency": {
+    "description": "召回加权-时效",
+    "type": "float",
+    "default": 0.3,
+    "hint": "召回结果二次排序中时间衰减的权重（0-1）"
+  },
+  "recall_recency_halflife_days": {
+    "description": "召回时效半衰期(天)",
+    "type": "int",
+    "default": 14,
+    "hint": "时效衰减半衰期：距今 N 天的记忆时效分约为 0.5"
+  },
+  "memory_consolidation_enabled": {
+    "description": "启用记忆巩固",
+    "type": "bool",
+    "default": true,
+    "hint": "定期将低频老旧记忆交由 LLM 压缩为摘要印象，原文标记为已废弃。需配置总结模型"
+  },
+  "consolidation_min_age_days": {
+    "description": "巩固最小年龄(天)",
+    "type": "int",
+    "default": 14,
+    "hint": "仅巩固创建超过此天数的记忆"
+  },
+  "consolidation_max_recall": {
+    "description": "巩固召回频次上限",
+    "type": "int",
+    "default": 1,
+    "hint": "仅巩固历史召回次数不超过此值的低频记忆（避免压缩高频使用中的记忆）"
+  },
+  "consolidation_batch_size": {
+    "description": "巩固批量大小",
+    "type": "int",
+    "default": 30,
+    "hint": "每次巩固任务处理的记忆条数上限"
   }
 }
