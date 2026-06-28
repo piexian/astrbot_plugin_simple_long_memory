@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from .prompts import (
     ALLOWED_MEMORY_TYPES,
     MAX_EXTRACTED_MEMORIES,
+    MEMORY_CONSOLIDATION_PROMPT,
     MEMORY_EXTRACTION_PROMPT,
     RECALL_QUERY_PROMPT,
 )
@@ -355,6 +356,8 @@ class MemoryPlugin(Star):
     # 请求快照过期时间（秒）
     SNAPSHOT_TTL = 300  # 5 分钟
     SNAPSHOT_CLEANUP_INTERVAL = 60
+    TTL_EXPIRE_INTERVAL = 3600  # TTL 过期扫描间隔（秒）
+    CONSOLIDATION_INTERVAL = 7200  # 记忆巩固扫描间隔（秒）
     MAX_SESSION_SNAPSHOTS = DEFAULT_MAX_SESSION_SNAPSHOTS
     MAX_SNAPSHOT_CHARS = DEFAULT_MAX_SNAPSHOT_CHARS
 
@@ -369,6 +372,8 @@ class MemoryPlugin(Star):
         # 每个会话的对话计数器
         self._session_counters: dict[str, int] = {}
         self._last_snapshot_cleanup = 0.0
+        self._last_ttl_expire = 0.0
+        self._last_consolidation = 0.0
 
     async def initialize(self):
         """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
@@ -635,6 +640,104 @@ class MemoryPlugin(Star):
         self._session_counters[key] = self._session_counters.get(key, 0) + 1
         return self._session_counters[key]
 
+    async def _maybe_expire_stale_memories(self) -> None:
+        """节流触发 TTL 过期（P1.1）。仿 _cleanup_expired_snapshots 的间隔模式。"""
+        now = time.time()
+        if now - self._last_ttl_expire < self.TTL_EXPIRE_INTERVAL:
+            return
+        self._last_ttl_expire = now
+        mgr = self.memory_mgr
+        if not mgr or not mgr.is_kb_connected:
+            return
+        ttl_days = _read_positive_int(self.config.get("memory_ttl_days", 30), 30)
+        if ttl_days <= 0:
+            return
+        try:
+            expired = await mgr._expire_stale_memories(ttl_days)
+            if expired:
+                logger.info(f"[简单长期记忆] TTL 过期标记 {expired} 条记忆")
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] TTL 过期任务失败: {e}")
+
+    async def _maybe_consolidate_memories(self, event: AstrMessageEvent) -> None:
+        """节流触发记忆巩固（P1.2）：低频老记忆 → LLM 总结 → 摘要记忆 + 原文标记。"""
+        now = time.time()
+        if now - self._last_consolidation < self.CONSOLIDATION_INTERVAL:
+            return
+        self._last_consolidation = now
+        mgr = self.memory_mgr
+        if not mgr or not mgr.is_kb_connected:
+            return
+        if not self.config.get("memory_consolidation_enabled", True):
+            return
+        min_age_days = _read_positive_int(
+            self.config.get("consolidation_min_age_days", 14), 14
+        )
+        max_recall = _read_positive_int(
+            self.config.get("consolidation_max_recall", 1), 1
+        )
+        limit = _read_positive_int(self.config.get("consolidation_batch_size", 30), 30)
+        owner_user_id = mgr._current_owner_user_id(event)
+        try:
+            candidates = await mgr._fetch_consolidation_candidates(
+                min_age_days,
+                max_recall,
+                limit,
+                owner_user_id=owner_user_id,
+                memory_scope=MemoryScope.PERSONAL,
+            )
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 读取巩固候选失败: {e}")
+            return
+        if not candidates:
+            return
+        provider_id = await self._get_llm_provider_id(event, "summarization")
+        if not provider_id:
+            provider_id = await self._get_llm_provider_id(event, "extraction")
+        if not provider_id:
+            return
+        joined = "\n".join(
+            f"- {c.get('text', '').strip()}" for c in candidates if c.get("text")
+        )
+        if not joined.strip():
+            return
+        try:
+            prompt = MEMORY_CONSOLIDATION_PROMPT.format(memories=joined)
+            llm_response = await self.context.llm_generate(
+                chat_provider_id=provider_id, prompt=prompt
+            )
+            summary = (getattr(llm_response, "completion_text", "") or "").strip()
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 巩固 LLM 调用失败: {e}")
+            return
+        if not summary:
+            return
+        source_uris = [
+            c.get("metadata", {}).get("uri")
+            for c in candidates
+            if c.get("metadata", {}).get("uri")
+        ]
+        # 先标记原文 deprecated+compressed：成功后再写摘要，避免 mark 失败导致下轮重复巩固累积
+        marked = await mgr._mark_consolidated(source_uris)
+        if marked <= 0:
+            logger.debug("[简单长期记忆] 巩固：原文标记 0 条，跳过摘要写入")
+            return
+        try:
+            await mgr.store_memory(
+                event=event,
+                content=summary,
+                domain="consolidated",
+                memory_type=MemoryType.CONTEXT,
+                disclosure="由历史低频记忆巩固而来",
+                importance=4,
+                memory_scope=MemoryScope.PERSONAL,
+            )
+            logger.info(
+                f"[简单长期记忆] 巩固 {len(candidates)} 条 → 1 条摘要，标记原文 {marked} 条"
+            )
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 巩固写入失败: {e}")
+
     def _cleanup_expired_snapshots(self, current_time: float | None = None) -> None:
         """清理过期的请求快照"""
         current_time = current_time or time.time()
@@ -801,6 +904,10 @@ class MemoryPlugin(Star):
         if not self.config.get("auto_memorize", True):
             return
 
+        # P1 生命周期维护（节流；expire 轻量同步，consolidate 含 LLM 调用后台化以免阻塞用户首轮）
+        await self._maybe_expire_stale_memories()
+        asyncio.create_task(self._maybe_consolidate_memories(event))
+
         try:
             # 累积请求快照（等待响应后完成）
             self._accumulate_request_snapshot(event, request)
@@ -813,11 +920,12 @@ class MemoryPlugin(Star):
             if self.config.get("optimize_recall_query", False):
                 query = await self._optimize_recall_query(event, query)
 
-            # 召回相关记忆
+            # 召回相关记忆（注入路径：bump=True 计入 recall_count 反馈）
             memories = await self.memory_mgr.recall_memories(
                 event=event,
                 query=query,
                 top_k=self.config.get("max_memories_per_inject", 5),
+                bump=True,
             )
 
             if memories:

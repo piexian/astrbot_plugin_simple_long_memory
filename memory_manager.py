@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
+import time
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
@@ -256,6 +258,186 @@ class MemoryManager:
         if not self._kb_helper:
             raise RuntimeError("记忆管理器未初始化")
         return self._kb_helper.vec_db
+
+    async def _exec_metadata_update(
+        self,
+        set_clause: str,
+        where_clause: str,
+        params: dict[str, Any],
+    ) -> int:
+        """原地更新 documents.metadata（json_set），返回受影响行数。
+
+        绕过 FaissVecDB 无 update_metadata API 的限制：只改 metadata JSON 列，
+        不动 FAISS 向量、不动 FTS5 索引，廉价且安全。失败仅记录日志，不阻断检索。
+        """
+        if not self._kb_helper:
+            return 0
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session, session.begin():
+                from sqlalchemy import text as sa_text
+
+                result = await session.execute(
+                    sa_text(
+                        f"UPDATE documents SET metadata = {set_clause} WHERE {where_clause}"
+                    ),
+                    params,
+                )
+                return int(result.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] metadata 原地更新失败（不影响检索）: {e}")
+            return 0
+
+    async def _bump_recall_stats(self, uris: list[str]) -> None:
+        """递增给定 uri 记忆的 recall_count 并刷新 last_recalled_at（P0.1 召回反馈）。"""
+        uris = [u for u in uris if u]
+        if not uris:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        set_clause = (
+            "json_set(json_set(metadata, '$.recall_count', "
+            "CAST(COALESCE(json_extract(metadata,'$.recall_count'),0) AS INTEGER) + 1), "
+            "'$.last_recalled_at', :now)"
+        )
+        placeholders = ",".join(f":u{i}" for i in range(len(uris)))
+        where_clause = (
+            f"json_extract(metadata,'$.uri') IN ({placeholders}) "
+            "AND json_extract(metadata,'$.is_memory_record') = 1"
+        )
+        params: dict[str, Any] = {"now": now}
+        params.update({f"u{i}": u for i, u in enumerate(uris)})
+        await self._exec_metadata_update(set_clause, where_clause, params)
+
+    async def _expire_stale_memories(self, ttl_days: int) -> int:
+        """TTL 过期：把超过 ttl_days 且未废弃的记忆标记 deprecated=True（P1.1）。
+
+        召回 filter 已排除 deprecated，标记后即从召回移除。返回标记条数。
+        """
+        if ttl_days <= 0 or not self._kb_helper:
+            return 0
+        kb_id = self._kb_helper.kb.kb_id
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
+        set_clause = "json_set(metadata, '$.deprecated', 1)"
+        where_clause = (
+            "json_extract(metadata,'$.is_memory_record') = 1 "
+            "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
+            "AND json_extract(metadata,'$.kb_id') = :kb_id "
+            "AND json_extract(metadata,'$.created_at') < :cutoff"
+        )
+        params: dict[str, Any] = {"kb_id": kb_id, "cutoff": cutoff_iso}
+        return await self._exec_metadata_update(set_clause, where_clause, params)
+
+    async def _fetch_consolidation_candidates(
+        self,
+        min_age_days: int,
+        max_recall: int = 1,
+        limit: int = 30,
+        owner_user_id: str | None = None,
+        memory_scope: str = "personal",
+    ) -> list[dict[str, Any]]:
+        """取出低频且老旧、未废弃未压缩的记忆，作为巩固候选（P1.2）。
+
+        owner_user_id + memory_scope 限定候选范围，防止跨用户/跨作用域隐私泄露：
+        默认仅巩固当前用户的 personal 记忆；global/group/conversation 不参与巩固。
+        """
+        if not self._kb_helper or limit <= 0:
+            return []
+        kb_id = self._kb_helper.kb.kb_id
+        cutoff_iso = (
+            datetime.now(timezone.utc) - timedelta(days=min_age_days)
+        ).isoformat()
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT text, metadata FROM documents "
+                            "WHERE json_extract(metadata,'$.is_memory_record') = 1 "
+                            "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
+                            "AND json_extract(metadata,'$.compressed') IS NOT 1 "
+                            "AND json_extract(metadata,'$.kb_id') = :kb_id "
+                            "AND json_extract(metadata,'$.created_at') < :cutoff "
+                            "AND CAST(COALESCE(json_extract(metadata,'$.recall_count'),0) AS INTEGER) <= :max_recall "
+                            "AND json_extract(metadata,'$.owner_user_id') = :owner_user_id "
+                            "AND json_extract(metadata,'$.memory_scope') = :memory_scope "
+                            "ORDER BY json_extract(metadata,'$.created_at') ASC "
+                            "LIMIT :limit"
+                        ),
+                        {
+                            "kb_id": kb_id,
+                            "cutoff": cutoff_iso,
+                            "max_recall": max_recall,
+                            "owner_user_id": owner_user_id,
+                            "memory_scope": memory_scope,
+                            "limit": limit,
+                        },
+                    )
+                ).all()
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 读取巩固候选失败: {e}")
+            return []
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            text_val = row[0] if row else ""
+            meta = _safe_parse_metadata(row[1] if len(row) > 1 else {})
+            candidates.append({"text": text_val, "metadata": meta})
+        return candidates
+
+    async def _mark_consolidated(self, uris: list[str]) -> int:
+        """把已巩固的原记忆标记为 deprecated+compressed（P1.2）。"""
+        uris = [u for u in uris if u]
+        if not uris:
+            return 0
+        set_clause = (
+            "json_set(json_set(metadata, '$.deprecated', 1), '$.compressed', 1)"
+        )
+        placeholders = ",".join(f":u{i}" for i in range(len(uris)))
+        where_clause = (
+            f"json_extract(metadata,'$.uri') IN ({placeholders}) "
+            "AND json_extract(metadata,'$.is_memory_record') = 1"
+        )
+        params: dict[str, Any] = {f"u{i}": u for i, u in enumerate(uris)}
+        return await self._exec_metadata_update(set_clause, where_clause, params)
+
+    def _rerank_by_signal(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """根据 importance/recall_count/recency 对召回结果二次加权排序（P0.2）。
+
+        纯本地计算，不依赖 AstrBot。权重可经配置调整。
+        """
+        if len(memories) <= 1:
+            return memories
+        now = time.time()
+        half_life = max(self.config.get("recall_recency_halflife_days", 14), 1) * 86400
+        w_importance = self.config.get("recall_weight_importance", 0.4)
+        w_frequency = self.config.get("recall_weight_frequency", 0.3)
+        w_recency = self.config.get("recall_weight_recency", 0.3)
+
+        def _score(mem: dict[str, Any]) -> float:
+            meta = mem.get("metadata", {})
+            importance = (int(meta.get("importance", 3) or 3) - 1) / 4.0
+            frequency = min(
+                math.log1p(int(meta.get("recall_count", 0) or 0)) / 3.0, 1.0
+            )
+            ts_str = meta.get("last_recalled_at") or meta.get("created_at")
+            recency = 0.5
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(
+                        str(ts_str).replace("Z", "+00:00")
+                    ).timestamp()
+                    recency = math.exp(-(now - ts) / half_life)
+                except (ValueError, TypeError):
+                    recency = 0.5
+            return (
+                w_importance * importance
+                + w_frequency * frequency
+                + w_recency * recency
+            )
+
+        return sorted(memories, key=_score, reverse=True)
 
     # ==================== KB 文档注册 ====================
 
@@ -728,6 +910,7 @@ class MemoryManager:
         top_k: int | None = None,
         all_users: bool = False,
         memory_scope: str | None = None,
+        bump: bool = False,
     ) -> list[dict[str, Any]]:
         """召回相关记忆（自动按用户隔离）
 
@@ -749,30 +932,36 @@ class MemoryManager:
             filters = {"is_memory_record": True, "deprecated": False}
             if domain:
                 filters["domain"] = domain
-            memories = await self._retrieve_with_filter(query, fetch_k, filters)
-            return self._dedupe_memories(memories)[:top_k]
-
-        global_memory = self.config.get("global_memory", True)
-        filters_list = self._build_recall_filters(
-            event,
-            global_memory=global_memory,
-            domain=domain,
-            memory_scope=memory_scope,
-        )
-
-        tasks = [
-            self._retrieve_with_filter(
-                query,
-                fetch_k,
-                filters,
+            raw = await self._retrieve_with_filter(query, fetch_k, filters)
+            memories = self._dedupe_memories(raw)[:top_k]
+        else:
+            global_memory = self.config.get("global_memory", True)
+            filters_list = self._build_recall_filters(
+                event,
+                global_memory=global_memory,
+                domain=domain,
+                memory_scope=memory_scope,
             )
-            for filters in filters_list
-        ]
-        results_list = await asyncio.gather(*tasks)
-        results = [item for sublist in results_list for item in sublist]
-        results = self._filter_visible_shared_personal(event, results)
 
-        memories = self._dedupe_memories(results)[:top_k]
+            tasks = [
+                self._retrieve_with_filter(query, fetch_k, filters)
+                for filters in filters_list
+            ]
+            results_list = await asyncio.gather(*tasks)
+            results = [item for sublist in results_list for item in sublist]
+            results = self._filter_visible_shared_personal(event, results)
+            memories = self._dedupe_memories(results)[:top_k]
+
+        # P0.2 信号加权重排（importance / recall_count / recency）
+        memories = self._rerank_by_signal(memories)
+        # P0.1 召回反馈：仅注入路径递增 recall_count（避免 search/selftest/工具调用污染频次信号）
+        if bump:
+            recalled_uris = [
+                m.get("metadata", {}).get("uri")
+                for m in memories
+                if m.get("metadata", {}).get("uri")
+            ]
+            await self._bump_recall_stats(recalled_uris)
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
 
@@ -824,28 +1013,164 @@ class MemoryManager:
         filters: dict[str, Any],
     ) -> list[dict[str, Any]]:
         use_rerank = self.config.get("use_reranker", True)
-        results = await self.vec_db.retrieve(
+        # 稠密检索（本阶段不 rerank，融合后再统一 rerank）
+        dense_results = await self.vec_db.retrieve(
             query=query,
             k=top_k,
-            rerank=use_rerank,
+            rerank=False,
             metadata_filters=filters,
         )
-
-        # 解析结果
-        memories = []
-        for result in results:
+        dense_memories: list[dict[str, Any]] = []
+        for result in dense_results:
             data = result.data
-            metadata = _safe_parse_metadata(data.get("metadata", {}))
-
-            memories.append(
+            dense_memories.append(
                 {
                     "text": data.get("text", ""),
-                    "metadata": metadata,
+                    "metadata": _safe_parse_metadata(data.get("metadata", {})),
                     "similarity": result.similarity,
                 }
             )
 
+        # P0.3 稀疏检索（FTS5）+ RRF 融合
+        if self.config.get("recall_sparse_fusion", True):
+            sparse_memories = await self._sparse_retrieve(query, top_k, filters)
+            memories = (
+                self._rrf_fuse(dense_memories, sparse_memories, limit=top_k)
+                if sparse_memories
+                else dense_memories
+            )
+        else:
+            memories = dense_memories
+
+        # 融合后统一 rerank（复用知识库配置的 rerank provider）
+        if use_rerank and memories:
+            rerank_provider = getattr(self.vec_db, "rerank_provider", None)
+            if rerank_provider:
+                try:
+                    docs = [m.get("text", "") for m in memories]
+                    reranked = await rerank_provider.rerank(query, docs)
+                    reranked = sorted(
+                        reranked, key=lambda x: x.relevance_score, reverse=True
+                    )
+                    memories = [
+                        memories[r.index]
+                        for r in reranked
+                        if 0 <= r.index < len(memories)
+                    ]
+                except Exception as e:
+                    logger.debug(f"[简单长期记忆] rerank 失败，使用融合结果: {e}")
         return memories
+
+    async def _sparse_retrieve(
+        self, query: str, top_k: int, filters: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """FTS5 稀疏检索（P0.3）。不可用或失败时返回空列表，调用方回退纯稠密。"""
+        tokens = self._tokenize_query(query)
+        if not tokens:
+            return []
+        try:
+            docs = await self.vec_db.document_storage.search_sparse(
+                query_tokens=tokens, limit=max(top_k * 3, 20)
+            )
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 稀疏检索失败，回退纯稠密: {e}")
+            return []
+        if not docs:
+            return []
+        out: list[dict[str, Any]] = []
+        for doc in docs:
+            meta = _safe_parse_metadata(doc.get("metadata", {}))
+            if not self._matches_filters(meta, filters):
+                continue
+            out.append(
+                {
+                    "text": doc.get("text", ""),
+                    "metadata": meta,
+                    "similarity": -float(doc.get("score", 0) or 0),
+                }
+            )
+        return out
+
+    def _tokenize_query(self, query: str) -> list[str]:
+        """分词（依赖缓存）。AstrBot 检索依赖不可用时返回空列表。"""
+        cache = getattr(self, "_sparse_tokenize", None)
+        if cache is None:
+            try:
+                import os
+
+                from astrbot.core.knowledge_base.retrieval import (
+                    sparse_retriever as _sr,
+                )
+                from astrbot.core.knowledge_base.retrieval.tokenizer import (
+                    load_stopwords,
+                    tokenize_text,
+                )
+
+                stopwords = load_stopwords(
+                    os.path.join(os.path.dirname(_sr.__file__), "hit_stopwords.txt")
+                )
+                self._sparse_tokenize = (tokenize_text, stopwords)
+                cache = self._sparse_tokenize
+            except Exception as e:
+                logger.debug(f"[简单长期记忆] 稀疏检索分词依赖不可用: {e}")
+                self._sparse_tokenize = False
+                return []
+        if cache is False:
+            return []
+        tokenize_text, stopwords = cache
+        return tokenize_text(query, stopwords)
+
+    @staticmethod
+    def _matches_filters(metadata: dict[str, Any], filters: dict[str, Any]) -> bool:
+        """本地 metadata 过滤（稀疏检索结果不带 filter，需本地过滤）。"""
+        for key, expected in filters.items():
+            if key == "is_memory_record":
+                if bool(metadata.get(key)) != bool(expected):
+                    return False
+            elif key == "deprecated":
+                if bool(metadata.get(key, False)) != bool(expected):
+                    return False
+            elif metadata.get(key) != expected:
+                return False
+        return True
+
+    def _rrf_fuse(
+        self,
+        dense: list[dict[str, Any]],
+        sparse: list[dict[str, Any]],
+        k: int = 60,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Reciprocal Rank Fusion 融合稠密与稀疏结果（P0.3）。
+
+        score(doc) = sum(1 / (k + rank))，同 AstrBot rank_fusion.py 公式；uri 作去重主键。
+        """
+        scores: dict[str, float] = {}
+        dense_by_uri: dict[str, dict[str, Any]] = {}
+        sparse_by_uri: dict[str, dict[str, Any]] = {}
+
+        for rank, mem in enumerate(dense):
+            uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
+            if not uri:
+                continue
+            scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
+            dense_by_uri.setdefault(uri, mem)
+        for rank, mem in enumerate(sparse):
+            uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
+            if not uri:
+                continue
+            scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
+            sparse_by_uri.setdefault(uri, mem)
+
+        ordered = sorted(scores, key=lambda u: scores[u], reverse=True)[:limit]
+        fused: list[dict[str, Any]] = []
+        for uri in ordered:
+            mem = dense_by_uri.get(uri) or sparse_by_uri.get(uri)
+            if mem:
+                # 保留原始 similarity（dense cosine / sparse 负分），RRF 分独立存放；
+                # 勿覆盖 similarity，否则 smart_update_memory 的 0.85 阈值与 _dedupe 排序失效
+                fused.append({**mem, "rrf_score": scores[uri]})
+        return fused
 
     def _dedupe_memories(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen = set()

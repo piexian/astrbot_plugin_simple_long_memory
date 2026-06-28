@@ -64,6 +64,42 @@
     "enable_admin_global_memory_tool": {
       "description": "Enable Admin Global Memory Tool",
       "hint": "When enabled, provides the memory_store_global tool so administrators can ask AI to add global memories that apply to all chats."
+    },
+    "recall_sparse_fusion": {
+      "description": "Enable Sparse Retrieval Fusion",
+      "hint": "Adds FTS5 keyword sparse retrieval atop dense vector search and fuses both via RRF, improving recall for keywords/proper nouns. Falls back to dense-only when FTS5 is unavailable."
+    },
+    "recall_weight_importance": {
+      "description": "Recall Weight - Importance",
+      "hint": "Weight of importance in recall re-ranking (0-1)"
+    },
+    "recall_weight_frequency": {
+      "description": "Recall Weight - Frequency",
+      "hint": "Weight of recall_count frequency in recall re-ranking (0-1)"
+    },
+    "recall_weight_recency": {
+      "description": "Recall Weight - Recency",
+      "hint": "Weight of time decay in recall re-ranking (0-1)"
+    },
+    "recall_recency_halflife_days": {
+      "description": "Recall Recency Halflife (days)",
+      "hint": "Recency decay halflife: a memory N days old scores about 0.5"
+    },
+    "memory_consolidation_enabled": {
+      "description": "Enable Memory Consolidation",
+      "hint": "Periodically compress low-frequency old memories into summary impressions via LLM; originals are marked deprecated. Requires a summarization model."
+    },
+    "consolidation_min_age_days": {
+      "description": "Consolidation Min Age (days)",
+      "hint": "Only consolidate memories older than this many days"
+    },
+    "consolidation_max_recall": {
+      "description": "Consolidation Max Recall Count",
+      "hint": "Only consolidate low-frequency memories with recall count at or below this (avoids compressing frequently-used memories)"
+    },
+    "consolidation_batch_size": {
+      "description": "Consolidation Batch Size",
+      "hint": "Maximum number of memories processed per consolidation run"
     }
   }
 }
