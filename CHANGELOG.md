@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.3 (2026-06-28)
+
+### 新增
+- **召回反馈**：记忆召回时 `recall_count` 递增，记录每条记忆的命中频次，用于后续加权与巩固判断。
+- **召回加权重排**：召回结果按 `importance`（重要性）/ `recall_count`（频次）/ 时间衰减（时效）三路信号加权二次排序；时效采用可配置半衰期。
+- **稠密+稀疏 RRF 融合**：召回在稠密向量之外追加 FTS5 关键词稀疏检索，用 RRF 融合两路结果，提升关键词/专有名词召回率。FTS5 不可用时自动回退纯稠密。
+- **TTL 过期**：对长期未命中的低频记忆标记过期，`permanent` / `global`（管理员全局）记忆排除，不会被误过期。
+- **记忆巩固**：定期将低频老旧记忆交由 LLM 压缩为摘要印象，原文标记为已废弃；可配置最小年龄、召回频次上限、批量大小。
+- 新增 9 项召回/巩固相关配置项，同步 `zh-CN` / `en-US` 双语 i18n 文案。
+
+### 修复
+- 巩固任务 `MemoryType.CONTEXT`（原不存在）改为 `NORMAL`，否则巩固必崩且原文已标记却无摘要导致数据丢失。
+- 巩固产物 `domain` 从 `consolidated` 改为 `context`，进入白名单，不再回退到 `facts`。
+- TTL 过期排除 `permanent` / `global` 记忆，管理员全局记忆不再被误过期。
+- 后台 LLM 长任务使用 `asyncio.create_task` 时加入 `_background_tasks` 强引用集合，防止任务被 GC 提前回收。
+- `_rerank` 对数值做安全转换并 `max(0, Δt)`，防止 `int()` 崩溃与 `exp` 溢出。
+- 记录字段访问改用 `getattr` 兜底，嵌套 `json_set` 合并为单次调用。
+
+### 变更
+- 将 `expire_stale_memories` / `fetch_consolidation_candidates` / `mark_consolidated` 去掉 `_` 前缀升为公共 API；`fetch_consolidation_candidates` 改接 `event`，`owner` 由内部推导，解除 `main.py` 对 `MemoryManager` 受保护成员的耦合（回应 PR#4 Sourcery 反馈）。
+- 更新 README 安装说明，移除插件待发布的提示。
+
 ## v0.3.2 (2026-05-14)
 
 ### 新增
