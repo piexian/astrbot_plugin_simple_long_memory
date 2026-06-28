@@ -308,7 +308,7 @@ class MemoryManager:
         params.update({f"u{i}": u for i, u in enumerate(uris)})
         await self._exec_metadata_update(set_clause, where_clause, params)
 
-    async def _expire_stale_memories(self, ttl_days: int) -> int:
+    async def expire_stale_memories(self, ttl_days: int) -> int:
         """TTL 过期：把超过 ttl_days 且未废弃的记忆标记 deprecated=True（P1.1）。
 
         召回 filter 已排除 deprecated，标记后即从召回移除。返回标记条数。
@@ -329,21 +329,21 @@ class MemoryManager:
         params: dict[str, Any] = {"kb_id": kb_id, "cutoff": cutoff_iso}
         return await self._exec_metadata_update(set_clause, where_clause, params)
 
-    async def _fetch_consolidation_candidates(
+    async def fetch_consolidation_candidates(
         self,
+        event: AstrMessageEvent,
         min_age_days: int,
         max_recall: int = 1,
         limit: int = 30,
-        owner_user_id: str | None = None,
-        memory_scope: str = "personal",
     ) -> list[dict[str, Any]]:
-        """取出低频且老旧、未废弃未压缩的记忆，作为巩固候选（P1.2）。
+        """取出当前用户低频老旧、未废弃未压缩的个人记忆，作为巩固候选（P1.2）。
 
-        owner_user_id + memory_scope 限定候选范围，防止跨用户/跨作用域隐私泄露：
-        默认仅巩固当前用户的 personal 记忆；global/group/conversation 不参与巩固。
+        owner 与 memory_scope 由 event 推导并锁定为当前用户 personal，防止跨用户/跨作用域泄露。
         """
         if not self._kb_helper or limit <= 0:
             return []
+        owner_user_id = self._current_owner_user_id(event)
+        memory_scope = MemoryScope.PERSONAL
         kb_id = self._kb_helper.kb.kb_id
         cutoff_iso = (
             datetime.now(timezone.utc) - timedelta(days=min_age_days)
@@ -388,7 +388,7 @@ class MemoryManager:
             candidates.append({"text": text_val, "metadata": meta})
         return candidates
 
-    async def _mark_consolidated(self, uris: list[str]) -> int:
+    async def mark_consolidated(self, uris: list[str]) -> int:
         """把已巩固的原记忆标记为 deprecated+compressed（P1.2）。"""
         uris = [u for u in uris if u]
         if not uris:

@@ -654,7 +654,7 @@ class MemoryPlugin(Star):
         if ttl_days <= 0:
             return
         try:
-            expired = await mgr._expire_stale_memories(ttl_days)
+            expired = await mgr.expire_stale_memories(ttl_days)
             if expired:
                 logger.info(f"[简单长期记忆] TTL 过期标记 {expired} 条记忆")
         except Exception as e:
@@ -678,14 +678,9 @@ class MemoryPlugin(Star):
             self.config.get("consolidation_max_recall", 1), 1
         )
         limit = _read_positive_int(self.config.get("consolidation_batch_size", 30), 30)
-        owner_user_id = mgr._current_owner_user_id(event)
         try:
-            candidates = await mgr._fetch_consolidation_candidates(
-                min_age_days,
-                max_recall,
-                limit,
-                owner_user_id=owner_user_id,
-                memory_scope=MemoryScope.PERSONAL,
+            candidates = await mgr.fetch_consolidation_candidates(
+                event, min_age_days, max_recall, limit
             )
         except Exception as e:
             logger.debug(f"[简单长期记忆] 读取巩固候选失败: {e}")
@@ -719,7 +714,7 @@ class MemoryPlugin(Star):
             if c.get("metadata", {}).get("uri")
         ]
         # 先标记原文 deprecated+compressed：成功后再写摘要，避免 mark 失败导致下轮重复巩固累积
-        marked = await mgr._mark_consolidated(source_uris)
+        marked = await mgr.mark_consolidated(source_uris)
         if marked <= 0:
             logger.debug("[简单长期记忆] 巩固：原文标记 0 条，跳过摘要写入")
             return
