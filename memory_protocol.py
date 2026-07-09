@@ -392,7 +392,7 @@ def format_memory_for_user(
         格式化后的记忆列表
     """
     if not memories:
-        return "暂无记忆"
+        return "当前分页不存在" if total > 0 else "暂无记忆"
 
     total_pages = (total + page_size - 1) // page_size if total > 0 else 1
     start_idx = (page - 1) * page_size
@@ -416,7 +416,7 @@ def format_memory_for_user(
         if meta.recall_count > 0:
             lines.append(f"   召回: {meta.recall_count}次")
 
-    if total_pages > 1:
+    if page < total_pages:
         all_flag = " --all" if all_mode else ""
         lines.append(f"\n提示: {cmd_prefix}memory list{all_flag} {page + 1} 查看下一页")
 
