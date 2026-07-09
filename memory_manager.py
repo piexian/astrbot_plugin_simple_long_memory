@@ -1607,11 +1607,8 @@ class MemoryManager:
         Returns:
             统计信息字典
         """
-        if all_users:
-            filters = self._build_query_filter(None, all_users=True)
-        else:
-            # 原行为：非 all_users 模式下不加 deprecated 过滤
-            filters = self._build_user_filter(event)
+        query_event = None if all_users else event
+        filters = self._build_query_filter(query_event, all_users=all_users)
 
         # 总数
         total = await self.vec_db.count_documents(metadata_filter=filters)
@@ -1625,7 +1622,12 @@ class MemoryManager:
         normal = await self.vec_db.count_documents(metadata_filter=normal_filters)
 
         # 已压缩数
-        compressed_filters = {**filters, "compressed": True}
+        compressed_filters = self._build_query_filter(
+            query_event,
+            all_users=all_users,
+            include_deprecated=True,
+        )
+        compressed_filters["compressed"] = True
         compressed = await self.vec_db.count_documents(
             metadata_filter=compressed_filters
         )
@@ -2146,7 +2148,7 @@ class MemoryManager:
             migration_committed = False
             migration_commit_error = ""
             if is_migration:
-                if failed == 0 and success > 0:
+                if failed == 0:
                     try:
                         await self._delete_rebuild_source_records(
                             source_kb, memory_records

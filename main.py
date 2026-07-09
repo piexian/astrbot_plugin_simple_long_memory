@@ -1090,9 +1090,13 @@ class MemoryPlugin(Star):
         positional = args["positional"]
         if positional:
             try:
-                page = max(1, int(positional))
+                page = int(positional)
             except ValueError:
-                pass
+                yield event.plain_result("页码必须是正整数")
+                return
+            if page < 1:
+                yield event.plain_result("页码必须是正整数")
+                return
         page_size = 10
         memories, total, truncated = await self.memory_mgr.list_memories(
             event, page=page, page_size=page_size, all_users=all_users
@@ -1132,7 +1136,10 @@ class MemoryPlugin(Star):
         )
         scope = "全局" if all_users else "个人"
         result = format_memory_for_user(
-            memories, total=len(memories), cmd_prefix=self._get_cmd_prefix()
+            memories,
+            total=len(memories),
+            page_size=max(1, len(memories)),
+            cmd_prefix=self._get_cmd_prefix(),
         )
         yield event.plain_result(f"[{scope}搜索]\n{result}")
 
@@ -1156,7 +1163,7 @@ class MemoryPlugin(Star):
             f"  总数: {stats['total']}\n"
             f"  永久记忆: {stats['permanent']}\n"
             f"  普通记忆: {stats['normal']}\n"
-            f"  已压缩: {stats['compressed']}"
+            f"  历史已压缩: {stats['compressed']}"
         )
         yield event.plain_result(result)
 
@@ -1491,13 +1498,13 @@ class MemoryPlugin(Star):
             if v and v.get("passed"):
                 report += (
                     "\n\n  数据校验通过，请确认记忆无误后执行:"
-                    "\n  /memory rebuild --clear-cache"
+                    f"\n  {cmd_prefix}memory rebuild --clear-cache"
                 )
             elif v and not v.get("passed") and not v.get("error"):
                 report += (
                     "\n\n  数据校验未通过，请排查后重试。"
                     "重建缓存已保留，可执行:"
-                    "\n  /memory rebuild --clear-cache 清理缓存"
+                    f"\n  {cmd_prefix}memory rebuild --clear-cache 清理缓存"
                 )
 
             yield event.plain_result(report)
@@ -1530,6 +1537,7 @@ class MemoryPlugin(Star):
             return "\n".join(report)
 
         # 读取测试
+        hit = False
         try:
             results = await self.memory_mgr.recall_memories(
                 event=event, query=test_content, top_k=3
@@ -1543,8 +1551,10 @@ class MemoryPlugin(Star):
 
         # 清理测试数据
         try:
-            await self.memory_mgr.forget_memory(event=event, uri=uri)
-            report.append("  清理: 已删除测试记忆")
+            deleted = await self.memory_mgr.forget_memory(event=event, uri=uri)
+            report.append(
+                "  清理: 已删除测试记忆" if deleted > 0 else "  清理: 未找到测试记忆"
+            )
         except Exception as e:
             report.append(f"  清理: 失败 ({e})")
 
