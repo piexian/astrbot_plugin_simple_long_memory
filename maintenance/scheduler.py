@@ -72,13 +72,16 @@ class MaintenanceScheduler:
         cron_mgr = self._context.cron_manager
         if not cron_mgr:
             return
+        remaining: list[str] = []
         for job_id in self._job_ids:
             try:
-                await cron_mgr.remove_job(job_id)
+                await cron_mgr.delete_job(job_id)
             except Exception as e:
-                logger.debug(f"[简单长期记忆] 注销任务失败: {job_id}, {e}")
-        self._job_ids.clear()
-        logger.info("[简单长期记忆] 后台整理调度器已停止")
+                logger.warning(f"[简单长期记忆] 注销任务失败: {job_id}, {e}")
+                remaining.append(job_id)
+        self._job_ids = remaining
+        if not remaining:
+            logger.info("[简单长期记忆] 后台整理调度器已停止")
 
     async def _run_purge(self, **kwargs: Any) -> None:
         """执行物理清理（single-flight）。"""

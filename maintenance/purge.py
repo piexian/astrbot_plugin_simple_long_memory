@@ -6,6 +6,7 @@ SQLite 文档记录和 KB 文档记录，并级联清理关联边。
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,9 @@ async def purge_deprecated_memories(
 ) -> dict[str, int]:
     """物理删除 deprecated 超过 after_days 天的记忆。
 
+    按精确的 kb_doc_id 逐条删除，不会误删宽限期内的记录。
+    向量删除失败时不继续下游清理，保证一致性。
+
     Args:
         vec_db: 向量数据库实例
         kb_helper: KBHelper 实例
@@ -38,7 +42,7 @@ async def purge_deprecated_memories(
     kb_id = kb_helper.kb.kb_id
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
 
-    # 1. 查询待清理的记忆 URI 和 kb_doc_id
+    # 1. 精确查询待清理的记忆 URI 和 kb_doc_id
     uris: list[str] = []
     doc_ids: list[str] = []
     try:
@@ -60,8 +64,6 @@ async def purge_deprecated_memories(
                 )
             ).all()
 
-            import json
-
             for row in rows:
                 meta_raw = getattr(row, "metadata", "{}")
                 try:
@@ -81,21 +83,25 @@ async def purge_deprecated_memories(
     if not uris and not doc_ids:
         return {"purged": 0, "links_cleaned": 0}
 
-    # 2. 从向量数据库删除
+    # 2. 按精确 kb_doc_id 逐条删除向量（不用宽泛过滤器，防止误删宽限期内记录）
     purged = 0
-    try:
-        await vec_db.delete_documents(
-            metadata_filters={
-                "is_memory_record": True,
-                "deprecated": True,
-                "kb_id": kb_id,
-            }
-        )
-        purged = len(uris)
-    except Exception as e:
-        logger.warning(f"[简单长期记忆] purge 向量删除失败: {e}")
+    failed = 0
+    for doc_id in doc_ids:
+        try:
+            await vec_db.delete_documents(
+                metadata_filters={"kb_doc_id": doc_id, "kb_id": kb_id}
+            )
+            purged += 1
+        except Exception as e:
+            failed += 1
+            logger.debug(f"[简单长期记忆] purge 删除 {doc_id} 失败: {e}")
 
-    # 3. 从 KB 文档记录删除
+    # 向量删除全部失败时不继续下游清理
+    if purged == 0 and failed > 0:
+        logger.warning("[简单长期记忆] purge 向量删除全部失败，跳过下游清理")
+        return {"purged": 0, "links_cleaned": 0}
+
+    # 3. 从 KB 文档记录删除（仅删除成功清理向量的 doc_id）
     if doc_ids:
         try:
             from astrbot.core.knowledge_base.models import KBDocument
@@ -126,6 +132,7 @@ async def purge_deprecated_memories(
 
     if purged:
         logger.info(
-            f"[简单长期记忆] 物理清理完成: {purged} 条记忆, {links_cleaned} 条关联边"
+            f"[简单长期记忆] 物理清理完成: {purged} 条记忆, "
+            f"{links_cleaned} 条关联边" + (f", {failed} 条失败" if failed else "")
         )
     return {"purged": purged, "links_cleaned": links_cleaned}

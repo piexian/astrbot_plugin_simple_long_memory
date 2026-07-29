@@ -1740,27 +1740,49 @@ class MemoryPlugin(Star):
         old_entities = old_meta.get("entities", [])
         old_topics = old_meta.get("topics", [])
 
-        # 删除旧记录
+        # 先写入新记录，成功后再删除旧记录（防止写入失败导致数据丢失）
+        new_uri = str(MemoryURI.generate(old_domain))
+        try:
+            await self.memory_mgr.store_memory(
+                event=event,
+                content=content,
+                domain=old_domain,
+                uri=new_uri,
+                memory_type=MemoryType.NORMAL,
+                disclosure=_sanitize_memory_content(disclosure)[:200]
+                if disclosure
+                else old_meta.get("disclosure", ""),
+                importance=old_importance,
+                memory_scope=old_scope,
+                entities=old_entities,
+                topics=old_topics,
+            )
+        except Exception as e:
+            return f"Error: failed to write new memory: {e}"
+
+        # 新记录写入成功，删除旧记录
         deleted = await self.memory_mgr.forget_memory(event, uri.strip())
         if deleted == 0:
-            return f"Error: failed to delete old memory: {uri}"
+            # 旧记录删除失败，回滚新记录
+            await self.memory_mgr.forget_memory(event, new_uri)
+            return f"Error: failed to delete old memory, rolled back: {uri}"
 
-        # 写入新记录，保留旧属性
-        new_uri = str(MemoryURI.generate(old_domain))
-        await self.memory_mgr.store_memory(
-            event=event,
-            content=content,
-            domain=old_domain,
-            uri=new_uri,
-            memory_type=MemoryType.NORMAL,
-            disclosure=_sanitize_memory_content(disclosure)[:200]
-            if disclosure
-            else old_meta.get("disclosure", ""),
-            importance=old_importance,
-            memory_scope=old_scope,
-            entities=old_entities,
-            topics=old_topics,
-        )
+        # 迁移关联边：旧 URI 的关联指向新 URI
+        if self.memory_mgr.link_manager:
+            old_links = await self.memory_mgr.link_manager.get_links_for_uri(
+                uri.strip(), injectable_only=False, limit=50
+            )
+            for link in old_links:
+                await self.memory_mgr.link_manager.add_link(
+                    new_uri,
+                    link["target_uri"],
+                    link["relation_type"],
+                    reason=link.get("reason", ""),
+                    confidence=link.get("confidence", 1.0),
+                    created_by="memory_update",
+                )
+            await self.memory_mgr.link_manager.delete_links_for_uris([uri.strip()])
+
         return f"Memory updated: {uri} -> {new_uri}"
 
     @filter.llm_tool(name="memory_store_global")

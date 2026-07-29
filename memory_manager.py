@@ -282,7 +282,8 @@ class MemoryManager:
         """迁移补丁：为已废弃但缺少 deprecated_at 的记忆回填时间戳。
 
         旧版废弃操作只写 deprecated=1，没有记录废弃时间。
-        用 created_at 回填作为保守估计，确保 purge 宽限期不会立即触发。
+        回填迁移执行时间（而非 created_at），确保宽限期从迁移时刻开始计算，
+        不会导致历史废弃记忆被立即清理。
         """
         try:
             doc_storage = self.vec_db.document_storage
@@ -293,8 +294,7 @@ class MemoryManager:
                     sa_text(
                         "UPDATE documents "
                         "SET metadata = json_set(metadata, '$.deprecated_at', "
-                        "    COALESCE(json_extract(metadata, '$.created_at'), "
-                        "             datetime('now'))) "
+                        "    datetime('now')) "
                         "WHERE json_extract(metadata, '$.deprecated') = 1 "
                         "  AND json_extract(metadata, '$.deprecated_at') IS NULL "
                         "  AND json_extract(metadata, '$.is_memory_record') = 1"
@@ -1284,7 +1284,7 @@ class MemoryManager:
             " AND json_extract(metadata,'$.disclosure') IS NOT NULL"
             " AND json_extract(metadata,'$.disclosure') != ''"
         )
-        scan_limit = min(top_k * 3, 30)
+        scan_limit = int(self.config.get("disclosure_scan_limit", 200))
         params["disc_limit"] = scan_limit
 
         try:
@@ -1296,6 +1296,7 @@ class MemoryManager:
                     await session.execute(
                         sa_text(
                             f"SELECT text, metadata FROM documents WHERE {where_clause} "
+                            "ORDER BY json_extract(metadata,'$.created_at') DESC "
                             "LIMIT :disc_limit"
                         ),
                         params,
@@ -1433,6 +1434,7 @@ class MemoryManager:
             实际删除的记录数
         """
         doc_ids: list[str] = []
+        uris: list[str] = []
         deleted = 0
         try:
             doc_ids, uris, deleted = await self._collect_kb_doc_ids_for_filters(filters)
@@ -1539,6 +1541,7 @@ class MemoryManager:
     ) -> int:
         """底层清空逻辑：查询 doc_ids → 删除 → 反注册 → 同步统计"""
         doc_ids: list[str] = []
+        uris: list[str] = []
         count = 0
         try:
             doc_ids, uris, count = await self._collect_kb_doc_ids_for_filters(filters)
@@ -2352,6 +2355,9 @@ class MemoryManager:
                             )
                         self._kb_helper = target_kb
                         self._kb_name = target_kb_name
+                        # 迁移后重新绑定关联管理器到目标 KB
+                        self._link_manager = MemoryLinkManager(self.vec_db)
+                        await self._link_manager.ensure_table()
                         migration_committed = True
                         logger.info(f"[简单长期记忆] 已迁移到知识库: {target_kb_name}")
                     except Exception as e:
