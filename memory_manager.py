@@ -402,8 +402,10 @@ class MemoryManager:
         params: dict[str, Any] = {f"u{i}": u for i, u in enumerate(uris)}
         return await self._exec_metadata_update(set_clause, where_clause, params)
 
-    def _rerank_by_signal(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """根据 importance/recall_count/recency 对召回结果二次加权排序（P0.2）。
+    def _rerank_by_signal(
+        self, memories: list[dict[str, Any]], query: str = ""
+    ) -> list[dict[str, Any]]:
+        """根据 importance/recall_count/recency/disclosure 对召回结果二次加权排序。
 
         纯本地计算，不依赖 AstrBot。权重可经配置调整。
         """
@@ -414,6 +416,15 @@ class MemoryManager:
         w_importance = self.config.get("recall_weight_importance", 0.4)
         w_frequency = self.config.get("recall_weight_frequency", 0.3)
         w_recency = self.config.get("recall_weight_recency", 0.3)
+        disclosure_bonus = self.config.get("recall_disclosure_bonus", 0.25)
+
+        # 预计算 query tokens 用于 disclosure 匹配
+        query_tokens: set[str] = set()
+        if query and disclosure_bonus > 0:
+            tokens = self._tokenize_query(query)
+            if not tokens:
+                tokens = [t for t in query.lower().split() if len(t) >= 2]
+            query_tokens = set(tokens)
 
         def _score(mem: dict[str, Any]) -> float:
             meta = mem.get("metadata", {})
@@ -439,11 +450,21 @@ class MemoryManager:
                     recency = math.exp(-max(0.0, now - ts) / half_life)
                 except (ValueError, TypeError):
                     recency = 0.5
-            return (
+            score = (
                 w_importance * importance
                 + w_frequency * frequency
                 + w_recency * recency
             )
+            # disclosure 匹配加成：query 关键词与 disclosure 文本有交集时加分
+            if query_tokens:
+                disclosure = str(meta.get("disclosure", "")).lower()
+                if disclosure:
+                    disc_tokens = self._tokenize_query(disclosure)
+                    if not disc_tokens:
+                        disc_tokens = [t for t in disclosure.split() if len(t) >= 2]
+                    if query_tokens & set(disc_tokens):
+                        score += disclosure_bonus
+            return score
 
         return sorted(memories, key=_score, reverse=True)
 
@@ -960,8 +981,8 @@ class MemoryManager:
             results = self._filter_visible_shared_personal(event, results)
             memories = self._dedupe_memories(results)[:top_k]
 
-        # P0.2 信号加权重排（importance / recall_count / recency）
-        memories = self._rerank_by_signal(memories)
+        # P0.2 信号加权重排（importance / recall_count / recency / disclosure 匹配）
+        memories = self._rerank_by_signal(memories, query=query)
         # P0.1 召回反馈：仅注入路径递增 recall_count（避免 search/selftest/工具调用污染频次信号）
         if bump:
             recalled_uris = [
@@ -1039,17 +1060,25 @@ class MemoryManager:
                 }
             )
 
-        # P0.3 稀疏检索（FTS5）+ RRF 融合
+        # P0.3 稀疏检索（FTS5）
+        sparse_memories: list[dict[str, Any]] = []
         if self.config.get("recall_sparse_fusion", True):
             sparse_memories = await self._sparse_retrieve(query, top_k, filters)
-            memories = (
-                self._rrf_fuse(dense_memories, sparse_memories, limit=top_k)
-                if sparse_memories
-                else dense_memories
-            )
-        else:
-            memories = dense_memories
 
+        # Disclosure 精确匹配通道
+        disclosure_memories = await self._disclosure_retrieve(query, top_k, filters)
+
+        # RRF 多通道融合（空列表自动跳过）
+        channels = [dense_memories]
+        if sparse_memories:
+            channels.append(sparse_memories)
+        if disclosure_memories:
+            channels.append(disclosure_memories)
+        memories = (
+            self._rrf_fuse(*channels, limit=top_k)
+            if len(channels) > 1
+            else dense_memories
+        )
         # 融合后统一 rerank（复用知识库配置的 rerank provider）
         if use_rerank and memories:
             rerank_provider = getattr(self.vec_db, "rerank_provider", None)
@@ -1142,38 +1171,124 @@ class MemoryManager:
                 return False
         return True
 
+    @staticmethod
+    def _filters_to_sql(filters: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """将 metadata_filters dict 转为参数化 SQL WHERE 子句。
+
+        返回 (where_clause, params)，where_clause 不含 WHERE 关键字。
+        """
+        clauses: list[str] = []
+        params: dict[str, Any] = {}
+        for key, value in filters.items():
+            if key == "is_memory_record":
+                clauses.append("json_extract(metadata,'$.is_memory_record') = 1")
+            elif key == "deprecated":
+                # deprecated=False 意为“未废弃”，NULL 也视为未废弃
+                clauses.append("json_extract(metadata,'$.deprecated') IS NOT 1")
+            else:
+                param_name = f"f_{key}"
+                clauses.append(f"json_extract(metadata,'$.{key}') = :{param_name}")
+                params[param_name] = value
+        return " AND ".join(clauses) if clauses else "1=1", params
+
+    async def _disclosure_retrieve(
+        self, query: str, top_k: int, filters: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Disclosure 精确匹配检索通道。
+
+        查找 disclosure 字段与查询关键词有交集的记忆，
+        确保“当用户问 X 时”类型的触发条件不会被向量相似度漏掉。
+        """
+        if not self._kb_helper:
+            return []
+
+        # 分词：优先用 AstrBot 分词器，不可用时 fallback 到空格分词
+        query_tokens = self._tokenize_query(query)
+        if not query_tokens:
+            query_tokens = [t for t in query.lower().split() if len(t) >= 2]
+        if not query_tokens:
+            return []
+
+        # 构建 SQL：在现有 filters 基础上追加 disclosure 非空条件
+        where_clause, params = self._filters_to_sql(filters)
+        where_clause += (
+            " AND json_extract(metadata,'$.disclosure') IS NOT NULL"
+            " AND json_extract(metadata,'$.disclosure') != ''"
+        )
+        scan_limit = min(top_k * 3, 30)
+        params["disc_limit"] = scan_limit
+
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            f"SELECT text, metadata FROM documents WHERE {where_clause} "
+                            "LIMIT :disc_limit"
+                        ),
+                        params,
+                    )
+                ).all()
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] disclosure 检索失败: {e}")
+            return []
+
+        # Python 侧关键词匹配
+        query_token_set = set(query_tokens)
+        matched: list[dict[str, Any]] = []
+        for row in rows:
+            meta = _safe_parse_metadata(getattr(row, "metadata", {}) or {})
+            disclosure = str(meta.get("disclosure", "")).lower()
+            if not disclosure:
+                continue
+            # 分词 disclosure，检查与 query 的交集
+            disc_tokens = self._tokenize_query(disclosure)
+            if not disc_tokens:
+                disc_tokens = [t for t in disclosure.split() if len(t) >= 2]
+            if query_token_set & set(disc_tokens):
+                matched.append(
+                    {
+                        "text": getattr(row, "text", "") or "",
+                        "metadata": meta,
+                        "similarity": 0.0,  # 合成占位，RRF 按排名计分
+                    }
+                )
+            if len(matched) >= min(top_k * 2, 10):
+                break
+
+        if matched:
+            logger.debug(f"[简单长期记忆] disclosure 匹配 {len(matched)} 条记忆")
+        return matched
+
     def _rrf_fuse(
         self,
-        dense: list[dict[str, Any]],
-        sparse: list[dict[str, Any]],
+        *channels: list[dict[str, Any]],
         k: int = 60,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Reciprocal Rank Fusion 融合稠密与稀疏结果（P0.3）。
+        """Reciprocal Rank Fusion 融合多路检索结果。
 
         score(doc) = sum(1 / (k + rank))，同 AstrBot rank_fusion.py 公式；uri 作去重主键。
+        接受任意数量的排序列表（稠密/稀疏/disclosure 等），空列表自动跳过。
         """
         scores: dict[str, float] = {}
-        dense_by_uri: dict[str, dict[str, Any]] = {}
-        sparse_by_uri: dict[str, dict[str, Any]] = {}
+        mem_by_uri: dict[str, dict[str, Any]] = {}
 
-        for rank, mem in enumerate(dense):
-            uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
-            if not uri:
-                continue
-            scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
-            dense_by_uri.setdefault(uri, mem)
-        for rank, mem in enumerate(sparse):
-            uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
-            if not uri:
-                continue
-            scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
-            sparse_by_uri.setdefault(uri, mem)
+        for channel in channels:
+            for rank, mem in enumerate(channel):
+                uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
+                if not uri:
+                    continue
+                scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
+                mem_by_uri.setdefault(uri, mem)
 
         ordered = sorted(scores, key=lambda u: scores[u], reverse=True)[:limit]
         fused: list[dict[str, Any]] = []
         for uri in ordered:
-            mem = dense_by_uri.get(uri) or sparse_by_uri.get(uri)
+            mem = mem_by_uri.get(uri)
             if mem:
                 # 保留原始 similarity（dense cosine / sparse 负分），RRF 分独立存放；
                 # 勿覆盖 similarity，否则 smart_update_memory 的 0.85 阈值与 _dedupe 排序失效

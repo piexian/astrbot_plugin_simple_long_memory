@@ -43,6 +43,8 @@ from .prompts import (
     MEMORY_CONSOLIDATION_PROMPT,
     MEMORY_EXTRACTION_PROMPT,
     RECALL_QUERY_PROMPT,
+    VALID_TOOL_DOMAINS,
+    VALID_TOOL_SCOPES,
 )
 from .prompts import (
     sanitize_memory_content as _sanitize_memory_content,
@@ -1566,16 +1568,43 @@ class MemoryPlugin(Star):
     # ==================== LLM 工具 ====================
 
     @filter.llm_tool(name="memory_recall")
-    async def tool_recall(self, event: AstrMessageEvent, query: str) -> str:
+    async def tool_recall(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        domain: str = "",
+        scope: str = "",
+    ) -> str:
         """Search long-term memory for relevant information
 
         Args:
             query(string): search keywords or question
+            domain(string): optional filter by memory domain (user_profile/preferences/facts/events/context)
+            scope(string): optional filter by memory scope (personal/group/conversation/global)
         """
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
-        memories = await self.memory_mgr.recall_memories(event, query)
+        # 参数校验：错误即报错，不静默降级
+        domain_filter: str | None = None
+        if domain:
+            domain_lower = domain.lower().strip()
+            if domain_lower not in VALID_TOOL_DOMAINS:
+                valid = ", ".join(sorted(VALID_TOOL_DOMAINS))
+                return f"Error: invalid domain '{domain}'. Valid domains: {valid}"
+            domain_filter = domain_lower
+
+        scope_filter: str | None = None
+        if scope:
+            scope_lower = scope.lower().strip()
+            if scope_lower not in (*VALID_TOOL_SCOPES, MemoryScope.GLOBAL):
+                valid = ", ".join(sorted((*VALID_TOOL_SCOPES, MemoryScope.GLOBAL)))
+                return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+            scope_filter = scope_lower
+
+        memories = await self.memory_mgr.recall_memories(
+            event, query, domain=domain_filter, memory_scope=scope_filter
+        )
         if not memories:
             return "No relevant memories found"
 
@@ -1589,6 +1618,8 @@ class MemoryPlugin(Star):
         content: str,
         memory_type: str = "fact",
         disclosure: str = "",
+        importance: int = 3,
+        scope: str = "personal",
     ) -> str:
         """Store information to long-term memory
 
@@ -1596,15 +1627,46 @@ class MemoryPlugin(Star):
             content(string): content to remember
             memory_type(string): memory type (fact/preference/event/context)
             disclosure(string): condition description for triggering recall
+            importance(int): importance level 1-5, where 5 is most important
+            scope(string): memory scope (personal/group/conversation)
         """
         if not self.memory_mgr:
             return "Memory plugin not initialized"
+
+        # 参数校验：错误即报错，不静默降级
+        mem_type_lower = memory_type.lower().strip()
+        if mem_type_lower not in ALLOWED_MEMORY_TYPES:
+            valid = ", ".join(sorted(ALLOWED_MEMORY_TYPES))
+            return f"Error: invalid memory_type '{memory_type}'. Valid types: {valid}"
+
+        scope_lower = scope.lower().strip()
+        if scope_lower == MemoryScope.GLOBAL:
+            return (
+                "Error: scope 'global' is not allowed here. "
+                "Use the memory_store_global tool instead."
+            )
+        if scope_lower not in VALID_TOOL_SCOPES:
+            valid = ", ".join(sorted(VALID_TOOL_SCOPES))
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+
+        try:
+            importance_val = int(importance)
+        except (TypeError, ValueError):
+            return f"Error: importance must be an integer between 1 and 5, got '{importance}'"
+        if importance_val < 1 or importance_val > 5:
+            return f"Error: importance must be between 1 and 5, got {importance_val}"
+
+        # group scope 必须在群聊中使用
+        if scope_lower == MemoryScope.GROUP:
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            if parsed_umo.session_type != "group":
+                return "Error: scope 'group' can only be used in group chats"
 
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
 
-        domain = normalize_domain(memory_type)
+        domain = normalize_domain(mem_type_lower)
         uri = str(MemoryURI.generate(domain))
 
         await self.memory_mgr.store_memory(
@@ -1614,8 +1676,71 @@ class MemoryPlugin(Star):
             uri=uri,
             memory_type=MemoryType.NORMAL,
             disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
+            importance=importance_val,
+            memory_scope=scope_lower,
         )
         return f"Memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_update")
+    async def tool_update(
+        self,
+        event: AstrMessageEvent,
+        uri: str,
+        content: str,
+        disclosure: str = "",
+    ) -> str:
+        """Update an existing memory by URI, preserving its domain, importance and scope
+
+        Args:
+            uri(string): URI of the memory to update
+            content(string): new content to replace the old memory
+            disclosure(string): optional new condition description for triggering recall
+        """
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        if not uri or not uri.strip():
+            return "Error: uri is required"
+
+        # 查找旧记忆（按 user_id 隔离，找不到或不属于自己都报错）
+        old_memory = await self.memory_mgr.get_memory_by_uri(event, uri.strip())
+        if not old_memory:
+            return f"Error: memory not found or not yours: {uri}"
+
+        content = _sanitize_memory_content(content)
+        if not content:
+            return "Invalid memory content"
+
+        # 从旧 metadata 保留关键属性
+        old_meta = old_memory.get("metadata", {})
+        old_domain = old_meta.get("domain", "facts")
+        old_importance = old_meta.get("importance", 3)
+        old_scope = old_meta.get("memory_scope", MemoryScope.PERSONAL)
+        old_entities = old_meta.get("entities", [])
+        old_topics = old_meta.get("topics", [])
+
+        # 删除旧记录
+        deleted = await self.memory_mgr.forget_memory(event, uri.strip())
+        if deleted == 0:
+            return f"Error: failed to delete old memory: {uri}"
+
+        # 写入新记录，保留旧属性
+        new_uri = str(MemoryURI.generate(old_domain))
+        await self.memory_mgr.store_memory(
+            event=event,
+            content=content,
+            domain=old_domain,
+            uri=new_uri,
+            memory_type=MemoryType.NORMAL,
+            disclosure=_sanitize_memory_content(disclosure)[:200]
+            if disclosure
+            else old_meta.get("disclosure", ""),
+            importance=old_importance,
+            memory_scope=old_scope,
+            entities=old_entities,
+            topics=old_topics,
+        )
+        return f"Memory updated: {uri} -> {new_uri}"
 
     @filter.llm_tool(name="memory_store_global")
     async def tool_store_global(
@@ -1644,11 +1769,17 @@ class MemoryPlugin(Star):
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
+        # 参数校验
+        mem_type_lower = memory_type.lower().strip()
+        if mem_type_lower not in ALLOWED_MEMORY_TYPES:
+            valid = ", ".join(sorted(ALLOWED_MEMORY_TYPES))
+            return f"Error: invalid memory_type '{memory_type}'. Valid types: {valid}"
+
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
 
-        domain = normalize_domain(memory_type)
+        domain = normalize_domain(mem_type_lower)
         uri = str(MemoryURI.generate(domain))
 
         await self.memory_mgr.store_memory(

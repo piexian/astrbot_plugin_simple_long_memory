@@ -86,6 +86,12 @@ ALLOWED_MEMORY_TYPES: frozenset[str] = frozenset(
     ("fact", "preference", "event", "context")
 )
 
+# LLM 工具参数校验用合法值（错误即报错，不静默降级）
+VALID_TOOL_SCOPES: frozenset[str] = frozenset(("personal", "group", "conversation"))
+VALID_TOOL_DOMAINS: frozenset[str] = frozenset(
+    ("user_profile", "preferences", "facts", "events", "context")
+)
+
 # 需要过滤的敏感指令模式
 SENSITIVE_PATTERNS = [
     re.compile(
