@@ -1729,10 +1729,9 @@ class MemoryPlugin(Star):
             return f"Error: memory not found or not yours: {uri}"
 
         old_meta = old_memory.get("metadata", {})
-        old_scope = old_meta.get("memory_scope", MemoryScope.PERSONAL)
 
         # global 记忆不允许通过此工具修改，必须走管理员确认路径
-        if old_scope == MemoryScope.GLOBAL:
+        if old_meta.get("memory_scope") == MemoryScope.GLOBAL:
             return (
                 "Error: global memories cannot be updated via this tool. "
                 "Use /memory commands with admin confirmation instead."
@@ -1742,76 +1741,18 @@ class MemoryPlugin(Star):
         if not content:
             return "Invalid memory content"
 
-        # 从旧 metadata 保留关键属性（含租户/归属信息）
-        old_domain = old_meta.get("domain", "facts")
-        old_importance = old_meta.get("importance", 3)
-        old_entities = old_meta.get("entities", [])
-        old_topics = old_meta.get("topics", [])
-        old_visibility = old_meta.get("visibility", "")
-        old_subject = old_meta.get("subject", "")
-        old_owner_sender_ids = old_meta.get("owner_sender_ids", [])
-
-        # 删除前读取双向关联（forget 会级联删除关联边）
-        old_links_out: list[dict] = []
-        old_links_in: list[dict] = []
-        if self.memory_mgr.link_manager:
-            old_links_out = await self.memory_mgr.link_manager.get_links_for_uri(
-                uri.strip(), injectable_only=False, limit=50
-            )
-            old_links_in = await self.memory_mgr.link_manager.get_links_to_uri(
-                uri.strip(), injectable_only=False, limit=50
-            )
-
-        # 先写入新记录，成功后再删除旧记录
-        new_uri = str(MemoryURI.generate(old_domain))
+        # 使用 replace_memory 保留完整原始 metadata（租户/作用域/归属/关联）
+        new_disclosure = (
+            _sanitize_memory_content(disclosure)[:200] if disclosure else None
+        )
         try:
-            await self.memory_mgr.store_memory(
-                event=event,
-                content=content,
-                domain=old_domain,
-                uri=new_uri,
-                memory_type=MemoryType.NORMAL,
-                disclosure=_sanitize_memory_content(disclosure)[:200]
-                if disclosure
-                else old_meta.get("disclosure", ""),
-                importance=old_importance,
-                memory_scope=old_scope,
-                visibility=old_visibility,
-                subject=old_subject,
-                entities=old_entities,
-                topics=old_topics,
-                owner_sender_ids=old_owner_sender_ids or None,
+            new_uri = await self.memory_mgr.replace_memory(
+                old_metadata=old_meta,
+                new_content=content,
+                new_disclosure=new_disclosure,
             )
         except Exception as e:
-            return f"Error: failed to write new memory: {e}"
-
-        # 新记录写入成功，删除旧记录
-        deleted = await self.memory_mgr.forget_memory(event, uri.strip())
-        if deleted == 0:
-            # 旧记录删除失败，回滚新记录
-            await self.memory_mgr.forget_memory(event, new_uri)
-            return f"Error: failed to delete old memory, rolled back: {uri}"
-
-        # 迁移关联边：将旧 URI 的出边和入边替换为新 URI
-        if self.memory_mgr.link_manager:
-            for link in old_links_out:
-                await self.memory_mgr.link_manager.add_link(
-                    new_uri,
-                    link["target_uri"],
-                    link["relation_type"],
-                    reason=link.get("reason", ""),
-                    confidence=link.get("confidence", 1.0),
-                    created_by="memory_update",
-                )
-            for link in old_links_in:
-                await self.memory_mgr.link_manager.add_link(
-                    link["source_uri"],
-                    new_uri,
-                    link["relation_type"],
-                    reason=link.get("reason", ""),
-                    confidence=link.get("confidence", 1.0),
-                    created_by="memory_update",
-                )
+            return f"Error: failed to update memory: {e}"
 
         return f"Memory updated: {uri} -> {new_uri}"
 

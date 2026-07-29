@@ -147,12 +147,12 @@ class MemoryLinkManager:
                             f"{rel_filter}"
                             " AND confidence >= :min_conf"
                             " ORDER BY confidence DESC"
-                            " LIMIT :lim"
+                            + (" LIMIT :lim" if limit > 0 else "")
                         ),
                         {
                             "uri": uri,
                             "min_conf": min_confidence,
-                            "lim": limit,
+                            **({"lim": limit} if limit > 0 else {}),
                             **{
                                 f"rel{i}": r for i, r in enumerate(INJECTABLE_RELATIONS)
                             },
@@ -201,12 +201,12 @@ class MemoryLinkManager:
                             f"{rel_filter}"
                             " AND confidence >= :min_conf"
                             " ORDER BY confidence DESC"
-                            " LIMIT :lim"
+                            + (" LIMIT :lim" if limit > 0 else "")
                         ),
                         {
                             "uri": uri,
                             "min_conf": min_confidence,
-                            "lim": limit,
+                            **({"lim": limit} if limit > 0 else {}),
                             **{
                                 f"rel{i}": r for i, r in enumerate(INJECTABLE_RELATIONS)
                             },

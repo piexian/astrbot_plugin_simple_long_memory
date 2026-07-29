@@ -1003,6 +1003,114 @@ class MemoryManager:
         logger.debug(f"[简单长期记忆] 存储记忆: {uri}, 用户: {metadata['user_id']}")
         return uri
 
+    async def replace_memory(
+        self,
+        old_metadata: dict[str, Any],
+        new_content: str,
+        new_disclosure: str | None = None,
+    ) -> str:
+        """替换记忆内容，完整保留原始租户/作用域/归属元数据。
+
+        与 store_memory 不同，此方法不从 event 重建 owner/session/UMO，
+        而是直接复制旧 metadata，仅更新 content/disclosure/version/URI。
+        先写入新记录，成功后再删除旧记录。
+
+        Args:
+            old_metadata: 旧记忆的完整 metadata dict
+            new_content: 新的记忆内容
+            new_disclosure: 新的触发条件（None 表示保留旧值）
+
+        Returns:
+            新的记忆 URI
+
+        Raises:
+            RuntimeError: 写入新记录失败
+        """
+        old_domain = old_metadata.get("domain", "facts")
+        old_uri = old_metadata.get("uri", "")
+        new_uri = str(MemoryURI.generate(old_domain))
+        new_doc_id = str(uuid.uuid4())
+
+        # 构建新 metadata：复制全部旧字段，只更新内容相关字段
+        new_metadata = {**old_metadata}
+        new_metadata["uri"] = new_uri
+        new_metadata["kb_doc_id"] = new_doc_id
+        new_metadata["memory_content"] = new_content
+        new_metadata["version"] = old_metadata.get("version", 1) + 1
+        new_metadata["deprecated"] = False
+        if new_disclosure is not None:
+            new_metadata["disclosure"] = new_disclosure
+        # kb_id 保持当前连接的 KB
+        if self._kb_helper:
+            new_metadata["kb_id"] = self._kb_helper.kb.kb_id
+
+        formatted_content = format_memory_content(new_content, new_metadata)
+
+        # 先写入新记录
+        await self.vec_db.insert(
+            content=formatted_content,
+            metadata=new_metadata,
+            id=new_doc_id,
+        )
+
+        # 注册 KB 文档
+        try:
+            await self._register_kb_document(
+                new_doc_id, new_uri, len(formatted_content)
+            )
+            await self._sync_kb_stats()
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] replace KB 文档注册失败: {e}")
+
+        # 删除旧记录（向量 + KB 文档）
+        old_doc_id = old_metadata.get("kb_doc_id", "")
+        if old_doc_id:
+            try:
+                await self.vec_db.delete_documents(
+                    metadata_filters={"kb_doc_id": old_doc_id}
+                )
+            except Exception as e:
+                logger.warning(f"[简单长期记忆] replace 删除旧向量失败: {e}")
+            try:
+                await self._unregister_kb_documents([old_doc_id])
+                await self._sync_kb_stats()
+            except Exception as e:
+                logger.warning(f"[简单长期记忆] replace 删除旧 KB 文档失败: {e}")
+
+        # 迁移关联边
+        if self._link_manager and old_uri:
+            try:
+                out_links = await self._link_manager.get_links_for_uri(
+                    old_uri, injectable_only=False, limit=0
+                )
+                in_links = await self._link_manager.get_links_to_uri(
+                    old_uri, injectable_only=False, limit=0
+                )
+                for link in out_links:
+                    await self._link_manager.add_link(
+                        new_uri,
+                        link["target_uri"],
+                        link["relation_type"],
+                        reason=link.get("reason", ""),
+                        confidence=link.get("confidence", 1.0),
+                        created_by="replace",
+                    )
+                for link in in_links:
+                    await self._link_manager.add_link(
+                        link["source_uri"],
+                        new_uri,
+                        link["relation_type"],
+                        reason=link.get("reason", ""),
+                        confidence=link.get("confidence", 1.0),
+                        created_by="replace",
+                    )
+                await self._link_manager.delete_links_for_uris([old_uri])
+            except Exception as e:
+                logger.warning(f"[简单长期记忆] replace 关联迁移失败: {e}")
+
+        logger.debug(f"[简单长期记忆] 替换记忆: {old_uri} -> {new_uri}")
+        return new_uri
+
     async def recall_memories(
         self,
         event: AstrMessageEvent,
@@ -1287,54 +1395,62 @@ class MemoryManager:
             " AND json_extract(metadata,'$.disclosure') IS NOT NULL"
             " AND json_extract(metadata,'$.disclosure') != ''"
         )
+        # 分页扫描直到找到足够匹配或遍历完所有候选
         try:
             scan_limit = int(self.config.get("disclosure_scan_limit", 200))
         except (TypeError, ValueError):
             scan_limit = 200
-        scan_limit = max(10, min(scan_limit, 1000))
-        params["disc_limit"] = scan_limit
+        scan_limit = max(10, min(scan_limit, 5000))
+
+        query_token_set = set(query_tokens)
+        matched: list[dict[str, Any]] = []
+        target_matches = min(top_k * 2, 10)
+        page_size = min(scan_limit, 200)
+        offset = 0
 
         try:
             doc_storage = self.vec_db.document_storage
             async with doc_storage.get_session() as session:
                 from sqlalchemy import text as sa_text
 
-                rows = (
-                    await session.execute(
-                        sa_text(
-                            f"SELECT text, metadata FROM documents WHERE {where_clause} "
-                            "ORDER BY json_extract(metadata,'$.created_at') DESC "
-                            "LIMIT :disc_limit"
-                        ),
-                        params,
-                    )
-                ).all()
+                while offset < scan_limit and len(matched) < target_matches:
+                    batch_limit = min(page_size, scan_limit - offset)
+                    rows = (
+                        await session.execute(
+                            sa_text(
+                                f"SELECT text, metadata FROM documents "
+                                f"WHERE {where_clause} "
+                                "ORDER BY json_extract(metadata,'$.created_at') DESC "
+                                "LIMIT :batch_lim OFFSET :batch_off"
+                            ),
+                            {**params, "batch_lim": batch_limit, "batch_off": offset},
+                        )
+                    ).all()
+                    if not rows:
+                        break
+                    offset += len(rows)
+
+                    for row in rows:
+                        meta = _safe_parse_metadata(getattr(row, "metadata", {}) or {})
+                        disclosure = str(meta.get("disclosure", "")).lower()
+                        if not disclosure:
+                            continue
+                        disc_tokens = self._tokenize_query(disclosure)
+                        if not disc_tokens:
+                            disc_tokens = [t for t in disclosure.split() if len(t) >= 2]
+                        if query_token_set & set(disc_tokens):
+                            matched.append(
+                                {
+                                    "text": getattr(row, "text", "") or "",
+                                    "metadata": meta,
+                                    "similarity": 0.0,
+                                }
+                            )
+                            if len(matched) >= target_matches:
+                                break
         except Exception as e:
             logger.debug(f"[简单长期记忆] disclosure 检索失败: {e}")
             return []
-
-        # Python 侧关键词匹配
-        query_token_set = set(query_tokens)
-        matched: list[dict[str, Any]] = []
-        for row in rows:
-            meta = _safe_parse_metadata(getattr(row, "metadata", {}) or {})
-            disclosure = str(meta.get("disclosure", "")).lower()
-            if not disclosure:
-                continue
-            # 分词 disclosure，检查与 query 的交集
-            disc_tokens = self._tokenize_query(disclosure)
-            if not disc_tokens:
-                disc_tokens = [t for t in disclosure.split() if len(t) >= 2]
-            if query_token_set & set(disc_tokens):
-                matched.append(
-                    {
-                        "text": getattr(row, "text", "") or "",
-                        "metadata": meta,
-                        "similarity": 0.0,  # 合成占位，RRF 按排名计分
-                    }
-                )
-            if len(matched) >= min(top_k * 2, 10):
-                break
 
         if matched:
             logger.debug(f"[简单长期记忆] disclosure 匹配 {len(matched)} 条记忆")
@@ -2356,6 +2472,11 @@ class MemoryManager:
             if is_migration:
                 if failed == 0:
                     try:
+                        # 先导出源关联表（在删除源记录之前）
+                        exported_links: list[dict] = []
+                        if self._link_manager:
+                            exported_links = await self._link_manager.export_all()
+
                         await self._delete_rebuild_source_records(
                             source_kb, memory_records
                         )
@@ -2365,15 +2486,20 @@ class MemoryManager:
                             )
                         self._kb_helper = target_kb
                         self._kb_name = target_kb_name
-                        # 迁移关联表：导出源关联 → 目标建表 → 导入
-                        old_links: list[dict] = []
-                        if self._link_manager:
-                            old_links = await self._link_manager.export_all()
+                        # 目标建表 + 导入关联
                         self._link_manager = MemoryLinkManager(self.vec_db)
                         await self._link_manager.ensure_table()
-                        if old_links:
-                            imported = await self._link_manager.import_all(old_links)
-                            logger.info(f"[简单长期记忆] 迁移关联表: {imported} 条")
+                        if exported_links:
+                            imported = await self._link_manager.import_all(
+                                exported_links
+                            )
+                            if imported != len(exported_links):
+                                logger.warning(
+                                    f"[简单长期记忆] 关联迁移数量不一致: "
+                                    f"导出 {len(exported_links)}, 导入 {imported}"
+                                )
+                            else:
+                                logger.info(f"[简单长期记忆] 迁移关联表: {imported} 条")
                         migration_committed = True
                         logger.info(f"[简单长期记忆] 已迁移到知识库: {target_kb_name}")
                     except Exception as e:

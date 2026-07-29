@@ -103,6 +103,9 @@ class MaintenanceScheduler:
                     f"{result['purged']} 条记忆, "
                     f"{result['links_cleaned']} 条关联"
                 )
+            # 存在任何失败时抛出异常，让 cron manager 记录为失败
+            if result.get("errors"):
+                raise RuntimeError(f"purge 部分失败: {result['errors']}")
         except Exception as e:
             logger.warning(f"[简单长期记忆] 定时清理失败: {e}")
             raise  # 传播到 cron manager，记录为失败而非 completed
