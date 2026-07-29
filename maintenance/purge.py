@@ -25,7 +25,7 @@ async def purge_deprecated_memories(
     """物理删除 deprecated 超过 after_days 天的记忆。
 
     按精确的 kb_doc_id 逐条删除，不会误删宽限期内的记录。
-    向量删除失败时不继续下游清理，保证一致性。
+    只用成功删除的子集清理 KB 文档和关联边，保证跨存储一致性。
 
     Args:
         vec_db: 向量数据库实例
@@ -42,9 +42,8 @@ async def purge_deprecated_memories(
     kb_id = kb_helper.kb.kb_id
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
 
-    # 1. 精确查询待清理的记忆 URI 和 kb_doc_id
-    uris: list[str] = []
-    doc_ids: list[str] = []
+    # 1. 精确查询待清理的记忆，收集 (doc_id, uri) 配对
+    candidates: list[tuple[str, str]] = []  # (kb_doc_id, uri)
     try:
         doc_storage = vec_db.document_storage
         async with doc_storage.get_session() as session:
@@ -72,53 +71,57 @@ async def purge_deprecated_memories(
                     )
                 except (json.JSONDecodeError, TypeError):
                     meta = {}
-                if meta.get("uri"):
-                    uris.append(meta["uri"])
-                if meta.get("kb_doc_id"):
-                    doc_ids.append(meta["kb_doc_id"])
+                doc_id = meta.get("kb_doc_id", "")
+                uri = meta.get("uri", "")
+                if doc_id:
+                    candidates.append((doc_id, uri))
     except Exception as e:
         logger.warning(f"[简单长期记忆] purge 查询失败: {e}")
         return {"purged": 0, "links_cleaned": 0}
 
-    if not uris and not doc_ids:
+    if not candidates:
         return {"purged": 0, "links_cleaned": 0}
 
-    # 2. 按精确 kb_doc_id 逐条删除向量（不用宽泛过滤器，防止误删宽限期内记录）
-    purged = 0
+    # 2. 按精确 kb_doc_id 逐条删除向量，跟踪成功集合
+    succeeded_doc_ids: list[str] = []
+    succeeded_uris: list[str] = []
     failed = 0
-    for doc_id in doc_ids:
+    for doc_id, uri in candidates:
         try:
             await vec_db.delete_documents(
                 metadata_filters={"kb_doc_id": doc_id, "kb_id": kb_id}
             )
-            purged += 1
+            succeeded_doc_ids.append(doc_id)
+            if uri:
+                succeeded_uris.append(uri)
         except Exception as e:
             failed += 1
             logger.debug(f"[简单长期记忆] purge 删除 {doc_id} 失败: {e}")
 
     # 向量删除全部失败时不继续下游清理
-    if purged == 0 and failed > 0:
+    if not succeeded_doc_ids:
         logger.warning("[简单长期记忆] purge 向量删除全部失败，跳过下游清理")
         return {"purged": 0, "links_cleaned": 0}
 
-    # 3. 从 KB 文档记录删除（仅删除成功清理向量的 doc_id）
-    if doc_ids:
-        try:
-            from astrbot.core.knowledge_base.models import KBDocument
-            from sqlmodel import col, delete
+    # 3. 仅对成功删除向量的 doc_id 清理 KB 文档记录
+    try:
+        from astrbot.core.knowledge_base.models import KBDocument
+        from sqlmodel import col, delete
 
-            async with kb_helper.kb_db.get_db() as session:
-                async with session.begin():
-                    stmt = delete(KBDocument).where(col(KBDocument.doc_id).in_(doc_ids))
-                    await session.execute(stmt)
-                    await session.commit()
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] purge KB 文档删除失败: {e}")
+        async with kb_helper.kb_db.get_db() as session:
+            async with session.begin():
+                stmt = delete(KBDocument).where(
+                    col(KBDocument.doc_id).in_(succeeded_doc_ids)
+                )
+                await session.execute(stmt)
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"[简单长期记忆] purge KB 文档删除失败: {e}")
 
-    # 4. 级联清理关联边
+    # 4. 仅对成功删除的 URI 级联清理关联边
     links_cleaned = 0
-    if link_manager and uris:
-        links_cleaned = await link_manager.delete_links_for_uris(uris)
+    if link_manager and succeeded_uris:
+        links_cleaned = await link_manager.delete_links_for_uris(succeeded_uris)
 
     # 5. 同步 KB 统计
     try:
@@ -130,6 +133,7 @@ async def purge_deprecated_memories(
     except Exception as e:
         logger.debug(f"[简单长期记忆] purge 统计同步失败: {e}")
 
+    purged = len(succeeded_doc_ids)
     if purged:
         logger.info(
             f"[简单长期记忆] 物理清理完成: {purged} 条记忆, "

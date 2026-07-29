@@ -172,6 +172,60 @@ class MemoryLinkManager:
             logger.debug(f"[简单长期记忆] 查询关联失败: {e}")
             return []
 
+    async def get_links_to_uri(
+        self,
+        uri: str,
+        injectable_only: bool = True,
+        min_confidence: float = 0.0,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """查询指向某条记忆的入边关联。"""
+        try:
+            doc_storage = self._vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                rel_filter = ""
+                if injectable_only:
+                    placeholders = ",".join(
+                        f":rel{i}" for i in range(len(INJECTABLE_RELATIONS))
+                    )
+                    rel_filter = f" AND relation_type IN ({placeholders})"
+
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT source_uri, relation_type, reason, confidence "
+                            "FROM memory_links "
+                            "WHERE target_uri = :uri"
+                            f"{rel_filter}"
+                            " AND confidence >= :min_conf"
+                            " ORDER BY confidence DESC"
+                            " LIMIT :lim"
+                        ),
+                        {
+                            "uri": uri,
+                            "min_conf": min_confidence,
+                            "lim": limit,
+                            **{
+                                f"rel{i}": r for i, r in enumerate(INJECTABLE_RELATIONS)
+                            },
+                        },
+                    )
+                ).all()
+                return [
+                    {
+                        "source_uri": row.source_uri,
+                        "relation_type": row.relation_type,
+                        "reason": row.reason,
+                        "confidence": row.confidence,
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 查询入边关联失败: {e}")
+            return []
+
     async def delete_links_for_uris(self, uris: list[str]) -> int:
         """级联删除涉及指定 URI 的所有关联边。"""
         uris = [u for u in uris if u]
@@ -210,3 +264,68 @@ class MemoryLinkManager:
                 return int(row or 0)
         except Exception:
             return 0
+
+    async def export_all(self) -> list[dict[str, Any]]:
+        """导出所有关联记录（用于 KB 迁移）。"""
+        try:
+            doc_storage = self._vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT source_uri, target_uri, relation_type, "
+                            "reason, confidence, created_by, created_at "
+                            "FROM memory_links"
+                        )
+                    )
+                ).all()
+                return [
+                    {
+                        "source_uri": r.source_uri,
+                        "target_uri": r.target_uri,
+                        "relation_type": r.relation_type,
+                        "reason": r.reason,
+                        "confidence": r.confidence,
+                        "created_by": r.created_by,
+                        "created_at": r.created_at,
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 导出关联失败: {e}")
+            return []
+
+    async def import_all(self, records: list[dict[str, Any]]) -> int:
+        """导入关联记录（用于 KB 迁移）。"""
+        if not records:
+            return 0
+        imported = 0
+        try:
+            doc_storage = self._vec_db.document_storage
+            async with doc_storage.get_session() as session, session.begin():
+                from sqlalchemy import text as sa_text
+
+                for rec in records:
+                    await session.execute(
+                        sa_text(
+                            "INSERT OR IGNORE INTO memory_links "
+                            "(source_uri, target_uri, relation_type, reason, "
+                            " confidence, created_by, created_at) "
+                            "VALUES (:src, :tgt, :rel, :reason, :conf, :by, :at)"
+                        ),
+                        {
+                            "src": rec["source_uri"],
+                            "tgt": rec["target_uri"],
+                            "rel": rec["relation_type"],
+                            "reason": rec.get("reason", ""),
+                            "conf": rec.get("confidence", 1.0),
+                            "by": rec.get("created_by", "migration"),
+                            "at": rec.get("created_at", ""),
+                        },
+                    )
+                    imported += 1
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 导入关联失败: {e}")
+        return imported

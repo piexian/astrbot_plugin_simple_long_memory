@@ -1728,19 +1728,41 @@ class MemoryPlugin(Star):
         if not old_memory:
             return f"Error: memory not found or not yours: {uri}"
 
+        old_meta = old_memory.get("metadata", {})
+        old_scope = old_meta.get("memory_scope", MemoryScope.PERSONAL)
+
+        # global 记忆不允许通过此工具修改，必须走管理员确认路径
+        if old_scope == MemoryScope.GLOBAL:
+            return (
+                "Error: global memories cannot be updated via this tool. "
+                "Use /memory commands with admin confirmation instead."
+            )
+
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
 
-        # 从旧 metadata 保留关键属性
-        old_meta = old_memory.get("metadata", {})
+        # 从旧 metadata 保留关键属性（含租户/归属信息）
         old_domain = old_meta.get("domain", "facts")
         old_importance = old_meta.get("importance", 3)
-        old_scope = old_meta.get("memory_scope", MemoryScope.PERSONAL)
         old_entities = old_meta.get("entities", [])
         old_topics = old_meta.get("topics", [])
+        old_visibility = old_meta.get("visibility", "")
+        old_subject = old_meta.get("subject", "")
+        old_owner_sender_ids = old_meta.get("owner_sender_ids", [])
 
-        # 先写入新记录，成功后再删除旧记录（防止写入失败导致数据丢失）
+        # 删除前读取双向关联（forget 会级联删除关联边）
+        old_links_out: list[dict] = []
+        old_links_in: list[dict] = []
+        if self.memory_mgr.link_manager:
+            old_links_out = await self.memory_mgr.link_manager.get_links_for_uri(
+                uri.strip(), injectable_only=False, limit=50
+            )
+            old_links_in = await self.memory_mgr.link_manager.get_links_to_uri(
+                uri.strip(), injectable_only=False, limit=50
+            )
+
+        # 先写入新记录，成功后再删除旧记录
         new_uri = str(MemoryURI.generate(old_domain))
         try:
             await self.memory_mgr.store_memory(
@@ -1754,8 +1776,11 @@ class MemoryPlugin(Star):
                 else old_meta.get("disclosure", ""),
                 importance=old_importance,
                 memory_scope=old_scope,
+                visibility=old_visibility,
+                subject=old_subject,
                 entities=old_entities,
                 topics=old_topics,
+                owner_sender_ids=old_owner_sender_ids or None,
             )
         except Exception as e:
             return f"Error: failed to write new memory: {e}"
@@ -1767,12 +1792,9 @@ class MemoryPlugin(Star):
             await self.memory_mgr.forget_memory(event, new_uri)
             return f"Error: failed to delete old memory, rolled back: {uri}"
 
-        # 迁移关联边：旧 URI 的关联指向新 URI
+        # 迁移关联边：将旧 URI 的出边和入边替换为新 URI
         if self.memory_mgr.link_manager:
-            old_links = await self.memory_mgr.link_manager.get_links_for_uri(
-                uri.strip(), injectable_only=False, limit=50
-            )
-            for link in old_links:
+            for link in old_links_out:
                 await self.memory_mgr.link_manager.add_link(
                     new_uri,
                     link["target_uri"],
@@ -1781,7 +1803,15 @@ class MemoryPlugin(Star):
                     confidence=link.get("confidence", 1.0),
                     created_by="memory_update",
                 )
-            await self.memory_mgr.link_manager.delete_links_for_uris([uri.strip()])
+            for link in old_links_in:
+                await self.memory_mgr.link_manager.add_link(
+                    link["source_uri"],
+                    new_uri,
+                    link["relation_type"],
+                    reason=link.get("reason", ""),
+                    confidence=link.get("confidence", 1.0),
+                    created_by="memory_update",
+                )
 
         return f"Memory updated: {uri} -> {new_uri}"
 

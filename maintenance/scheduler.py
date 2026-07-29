@@ -105,5 +105,6 @@ class MaintenanceScheduler:
                 )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 定时清理失败: {e}")
+            raise  # 传播到 cron manager，记录为失败而非 completed
         finally:
             self._running_tasks.discard("purge")

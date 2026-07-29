@@ -290,15 +290,18 @@ class MemoryManager:
             async with doc_storage.get_session() as session, session.begin():
                 from sqlalchemy import text as sa_text
 
+                # 用 Python UTC ISO 格式，与 purge cutoff 的 isoformat() 保持一致
+                now_iso = datetime.now(timezone.utc).isoformat()
                 result = await session.execute(
                     sa_text(
                         "UPDATE documents "
                         "SET metadata = json_set(metadata, '$.deprecated_at', "
-                        "    datetime('now')) "
+                        "    :now_iso) "
                         "WHERE json_extract(metadata, '$.deprecated') = 1 "
                         "  AND json_extract(metadata, '$.deprecated_at') IS NULL "
                         "  AND json_extract(metadata, '$.is_memory_record') = 1"
-                    )
+                    ),
+                    {"now_iso": now_iso},
                 )
                 patched = result.rowcount
                 if patched:
@@ -1284,7 +1287,11 @@ class MemoryManager:
             " AND json_extract(metadata,'$.disclosure') IS NOT NULL"
             " AND json_extract(metadata,'$.disclosure') != ''"
         )
-        scan_limit = int(self.config.get("disclosure_scan_limit", 200))
+        try:
+            scan_limit = int(self.config.get("disclosure_scan_limit", 200))
+        except (TypeError, ValueError):
+            scan_limit = 200
+        scan_limit = max(10, min(scan_limit, 1000))
         params["disc_limit"] = scan_limit
 
         try:
@@ -1436,14 +1443,17 @@ class MemoryManager:
         doc_ids: list[str] = []
         uris: list[str] = []
         deleted = 0
+        collection_ok = False
         try:
             doc_ids, uris, deleted = await self._collect_kb_doc_ids_for_filters(filters)
+            collection_ok = True
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
-            try:
-                deleted = await self.vec_db.count_documents(metadata_filter=filters)
-            except Exception as ce:
-                logger.warning(f"[简单长期记忆] 统计待删除文档失败: {ce}")
+
+        if not collection_ok:
+            # 收集失败时禁止进入删除，防止无法跟踪删除结果
+            logger.warning("[简单长期记忆] 候选收集失败，跳过删除")
+            return 0
 
         await self.vec_db.delete_documents(metadata_filters=filters)
 
@@ -2355,9 +2365,15 @@ class MemoryManager:
                             )
                         self._kb_helper = target_kb
                         self._kb_name = target_kb_name
-                        # 迁移后重新绑定关联管理器到目标 KB
+                        # 迁移关联表：导出源关联 → 目标建表 → 导入
+                        old_links: list[dict] = []
+                        if self._link_manager:
+                            old_links = await self._link_manager.export_all()
                         self._link_manager = MemoryLinkManager(self.vec_db)
                         await self._link_manager.ensure_table()
+                        if old_links:
+                            imported = await self._link_manager.import_all(old_links)
+                            logger.info(f"[简单长期记忆] 迁移关联表: {imported} 条")
                         migration_committed = True
                         logger.info(f"[简单长期记忆] 已迁移到知识库: {target_kb_name}")
                     except Exception as e:
