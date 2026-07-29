@@ -1,0 +1,12 @@
+{
+  "id": "review-maintenance-agent-spec",
+  "title": "审查维护代理计划",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "astrbot-plugin",
+  "currentPhase": "completed",
+  "nextAction": "归档审查记录",
+  "createdAt": "2026-07-30T00:00:00Z",
+  "branch": "main"
+}

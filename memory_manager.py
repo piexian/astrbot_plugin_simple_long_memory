@@ -36,6 +36,8 @@ from .memory_protocol import (
     normalize_memory_scope,
 )
 
+from .maintenance.links import MemoryLinkManager
+
 if TYPE_CHECKING:
     from astrbot.core.knowledge_base.kb_helper import KBHelper
     from astrbot.core.knowledge_base.kb_mgr import KnowledgeBaseManager
@@ -170,6 +172,8 @@ class MemoryManager:
         self._kv_put = kv_put
         self._kv_get = kv_get
         self._kv_delete = kv_delete
+        # 关联表管理器（connect_kb 后初始化）
+        self._link_manager: MemoryLinkManager | None = None
 
     # ---------- public state accessors ----------
     @property
@@ -186,6 +190,24 @@ class MemoryManager:
     def is_rebuilding(self) -> bool:
         """当前是否正在执行重建/迁移。"""
         return self._rebuilding
+
+    @property
+    def link_manager(self) -> MemoryLinkManager | None:
+        """关联表管理器（KB 连接后可用）"""
+        return self._link_manager
+
+    async def purge_deprecated(self, after_days: int = 7) -> dict[str, int]:
+        """物理清理废弃超期记忆（含关联边级联清理）。"""
+        if not self._kb_helper:
+            return {"purged": 0, "links_cleaned": 0}
+        from .maintenance.purge import purge_deprecated_memories
+
+        return await purge_deprecated_memories(
+            vec_db=self.vec_db,
+            kb_helper=self._kb_helper,
+            link_manager=self._link_manager,
+            after_days=after_days,
+        )
 
     def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
         """从外部恢复重建期间未落盘的写入缓冲（启动恢复用）"""
@@ -221,6 +243,10 @@ class MemoryManager:
         self._kb_helper = kb
         logger.info(f"[简单长期记忆] 已连接知识库: {self._kb_name}")
         await self._migrate_patch_chunk_index()
+        await self._migrate_patch_deprecated_at()
+        # 初始化关联表
+        self._link_manager = MemoryLinkManager(self.vec_db)
+        await self._link_manager.ensure_table()
 
     async def _migrate_patch_chunk_index(self) -> None:
         """迁移补丁：为缺少 chunk_index 字段的旧记忆条目写入默认值 0。
@@ -251,6 +277,38 @@ class MemoryManager:
                     )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 迁移补丁执行失败（不影响功能）: {e}")
+
+    async def _migrate_patch_deprecated_at(self) -> None:
+        """迁移补丁：为已废弃但缺少 deprecated_at 的记忆回填时间戳。
+
+        旧版废弃操作只写 deprecated=1，没有记录废弃时间。
+        用 created_at 回填作为保守估计，确保 purge 宽限期不会立即触发。
+        """
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session, session.begin():
+                from sqlalchemy import text as sa_text
+
+                result = await session.execute(
+                    sa_text(
+                        "UPDATE documents "
+                        "SET metadata = json_set(metadata, '$.deprecated_at', "
+                        "    COALESCE(json_extract(metadata, '$.created_at'), "
+                        "             datetime('now'))) "
+                        "WHERE json_extract(metadata, '$.deprecated') = 1 "
+                        "  AND json_extract(metadata, '$.deprecated_at') IS NULL "
+                        "  AND json_extract(metadata, '$.is_memory_record') = 1"
+                    )
+                )
+                patched = result.rowcount
+                if patched:
+                    logger.info(
+                        f"[简单长期记忆] 迁移补丁：已为 {patched} 条废弃记忆回填 deprecated_at"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"[简单长期记忆] deprecated_at 迁移补丁失败（不影响功能）: {e}"
+            )
 
     @property
     def vec_db(self):
@@ -317,7 +375,9 @@ class MemoryManager:
             return 0
         kb_id = self._kb_helper.kb.kb_id
         cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
-        set_clause = "json_set(metadata, '$.deprecated', 1)"
+        set_clause = (
+            "json_set(metadata, '$.deprecated', 1, '$.deprecated_at', :now_iso)"
+        )
         where_clause = (
             "json_extract(metadata,'$.is_memory_record') = 1 "
             "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
@@ -326,7 +386,11 @@ class MemoryManager:
             "AND json_extract(metadata,'$.memory_type') != 'permanent' "
             "AND json_extract(metadata,'$.memory_scope') != 'global'"
         )
-        params: dict[str, Any] = {"kb_id": kb_id, "cutoff": cutoff_iso}
+        params: dict[str, Any] = {
+            "kb_id": kb_id,
+            "cutoff": cutoff_iso,
+            "now_iso": datetime.now(timezone.utc).isoformat(),
+        }
         return await self._exec_metadata_update(set_clause, where_clause, params)
 
     async def fetch_consolidation_candidates(
@@ -393,13 +457,18 @@ class MemoryManager:
         uris = [u for u in uris if u]
         if not uris:
             return 0
-        set_clause = "json_set(metadata, '$.deprecated', 1, '$.compressed', 1)"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        set_clause = (
+            "json_set(metadata, '$.deprecated', 1, '$.compressed', 1, "
+            "'$.deprecated_at', :now_iso)"
+        )
         placeholders = ",".join(f":u{i}" for i in range(len(uris)))
         where_clause = (
             f"json_extract(metadata,'$.uri') IN ({placeholders}) "
             "AND json_extract(metadata,'$.is_memory_record') = 1"
         )
         params: dict[str, Any] = {f"u{i}": u for i, u in enumerate(uris)}
+        params["now_iso"] = now_iso
         return await self._exec_metadata_update(set_clause, where_clause, params)
 
     def _rerank_by_signal(
@@ -1366,7 +1435,7 @@ class MemoryManager:
         doc_ids: list[str] = []
         deleted = 0
         try:
-            doc_ids, deleted = await self._collect_kb_doc_ids_for_filters(filters)
+            doc_ids, uris, deleted = await self._collect_kb_doc_ids_for_filters(filters)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
             try:
@@ -1383,14 +1452,17 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档删除失败: {e}")
 
+        # 级联清理关联边
+        if self._link_manager and uris:
+            await self._link_manager.delete_links_for_uris(uris)
         logger.info(f"[简单长期记忆] 删除记忆: {uri}, 实际删除 {deleted} 条")
         return deleted
 
     async def _collect_kb_doc_ids_for_filters(
         self,
         filters: dict[str, Any],
-    ) -> tuple[list[str], int]:
-        """分页收集匹配向量文档的 KB 文档 ID，避免固定上限截断。"""
+    ) -> tuple[list[str], list[str], int]:
+        """分页收集匹配向量文档的 KB 文档 ID 和 URI，避免固定上限截断。"""
         try:
             page_size = int(self.config.get("memory_delete_scan_page_size", 1000))
         except (TypeError, ValueError):
@@ -1398,6 +1470,7 @@ class MemoryManager:
         page_size = max(1, page_size)
 
         doc_ids: list[str] = []
+        uris: list[str] = []
         count = 0
         offset = 0
         while True:
@@ -1414,10 +1487,12 @@ class MemoryManager:
                 md = _safe_parse_metadata(doc.get("metadata", {}))
                 if md.get("kb_doc_id"):
                     doc_ids.append(md["kb_doc_id"])
+                if md.get("uri"):
+                    uris.append(md["uri"])
             if len(docs) < page_size:
                 break
 
-        return list(dict.fromkeys(doc_ids)), count
+        return list(dict.fromkeys(doc_ids)), list(dict.fromkeys(uris)), count
 
     async def clear_memories(
         self,
@@ -1466,7 +1541,7 @@ class MemoryManager:
         doc_ids: list[str] = []
         count = 0
         try:
-            doc_ids, count = await self._collect_kb_doc_ids_for_filters(filters)
+            doc_ids, uris, count = await self._collect_kb_doc_ids_for_filters(filters)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待清空文档失败: {e}")
             try:
@@ -1482,6 +1557,9 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档批量删除失败: {e}")
 
+        # 级联清理关联边
+        if self._link_manager and uris:
+            await self._link_manager.delete_links_for_uris(uris)
         logger.info(f"[简单长期记忆] 清空 {count} 条记忆, 范围: {scope_label}")
         return count
 
