@@ -527,6 +527,8 @@ class MemoryPlugin(Star):
             context=self.context,
             memory_mgr=self.memory_mgr,
             config=self.config,
+            kv_put=self.put_kv_data,
+            kv_get=self.get_kv_data,
         )
         await self._scheduler.start()
 
@@ -1538,6 +1540,81 @@ class MemoryPlugin(Star):
             yield event.plain_result(str(e))
         except Exception as e:
             yield event.plain_result(f"重建失败: {e}")
+
+    @memory_group.command("review")
+    async def cmd_review(self, event: AstrMessageEvent):
+        """争议审查 /memory review [approve|reject|clear] [id]"""
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可用")
+            return
+        args = _parse_command_args(event, "memory review").strip().split()
+        action = args[0] if args else "list"
+
+        if action == "list":
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            pending = [q for q in queue if q.get("status") == "pending"]
+            if not pending:
+                yield event.plain_result("✅ 无待审争议项")
+                return
+            lines = [f"📝 待审争议 ({len(pending)} 条)："]
+            for item in pending:
+                lines.append(
+                    f"#{item['id']} [{item.get('op_type', '?')}] "
+                    f"{item.get('verdict_reason', '')} "
+                    f"({item.get('created_at', '')})"
+                )
+            lines.append("\n/memory review approve <id> 批准")
+            lines.append("/memory review reject <id> 废案")
+            lines.append("/memory review clear 清空")
+            yield event.plain_result("\n".join(lines))
+
+        elif action == "clear":
+            await self.put_kv_data("maintenance_pending_review", [])
+            yield event.plain_result("✅ 待审队列已清空")
+
+        elif action in ("approve", "reject"):
+            if len(args) < 2:
+                yield event.plain_result(f"用法: /memory review {action} <id>")
+                return
+            try:
+                target_id = int(args[1])
+            except ValueError:
+                yield event.plain_result("id 必须是数字")
+                return
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            found = None
+            for item in queue:
+                if item.get("id") == target_id and item.get("status") == "pending":
+                    found = item
+                    break
+            if not found:
+                yield event.plain_result(f"未找到待审项 #{target_id}")
+                return
+            found["status"] = "approved" if action == "approve" else "rejected"
+            await self.put_kv_data("maintenance_pending_review", queue)
+            if action == "approve" and self.memory_mgr:
+                runner = self._scheduler._runner if self._scheduler else None
+                if runner:
+                    try:
+                        ok = await runner._execute_operation(found.get("op", {}))
+                        msg = (
+                            f"✅ #{target_id} 已批准并执行"
+                            if ok
+                            else f"⚠️ #{target_id} 已批准但执行失败"
+                        )
+                        yield event.plain_result(msg)
+                    except Exception as e:
+                        yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
+                else:
+                    yield event.plain_result(
+                        f"✅ #{target_id} 已标记批准（调度器未运行）"
+                    )
+            else:
+                yield event.plain_result(f"🚫 #{target_id} 已废案")
+        else:
+            yield event.plain_result(
+                "用法: /memory review [list|approve <id>|reject <id>|clear]"
+            )
 
     async def _run_memory_test(self, event: AstrMessageEvent) -> str:
         """执行一次记忆写入-读取测试并返回报告"""

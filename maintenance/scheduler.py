@@ -27,10 +27,14 @@ class MaintenanceScheduler:
         context: Context,
         memory_mgr: MemoryManager,
         config: dict[str, Any],
+        kv_put: Any = None,
+        kv_get: Any = None,
     ) -> None:
         self._context = context
         self._memory_mgr = memory_mgr
         self._config = config
+        self._kv_put = kv_put
+        self._kv_get = kv_get
         self._job_ids: list[str] = []
         self._running_tasks: set[str] = set()  # single-flight 防并发
 
@@ -46,6 +50,8 @@ class MaintenanceScheduler:
             memory_mgr=memory_mgr,
             llm=self._llm,
             config=config,
+            kv_put=kv_put,
+            kv_get=kv_get,
         )
 
     async def start(self) -> None:

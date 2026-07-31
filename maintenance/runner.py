@@ -104,11 +104,15 @@ class MaintenanceRunner:
         memory_mgr: Any,
         llm: MaintenanceLLM,
         config: dict[str, Any],
+        kv_put: Any = None,
+        kv_get: Any = None,
     ) -> None:
         self._context = context
         self._memory_mgr = memory_mgr
         self._llm = llm
         self._config = config
+        self._kv_put = kv_put
+        self._kv_get = kv_get
         self._running = False
 
     async def run_cycle(self) -> MaintenanceReport:
@@ -254,7 +258,10 @@ class MaintenanceRunner:
                     # 审核拒绝 → 跳过
                     skipped += 1
                     if verdict.get("needs_human_review"):
-                        # 争议项 → 写入待审队列（Phase 5 完善：接 KV 和通知）
+                        # 争议项 → 写入 KV 待审队列
+                        await self._enqueue_pending_review(
+                            op, verdict, report.session_id
+                        )
                         logger.info(
                             f"[简单长期记忆] 争议项待人工审核: {op.get('type')}, "
                             f"理由: {verdict.get('reason', '')}"
@@ -438,6 +445,32 @@ class MaintenanceRunner:
         else:
             # auto: 从主人格提取（Phase 5 完善）
             return ""
+
+    async def _enqueue_pending_review(
+        self, op: dict[str, Any], verdict: dict[str, Any], session_id: str
+    ) -> None:
+        """将争议操作写入 KV 待审队列。"""
+        if not self._kv_put or not self._kv_get:
+            return
+        try:
+            queue = await self._kv_get("maintenance_pending_review", None) or []
+            import time as _time
+
+            queue.append(
+                {
+                    "id": len(queue) + 1,
+                    "session_id": session_id,
+                    "op_type": op.get("type", ""),
+                    "op": op,
+                    "verdict_reason": verdict.get("reason", ""),
+                    "controversial": verdict.get("controversial", False),
+                    "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "pending",  # pending / approved / rejected
+                }
+            )
+            await self._kv_put("maintenance_pending_review", queue)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 写入待审队列失败: {e}")
 
     async def _execute_operation(self, op: dict[str, Any]) -> bool:
         """执行单个操作。"""
