@@ -16,9 +16,9 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .agents.organizer import OrganizerAgent
 from .llm import MaintenanceLLM
-from .prompts import build_prompt, DEFAULT_ORGANIZER_PROMPT, DEFAULT_ANALYST_PROMPT, DEFAULT_REVIEWER_PROMPT
-
+from .prompts import build_prompt, DEFAULT_ANALYST_PROMPT, DEFAULT_REVIEWER_PROMPT
 
 @dataclass
 class AgentManifest:
@@ -189,46 +189,45 @@ class MaintenanceRunner:
         """运行整理师：去重合并、质量精炼。"""
         manifest = AgentManifest(agent_type="organizer")
 
-        # 拉取记忆列表（简化版，Phase 3 完善）
-        memories_text = await self._get_memories_text()
-        memory_count = await self._get_memory_count()
-
-        # 组装 prompt
-        variables = {
-            "persona_summary": await self._get_persona_summary(),
-            "memories": memories_text,
-            "memory_count": memory_count,
-            "memory_stats": "{}",  # Phase 3 完善
-            "current_time": datetime.now(timezone.utc).isoformat(),
-            "admin_guides": "",  # Phase 5 完善
-        }
-        prompt = build_prompt(
-            default_template=DEFAULT_ORGANIZER_PROMPT,
-            variables=variables,
-            prompt_override=self._config.get("maintenance_organizer_prompt_override", ""),
-            prompt_extra=self._config.get("maintenance_organizer_prompt_extra", ""),
+        # 使用 OrganizerAgent 执行整理
+        organizer = OrganizerAgent(
+            context=self._context,
+            memory_mgr=self._memory_mgr,
+            llm=self._llm,
+            config=self._config,
         )
 
-        # 调用 LLM
-        model_id = self._config.get("maintenance_model_id", "")
-        raw = await self._llm._chat(
-            system_prompt="你是记忆整理师，只输出结构化 JSON。",
-            user_prompt=prompt,
-            model_id=model_id,
-        )
-        manifest.raw_response = raw or ""
-
-        if raw:
-            parsed = self._llm._parse_json(raw)
-            if parsed:
-                manifest.parsed = True
-                manifest.operations = parsed.get("merge", []) + parsed.get("archive", []) + parsed.get("update", [])
-                manifest.notes = parsed.get("notes", "")
-            else:
-                manifest.error = "JSON parse failed"
+        try:
+            result = await organizer.run()
+            manifest.parsed = True
+            # 将 organizer 的输出转换为 operations 格式
+            for merge_op in result.get("merge", []):
+                manifest.operations.append({
+                    "type": "merge",
+                    "uris": merge_op.get("uris", []),
+                    "merged_content": merge_op.get("merged_content", ""),
+                    "reason": merge_op.get("reason", ""),
+                    "confidence": merge_op.get("confidence", 0.0),
+                })
+            for archive_op in result.get("archive", []):
+                manifest.operations.append({
+                    "type": "archive",
+                    "uri": archive_op.get("uri", ""),
+                    "reason": archive_op.get("reason", ""),
+                })
+            for update_op in result.get("update", []):
+                manifest.operations.append({
+                    "type": "update",
+                    "uri": update_op.get("uri", ""),
+                    "new_content": update_op.get("new_content", ""),
+                    "reason": update_op.get("reason", ""),
+                })
+            manifest.notes = result.get("notes", "")
+        except Exception as e:
+            manifest.error = str(e)
+            logger.warning(f"[简单长期记忆] 整理师执行失败: {e}")
 
         return manifest
-
     async def _run_analyst(self) -> AgentManifest:
         """运行分析师：关联发现、矛盾检测。"""
         manifest = AgentManifest(agent_type="analyst")

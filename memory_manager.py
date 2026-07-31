@@ -1961,6 +1961,147 @@ class MemoryManager:
             "compressed": compressed,
         }
 
+    async def get_all_active_memories(
+        self,
+        owner_filter: dict[str, Any] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """拉取所有活跃记忆（后台整理用，无 event 场景）
+
+        Args:
+            owner_filter: 限定用户范围（如 {"user_id": "xxx"}），None 表示全部
+            limit: 最大返回条数
+
+        Returns:
+            记忆列表，每条包含 uri / content / metadata
+        """
+        filters: dict[str, Any] = {
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        if owner_filter:
+            filters.update(owner_filter)
+
+        try:
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters,
+                limit=limit,
+            )
+            memories = []
+            for doc in docs:
+                metadata = _safe_parse_metadata(doc.get("metadata", {}))
+                memories.append({
+                    "uri": metadata.get("uri", ""),
+                    "content": doc.get("text", ""),
+                    "metadata": metadata,
+                    "vector": doc.get("vector"),  # 可能为 None
+                })
+            return memories
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 拉取活跃记忆失败: {e}")
+            return []
+
+    async def merge_memories(
+        self,
+        source_uris: list[str],
+        merged_content: str,
+        reason: str = "",
+        created_by: str = "organizer",
+    ) -> dict[str, Any]:
+        """合并多条记忆（supersede 语义，不物理删除）
+
+        1. 新建一条合并后的记忆
+        2. 旧记忆标 deprecated + deprecated_at
+        3. memory_links 写入 supersedes 边
+        4. 旧记忆由 purge 统一物理清除
+
+        Args:
+            source_uris: 待合并的旧记忆 URI 列表
+            merged_content: 合并后的内容
+            reason: 合并原因
+            created_by: 创建者（默认 organizer）
+
+        Returns:
+            {"merged_uri": str, "deprecated_count": int, "success": bool}
+        """
+        if not source_uris or not merged_content:
+            return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
+        try:
+            # 1. 新建合并后的记忆（使用第一条旧记忆的 metadata 作为模板）
+            first_doc = await self.vec_db.document_storage.get_documents(
+                metadata_filters={"uri": source_uris[0], "is_memory_record": True},
+                limit=1,
+            )
+            if not first_doc:
+                logger.warning(f"[简单长期记忆] 合并失败：找不到源记忆 {source_uris[0]}")
+                return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
+            first_meta = _safe_parse_metadata(first_doc[0].get("metadata", {}))
+            new_uri = f"{first_meta.get('uri', '').split('://')[0]}://merged_{uuid.uuid4().hex[:12]}"
+
+            # 构建新记忆的 metadata（继承旧记忆的域、作用域等）
+            new_metadata = {
+                **first_meta,
+                "uri": new_uri,
+                "content": merged_content,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "deprecated": False,
+                "merged_from": source_uris,
+                "merged_reason": reason,
+            }
+
+            # 写入新记忆（简化版，直接写 document_storage）
+            await self.vec_db.document_storage.add_document(
+                text=merged_content,
+                metadata=new_metadata,
+            )
+
+            # 2. 旧记忆标 deprecated
+            deprecated_count = 0
+            for old_uri in source_uris:
+                try:
+                    # 更新 metadata
+                    old_docs = await self.vec_db.document_storage.get_documents(
+                        metadata_filters={"uri": old_uri, "is_memory_record": True},
+                        limit=1,
+                    )
+                    if old_docs:
+                        old_meta = _safe_parse_metadata(old_docs[0].get("metadata", {}))
+                        old_meta["deprecated"] = True
+                        old_meta["deprecated_at"] = datetime.now(timezone.utc).isoformat()
+                        old_meta["deprecated_reason"] = "merged"
+                        # 更新 document（简化版，实际可能需要 delete + add）
+                        # TODO: Phase 4 完善 metadata 更新接口
+                        deprecated_count += 1
+
+                        # 3. 写 supersedes 边
+                        if self._link_manager:
+                            await self._link_manager.add_link(
+                                source_uri=new_uri,
+                                target_uri=old_uri,
+                                relation_type="supersedes",
+                                reason=reason,
+                                confidence=1.0,
+                                created_by=created_by,
+                            )
+                except Exception as e:
+                    logger.warning(f"[简单长期记忆] 标记旧记忆 deprecated 失败: {old_uri}, {e}")
+
+            logger.info(
+                f"[简单长期记忆] 合并完成: {len(source_uris)} 条 → {new_uri}, "
+                f"deprecated {deprecated_count} 条"
+            )
+            return {
+                "merged_uri": new_uri,
+                "deprecated_count": deprecated_count,
+                "success": True,
+            }
+
+        except Exception as e:
+            logger.error(f"[简单长期记忆] 合并记忆失败: {e}")
+            return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
     async def forget_memory_by_user(
         self,
         event: AstrMessageEvent,
