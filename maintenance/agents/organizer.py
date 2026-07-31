@@ -156,14 +156,43 @@ class OrganizerAgent:
             vecs = vecs / norms
             sims = vecs @ vecs.T
 
-            # 收集 ≥ 阈值的对（无向，去重）
+            # 收集 ≥ 阈值的对（无向，去重，按 owner 分组）
             n = len(valid_memories)
             for i in range(n):
                 for j in range(i + 1, n):
+                    # 按 scope 实际边界分组，避免误过滤
+                    mem_a = valid_memories[i]
+                    mem_b = valid_memories[j]
+                    scope_a = mem_a.get("metadata", {}).get("memory_scope", "")
+                    scope_b = mem_b.get("metadata", {}).get("memory_scope", "")
+                    
+                    # scope 必须相同
+                    if scope_a != scope_b:
+                        continue
+                    
+                    # 根据 scope 类型确定分组键
+                    if scope_a == "personal":
+                        # personal：按 owner_user_id 分组
+                        owner_a = mem_a.get("metadata", {}).get("owner_user_id", "")
+                        owner_b = mem_b.get("metadata", {}).get("owner_user_id", "")
+                        if owner_a != owner_b:
+                            continue
+                    elif scope_a == "group":
+                        # group：按 session 分组（session_id 含群聊标识）
+                        session_a = mem_a.get("metadata", {}).get("owner_session_id", "")
+                        session_b = mem_b.get("metadata", {}).get("owner_session_id", "")
+                        if session_a != session_b:
+                            continue
+                    elif scope_a == "conversation":
+                        # conversation：按完整 UMO 精确分组，避免私聊/群聊 ID 碰撞
+                        umo_a = mem_a.get("metadata", {}).get("umo", "")
+                        umo_b = mem_b.get("metadata", {}).get("umo", "")
+                        if umo_a != umo_b:
+                            continue
+                    # global：无 per-user 限制，直接通过
                     cosine = float(sims[i, j])
                     if cosine >= self._merge_cosine_threshold:
-                        candidates.append((valid_memories[i], valid_memories[j], cosine))
-
+                        candidates.append((mem_a, mem_b, cosine))
             # 按余弦降序
             candidates.sort(key=lambda x: x[2], reverse=True)
 

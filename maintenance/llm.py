@@ -171,19 +171,19 @@ class MaintenanceLLM:
             logger.debug("[简单长期记忆] 未配置整理模型，跳过 LLM 调用")
             return None
 
+        # 在调用前计数，确保失败也计入限额
+        self._calls += 1
         try:
             # AstrBot context.llm_generate 接口
             response = await self._context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=f"{system_prompt}\n\n{user_prompt}",
             )
-            self._calls += 1
             return getattr(response, "completion_text", "") or ""
         except Exception as e:
             self._errors += 1
             logger.warning(f"[简单长期记忆] LLM 调用失败: {e}")
             return None
-
     # ─── 任务接口 ───────────────────────────────────────────
 
     async def judge_relation(

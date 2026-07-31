@@ -1063,20 +1063,42 @@ class MemoryManager:
             logger.warning(f"[简单长期记忆] replace KB 文档注册失败: {e}")
 
         # 删除旧记录（向量 + KB 文档）
+        # 删除旧向量失败时中止，避免数据不一致
         old_doc_id = old_metadata.get("kb_doc_id", "")
         if old_doc_id:
+            vector_deleted = False
             try:
                 await self.vec_db.delete_documents(
                     metadata_filters={"kb_doc_id": old_doc_id}
                 )
+                vector_deleted = True
             except Exception as e:
-                logger.warning(f"[简单长期记忆] replace 删除旧向量失败: {e}")
-            try:
-                await self._unregister_kb_documents([old_doc_id])
-                await self._sync_kb_stats()
-            except Exception as e:
-                logger.warning(f"[简单长期记忆] replace 删除旧 KB 文档失败: {e}")
-
+                logger.error(f"[简单长期记忆] replace 删除旧向量失败，中止操作: {e}")
+                # 尝试回滚：删除刚写入的新记录（向量 + KB 文档）
+                try:
+                    await self.vec_db.delete_documents(
+                        metadata_filters={"kb_doc_id": new_doc_id}
+                    )
+                    logger.info(f"[简单长期记忆] replace 回滚成功，已删除新向量记录: {new_doc_id}")
+                except Exception as rollback_err:
+                    logger.error(f"[简单长期记忆] replace 回滚向量失败: {rollback_err}")
+                
+                # 同时注销 KB 文档，避免 dangling entry
+                try:
+                    await self._unregister_kb_documents([new_doc_id])
+                    await self._sync_kb_stats()
+                    logger.info(f"[简单长期记忆] replace 回滚成功，已注销 KB 文档: {new_doc_id}")
+                except Exception as kb_err:
+                    logger.error(f"[简单长期记忆] replace 回滚 KB 文档失败: {kb_err}")
+                
+                raise RuntimeError(f"replace 失败：无法删除旧向量 {old_doc_id}: {e}")
+            # 只有向量删除成功后才继续清理 KB 文档
+            if vector_deleted:
+                try:
+                    await self._unregister_kb_documents([old_doc_id])
+                    await self._sync_kb_stats()
+                except Exception as e:
+                    logger.warning(f"[简单长期记忆] replace 删除旧 KB 文档失败: {e}")
         # 迁移关联边
         if self._link_manager and old_uri:
             try:
@@ -1172,17 +1194,19 @@ class MemoryManager:
             ]
             await self._bump_recall_stats(recalled_uris)
         
-        # P6: 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
+        # 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
         if self._link_manager:
-            linked_memories = await self._inject_linked_memories(memories)
+            linked_memories = await self._inject_linked_memories(memories, event, all_users=all_users)
             if linked_memories:
                 memories.extend(linked_memories)
-        
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
 
     async def _inject_linked_memories(
-        self, memories: list[dict[str, Any]]
+        self,
+        memories: list[dict[str, Any]],
+        event: AstrMessageEvent | None = None,
+        all_users: bool = False,
     ) -> list[dict[str, Any]]:
         """注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）。
 
@@ -1232,6 +1256,10 @@ class MemoryManager:
                 # 通过 URI 查询记忆
                 mem = await self._get_memory_by_uri(uri)
                 if mem and not mem.get("metadata", {}).get("deprecated", False):
+                    # 验证可见性，确保关联记忆对当前用户可见（all_users 模式下跳过）
+                    if event and not all_users and not self._is_memory_visible(event, mem):
+                        logger.debug(f"[简单长期记忆] 关联记忆不可见，跳过: {uri}")
+                        continue
                     # 标记为关联记忆
                     mem["metadata"]["_is_linked"] = True
                     linked_memories.append(mem)
@@ -1241,14 +1269,81 @@ class MemoryManager:
         return linked_memories
 
     async def _get_memory_by_uri(self, uri: str) -> dict[str, Any] | None:
-        """通过 URI 查询单条记忆。"""
+        """通过 URI 查询单条记忆。
+
+        使用 document_storage.get_documents() 直接查询，
+        避免语义搜索的不确定性。
+        """
         try:
-            filters = {"uri": uri, "is_memory_record": True, "deprecated": False}
-            results = await self._retrieve_with_filter("", 1, filters)
-            return results[0] if results else None
+            if not self.vec_db or not hasattr(self.vec_db, 'document_storage'):
+                logger.warning("[简单长期记忆] document_storage 不可用")
+                return None
+
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                result = await session.execute(
+                    sa_text(
+                        "SELECT doc_id, text, metadata FROM documents "
+                        "WHERE json_extract(metadata, '$.uri') = :uri "
+                        "AND json_extract(metadata, '$.is_memory_record') = 1 "
+                        "AND json_extract(metadata, '$.deprecated') = 0 "
+                        "LIMIT 1"
+                    ),
+                    {"uri": uri},
+                )
+                row = result.first()
+                if row:
+                    import json
+                    meta = json.loads(row.metadata) if isinstance(row.metadata, str) else row.metadata
+                    return {
+                        "doc_id": row.doc_id,
+                        "content": row.text,
+                        "metadata": meta,
+                    }
+                return None
         except Exception as e:
             logger.debug(f"[简单长期记忆] 查询记忆失败: {uri}, {e}")
             return None
+
+    def _is_memory_visible(self, event: AstrMessageEvent, memory: dict[str, Any]) -> bool:
+        """检查记忆对当前事件是否可见。
+
+        确保关联记忆注入时验证可见性，避免跨 scope 泄露。
+        """
+        meta = memory.get("metadata", {})
+        scope = meta.get("memory_scope", MemoryScope.PERSONAL)
+        owner = meta.get("owner_user_id", "")
+
+        # global 记忆所有人可见
+        if scope == MemoryScope.GLOBAL:
+            return True
+
+        # 获取当前用户信息（build_user_id 统一命名空间）
+        current_user = self._current_owner_user_id(event)
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        # personal 记忆：仅 owner 可见（包括多 owner 共享场景）
+        if scope == MemoryScope.PERSONAL:
+            # 单 owner：直接比较
+            if owner == current_user:
+                return True
+            # 多 owner 共享：检查 owner_user_ids
+            return self._is_visible_shared_personal(event, meta)
+
+        # group 记忆：同群可见（session_id 含群聊标识）
+        if scope == MemoryScope.GROUP:
+            mem_session = meta.get("owner_session_id", "")
+            current_session = build_session_id(parsed.platform_id, parsed.session_id)
+            return mem_session == current_session
+
+        # conversation 记忆：精确匹配完整 UMO，避免私聊/群聊 ID 碰撞
+        if scope == MemoryScope.CONVERSATION:
+            mem_umo = meta.get("umo", "")
+            return bool(mem_umo) and mem_umo == event.unified_msg_origin
+
+        # 默认不可见
+        return False
 
     def _build_recall_filters(
         self,
