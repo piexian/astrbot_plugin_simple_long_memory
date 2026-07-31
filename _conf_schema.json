@@ -2,7 +2,9 @@
   "kb_name": {
     "description": "记忆知识库",
     "type": "list",
-    "items": {"type": "string"},
+    "items": {
+      "type": "string"
+    },
     "default": [],
     "_special": "select_knowledgebase",
     "hint": "选择用于存储长期记忆的知识库（必填，请先在知识库管理中创建，知识库需配置嵌入模型）"
@@ -32,7 +34,11 @@
     "type": "int",
     "default": 20,
     "hint": "每N轮对话后触发一次记忆提取，对这N轮对话内容进行总结",
-    "slider": {"min": 5, "max": 200, "step": 1}
+    "slider": {
+      "min": 5,
+      "max": 200,
+      "step": 1
+    }
   },
   "extraction_min_content_length": {
     "description": "最小提取内容长度",
@@ -57,14 +63,22 @@
     "type": "int",
     "default": 200,
     "hint": "限制 /memory list 为计算当前用户可见记忆而扫描的最大记录数。实际扫描量会按当前页码和每页数量推导，并不会超过此上限",
-    "slider": {"min": 20, "max": 2000, "step": 20}
+    "slider": {
+      "min": 20,
+      "max": 2000,
+      "step": 20
+    }
   },
   "memory_delete_scan_page_size": {
     "description": "记忆删除扫描分页大小",
     "type": "int",
     "default": 1000,
     "hint": "删除或清空记忆前，每页扫描多少条匹配记录用于同步清理知识库文档记录。数值越大速度越快但单次内存占用更高",
-    "slider": {"min": 100, "max": 5000, "step": 100}
+    "slider": {
+      "min": 100,
+      "max": 5000,
+      "step": 100
+    }
   },
   "memory_ttl_days": {
     "description": "记忆生命周期(天)",
@@ -89,7 +103,11 @@
     "type": "int",
     "default": 10,
     "hint": "限制检索优化模型调用的最长等待时间。超时后将跳过优化并使用原始检索内容，避免阻塞对话响应",
-    "slider": {"min": 1, "max": 20, "step": 1}
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
   },
   "enable_admin_global_memory_tool": {
     "description": "启用管理员全局记忆工具",
@@ -170,6 +188,18 @@
     "default": "02:00-06:00",
     "hint": "单时间点如 03:00，或范围如 02:00-06:00（范围内空闲时执行）"
   },
+  "maintenance_cron": {
+    "description": "整理周期定时表达式",
+    "type": "string",
+    "default": "0 3 * * *",
+    "hint": "标准 cron 表达式，默认每天 03:00 执行完整整理管线（purge + 整理师 + 分析师 + 审核员）"
+  },
+  "maintenance_max_llm_calls": {
+    "description": "每周期 LLM 调用上限",
+    "type": "int",
+    "default": 50,
+    "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
+  },
   "auto_purge_enabled": {
     "description": "自动清理废弃记忆",
     "type": "bool",
@@ -191,7 +221,9 @@
   "maintenance_tasks": {
     "description": "整理团队编排",
     "type": "list",
-    "items": {"type": "object"},
+    "items": {
+      "type": "object"
+    },
     "default": [],
     "hint": "添加后台整理角色（organizer/analyst/reviewer），配置执行时间和行为"
   },
@@ -217,7 +249,11 @@
     "description": "人格加载模式",
     "type": "string",
     "default": "auto",
-    "options": ["auto", "manual", "off"],
+    "options": [
+      "auto",
+      "manual",
+      "off"
+    ],
     "hint": "auto=自动从主人格提取摘要, manual=使用下方自定义, off=不加载"
   },
   "persona_summary": {
