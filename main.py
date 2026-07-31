@@ -1590,27 +1590,30 @@ class MemoryPlugin(Star):
             if not found:
                 yield event.plain_result(f"未找到待审项 #{target_id}")
                 return
-            found["status"] = "approved" if action == "approve" else "rejected"
-            await self.put_kv_data("maintenance_pending_review", queue)
-            if action == "approve" and self.memory_mgr:
-                runner = self._scheduler._runner if self._scheduler else None
-                if runner:
-                    try:
-                        ok = await runner._execute_operation(found.get("op", {}))
-                        msg = (
-                            f"✅ #{target_id} 已批准并执行"
-                            if ok
-                            else f"⚠️ #{target_id} 已批准但执行失败"
-                        )
-                        yield event.plain_result(msg)
-                    except Exception as e:
-                        yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
-                else:
-                    yield event.plain_result(
-                        f"✅ #{target_id} 已标记批准（调度器未运行）"
-                    )
-            else:
+            if action == "reject":
+                found["status"] = "rejected"
+                await self.put_kv_data("maintenance_pending_review", queue)
                 yield event.plain_result(f"🚫 #{target_id} 已废案")
+            elif action == "approve":
+                # 先执行，成功后才标记 approved（失败保留可重试）
+                runner = self._scheduler._runner if self._scheduler else None
+                if not runner:
+                    yield event.plain_result(f"⚠️ #{target_id} 调度器未运行，无法执行")
+                    return
+                try:
+                    ok = await runner._execute_operation(found.get("op", {}))
+                    if ok:
+                        found["status"] = "approved"
+                        await self.put_kv_data("maintenance_pending_review", queue)
+                        yield event.plain_result(f"✅ #{target_id} 已批准并执行")
+                    else:
+                        found["status"] = "failed"
+                        await self.put_kv_data("maintenance_pending_review", queue)
+                        yield event.plain_result(
+                            f"⚠️ #{target_id} 执行失败，已标记 failed"
+                        )
+                except Exception as e:
+                    yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
         else:
             yield event.plain_result(
                 "用法: /memory review [list|approve <id>|reject <id>|clear]"

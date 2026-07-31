@@ -241,6 +241,16 @@ class MaintenanceRunner:
                     continue
 
                 if verdict.get("verdict") == "approve":
+                    # global 记忆操作必须经管理员人工确认（不可配置）
+                    if self._op_touches_global(op):
+                        await self._enqueue_pending_review(
+                            op, verdict, report.session_id
+                        )
+                        skipped += 1
+                        logger.info(
+                            f"[简单长期记忆] 操作 {i} 涉及 global 记忆，转人工审批"
+                        )
+                        continue
                     try:
                         success = await self._execute_operation(op)
                         if success:
@@ -411,8 +421,31 @@ class MaintenanceRunner:
             config=self._config,
         )
 
+        # 拉取操作涉及的源记录，供审核员对比
+        original_data: dict[str, Any] = {"memories": {}}
+        referenced_uris: set[str] = set()
+        for op in proposed_changes:
+            for key in ("uris", "uri", "source", "target", "old_uri", "new_uri"):
+                val = op.get(key)
+                if isinstance(val, list):
+                    referenced_uris.update(val)
+                elif isinstance(val, str) and val:
+                    referenced_uris.add(val)
+        for uri in list(referenced_uris)[:20]:
+            try:
+                mem = await self._memory_mgr._get_memory_by_uri(uri)
+                if mem:
+                    original_data["memories"][uri] = {
+                        "content": mem.get("content", ""),
+                        "metadata": mem.get("metadata", {}),
+                    }
+            except Exception:
+                pass
+
         try:
-            verdicts = await reviewer.review(proposed_changes)
+            verdicts = await reviewer.review(
+                proposed_changes, original_data=original_data
+            )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 审核员执行失败: {e}")
 
@@ -445,6 +478,31 @@ class MaintenanceRunner:
         else:
             # auto: 从主人格提取（Phase 5 完善）
             return ""
+
+    def _op_touches_global(self, op: dict[str, Any]) -> bool:
+        """检查操作是否涉及 global 作用域记忆。"""
+        uris = []
+        if op.get("uris"):
+            uris.extend(op["uris"])
+        if op.get("uri"):
+            uris.append(op["uri"])
+        if op.get("source"):
+            uris.append(op["source"])
+        if op.get("target"):
+            uris.append(op["target"])
+        if op.get("old_uri"):
+            uris.append(op["old_uri"])
+        if op.get("new_uri"):
+            uris.append(op["new_uri"])
+        # 检查 merged_content 中的 metadata（organizer 可能携带 scope）
+        scope = op.get("scope", "")
+        if scope == "global":
+            return True
+        # 通过 URI 前缀粗判（facts://global_* 等）
+        for uri in uris:
+            if "global" in uri.lower():
+                return True
+        return False
 
     async def _enqueue_pending_review(
         self, op: dict[str, Any], verdict: dict[str, Any], session_id: str

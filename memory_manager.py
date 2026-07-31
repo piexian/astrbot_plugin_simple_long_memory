@@ -2232,15 +2232,8 @@ class MemoryManager:
             old_meta["deprecated_at"] = datetime.now(timezone.utc).isoformat()
             old_meta["deprecated_reason"] = reason or "deprecated"
 
-            # 删除旧记录（向量 + 文档）
-            old_doc_id = doc.get("doc_id", "")
-            if old_doc_id:
-                await self.vec_db.delete_documents(
-                    metadata_filters={"kb_doc_id": old_doc_id}
-                )
-
-            # 重新插入（自动生成新 embedding，保持 doc/vector 一致）
-            new_doc_id = old_meta.get("kb_doc_id", str(uuid.uuid4()))
+            # 先插入新记录（原子性：插入失败时原记录不受影响）
+            new_doc_id = str(uuid.uuid4())
             old_meta["kb_doc_id"] = new_doc_id
             text = doc.get("text", old_meta.get("memory_content", ""))
             await self.vec_db.insert(
@@ -2248,6 +2241,20 @@ class MemoryManager:
                 metadata=old_meta,
                 id=new_doc_id,
             )
+
+            # 插入成功后再删除旧记录
+            old_doc_id = doc.get("doc_id", "")
+            if old_doc_id:
+                try:
+                    await self.vec_db.delete_documents(
+                        metadata_filters={"kb_doc_id": old_doc_id}
+                    )
+                except Exception as del_err:
+                    # 删除失败不影响正确性（旧记录仍在，purge 会清理）
+                    logger.warning(
+                        f"[简单长期记忆] deprecate 删除旧记录失败: {del_err}"
+                    )
+
             logger.debug(f"[简单长期记忆] 已标记 deprecated: {uri}")
             return True
         except Exception as e:
@@ -2318,8 +2325,9 @@ class MemoryManager:
                 id=new_doc_id,
             )
 
-            # 2. 旧记忆标 deprecated（delete + re-insert 保持 doc/vector 一致）
+            # 2. 旧记忆标 deprecated（全部成功才报成功，否则回滚新记录）
             deprecated_count = 0
+            failed_uris: list[str] = []
             for old_uri in source_uris:
                 try:
                     ok = await self.deprecate_memory(old_uri, reason="merged")
@@ -2335,10 +2343,31 @@ class MemoryManager:
                                 confidence=1.0,
                                 created_by=created_by,
                             )
+                    else:
+                        failed_uris.append(old_uri)
                 except Exception as e:
                     logger.warning(
                         f"[简单长期记忆] 标记旧记忆 deprecated 失败: {old_uri}, {e}"
                     )
+                    failed_uris.append(old_uri)
+
+            if failed_uris:
+                # 回滚：删除刚插入的合并记录
+                logger.warning(
+                    f"[简单长期记忆] 合并回滚: {len(failed_uris)} 条源未能 deprecated"
+                )
+                try:
+                    await self.vec_db.delete_documents(
+                        metadata_filters={"kb_doc_id": new_doc_id}
+                    )
+                except Exception:
+                    pass
+                return {
+                    "merged_uri": "",
+                    "deprecated_count": deprecated_count,
+                    "success": False,
+                }
+
             logger.info(
                 f"[简单长期记忆] 合并完成: {len(source_uris)} 条 → {new_uri}, "
                 f"deprecated {deprecated_count} 条"

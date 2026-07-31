@@ -146,23 +146,63 @@ class AnalystAgent:
         # Phase 5 实现对话历史拉取时使用这些配置
         # max_rounds = self._config.get("context_max_rounds", 50)
         # max_chars = self._config.get("context_max_chars", 30000)
-        # max_age_days = self._config.get("context_max_age_days", 7)
 
         try:
-            # 检查 context 是否有 conversation_manager
             if not hasattr(self._context, "conversation_manager"):
                 logger.debug(
                     "[简单长期记忆] conversation_manager 不可用，跳过对话历史拉取"
                 )
                 return ""
 
-            # conv_mgr = self._context.conversation_manager
+            import json as _json
 
-            # 按 owner_filter 限定 UMO（简化版：拉取所有对话，Phase 5 完善按 UMO 过滤）
-            # 这里需要 AstrBot 提供按 UMO 查询对话的接口
-            # 目前先返回空，等 AstrBot API 确认后再实现
-            logger.debug("[简单长期记忆] 对话历史拉取接口待确认，暂时返回空")
-            return ""
+            max_rounds = self._config.get("context_max_rounds", 50)
+            max_chars = self._config.get("context_max_chars", 30000)
+
+            conv_mgr = self._context.conversation_manager
+            # 按 UMO 限定范围（owner_filter 中可能有 umo）
+            umo = (owner_filter or {}).get("umo")
+            conversations = await conv_mgr.get_conversations(unified_msg_origin=umo)
+
+            lines: list[str] = []
+            total_chars = 0
+            total_rounds = 0
+            for conv in conversations:
+                history_raw = getattr(conv, "history", None)
+                if not history_raw:
+                    continue
+                try:
+                    history = (
+                        _json.loads(history_raw)
+                        if isinstance(history_raw, str)
+                        else history_raw
+                    )
+                except Exception:
+                    continue
+                if not isinstance(history, list):
+                    continue
+                for entry in reversed(history):  # 最新的在前
+                    if total_rounds >= max_rounds or total_chars >= max_chars:
+                        break
+                    role = entry.get("role", "")
+                    text = entry.get("content", "")
+                    if not text or role not in ("user", "assistant"):
+                        continue
+                    line = f"[{role}]: {text}"
+                    if total_chars + len(line) > max_chars:
+                        break
+                    lines.append(line)
+                    total_chars += len(line)
+                    total_rounds += 1
+                if total_rounds >= max_rounds or total_chars >= max_chars:
+                    break
+
+            lines.reverse()  # 恢复时间顺序
+            result = "\n".join(lines)
+            logger.debug(
+                f"[简单长期记忆] 拉取对话历史: {total_rounds} 轮, {total_chars} 字符"
+            )
+            return result
 
         except Exception as e:
             logger.warning(f"[简单长期记忆] 拉取对话历史失败: {e}")

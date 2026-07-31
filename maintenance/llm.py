@@ -48,10 +48,12 @@ class MaintenanceLLM:
         cache_enabled: bool = True,
         default_model_id: str = "",
         max_calls_per_cycle: int = 50,
+        llm_timeout: int = 120,
     ) -> None:
         self._context = context
         self._default_model_id = default_model_id
         self._max_calls_per_cycle = max_calls_per_cycle
+        self._llm_timeout = llm_timeout
         self._cache_enabled = cache_enabled
         self._calls = 0
         self._cache_hits = 0
@@ -206,12 +208,21 @@ class MaintenanceLLM:
         # 在调用前计数，确保失败也计入限额
         self._calls += 1
         try:
-            # AstrBot context.llm_generate 接口
-            response = await self._context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=f"{system_prompt}\n\n{user_prompt}",
+            import asyncio
+
+            timeout = self._llm_timeout
+            response = await asyncio.wait_for(
+                self._context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=f"{system_prompt}\n\n{user_prompt}",
+                ),
+                timeout=timeout,
             )
             return getattr(response, "completion_text", "") or ""
+        except TimeoutError:
+            self._errors += 1
+            logger.warning("[简单长期记忆] LLM 调用超时")
+            return None
         except Exception as e:
             self._errors += 1
             logger.warning(f"[简单长期记忆] LLM 调用失败: {e}")

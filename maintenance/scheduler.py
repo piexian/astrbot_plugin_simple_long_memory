@@ -44,6 +44,7 @@ class MaintenanceScheduler:
             context=context,
             default_model_id=maintenance_model_id,
             max_calls_per_cycle=config.get("maintenance_max_llm_calls", 50),
+            llm_timeout=config.get("maintenance_llm_timeout", 120),
         )
         self._runner = MaintenanceRunner(
             context=context,
