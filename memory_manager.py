@@ -1234,23 +1234,34 @@ class MemoryManager:
         if not main_uris:
             return []
 
-        # 查询每条主记忆的关联（单跳，只取可注入类型）
+        # 查询每条主记忆的关联（单跳，出边 + 入边，只取可注入类型）
         linked_uris: set[str] = set()
         for uri in main_uris[:5]:  # 限制查询数量，避免过多 DB 查询
             try:
-                links = await self._link_manager.get_links_for_uri(
+                # 出边：uri → target
+                out_links = await self._link_manager.get_links_for_uri(
                     uri=uri,
-                    injectable_only=True,  # 只取 related/supports/context，排除 contradicts/supersedes
+                    injectable_only=True,
                     min_confidence=0.5,
                     limit=3,
                 )
-                for link in links:
+                for link in out_links:
                     target_uri = link.get("target_uri", "")
                     if target_uri and target_uri not in main_uris:
                         linked_uris.add(target_uri)
+                # 入边：source → uri（对称关系反向查询）
+                in_links = await self._link_manager.get_links_to_uri(
+                    uri=uri,
+                    injectable_only=True,
+                    min_confidence=0.5,
+                    limit=3,
+                )
+                for link in in_links:
+                    source_uri = link.get("source_uri", "")
+                    if source_uri and source_uri not in main_uris:
+                        linked_uris.add(source_uri)
             except Exception as e:
                 logger.debug(f"[简单长期记忆] 查询关联失败: {uri}, {e}")
-
         if not linked_uris:
             return []
 
@@ -2242,15 +2253,22 @@ class MemoryManager:
                 id=new_doc_id,
             )
 
-            # 插入成功后再删除旧记录
+            # 插入成功后同步 KBDocument（注册新 ID，注销旧 ID）
             old_doc_id = doc.get("doc_id", "")
+            try:
+                await self._register_kb_document(new_doc_id, uri, len(text))
+            except Exception:
+                pass
             if old_doc_id:
+                try:
+                    await self._unregister_kb_documents([old_doc_id])
+                except Exception:
+                    pass
                 try:
                     await self.vec_db.delete_documents(
                         metadata_filters={"kb_doc_id": old_doc_id}
                     )
                 except Exception as del_err:
-                    # 删除失败不影响正确性（旧记录仍在，purge 会清理）
                     logger.warning(
                         f"[简单长期记忆] deprecate 删除旧记录失败: {del_err}"
                     )
@@ -2288,6 +2306,22 @@ class MemoryManager:
             return {"merged_uri": "", "deprecated_count": 0, "success": False}
 
         try:
+            # 0. 预验证：所有源必须存在且未 deprecated，否则不做任何修改
+            for pre_uri in source_uris:
+                pre_docs = await self.vec_db.document_storage.get_documents(
+                    metadata_filters={
+                        "uri": pre_uri,
+                        "is_memory_record": True,
+                        "deprecated": False,
+                    },
+                    limit=1,
+                )
+                if not pre_docs:
+                    logger.warning(
+                        f"[简单长期记忆] 合并预验证失败: {pre_uri} 不存在或已 deprecated"
+                    )
+                    return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
             # 1. 新建合并后的记忆（使用第一条旧记忆的 metadata 作为模板）
             first_doc = await self.vec_db.document_storage.get_documents(
                 metadata_filters={"uri": source_uris[0], "is_memory_record": True},
@@ -2352,7 +2386,7 @@ class MemoryManager:
                     failed_uris.append(old_uri)
 
             if failed_uris:
-                # 回滚：删除刚插入的合并记录
+                # 回滚：删除合并记录 + 恢复已 deprecate 的源
                 logger.warning(
                     f"[简单长期记忆] 合并回滚: {len(failed_uris)} 条源未能 deprecated"
                 )
@@ -2362,9 +2396,50 @@ class MemoryManager:
                     )
                 except Exception:
                     pass
+                # 恢复已成功 deprecate 的源（去掉 deprecated 标记）
+                for ok_uri in source_uris:
+                    if ok_uri not in failed_uris:
+                        try:
+                            dep_docs = await self.vec_db.document_storage.get_documents(
+                                metadata_filters={
+                                    "uri": ok_uri,
+                                    "is_memory_record": True,
+                                    "deprecated": True,
+                                },
+                                limit=1,
+                            )
+                            if dep_docs:
+                                dep_meta = _safe_parse_metadata(
+                                    dep_docs[0].get("metadata", {})
+                                )
+                                dep_meta["deprecated"] = False
+                                dep_meta.pop("deprecated_at", None)
+                                dep_meta.pop("deprecated_reason", None)
+                                restore_id = str(uuid.uuid4())
+                                dep_meta["kb_doc_id"] = restore_id
+                                await self.vec_db.insert(
+                                    content=dep_docs[0].get("text", ""),
+                                    metadata=dep_meta,
+                                    id=restore_id,
+                                )
+                                old_id = dep_docs[0].get("doc_id", "")
+                                if old_id:
+                                    await self.vec_db.delete_documents(
+                                        metadata_filters={"kb_doc_id": old_id}
+                                    )
+                        except Exception as restore_err:
+                            logger.warning(
+                                f"[简单长期记忆] 恢复源失败: {ok_uri}, {restore_err}"
+                            )
+                # 清理回滚产生的 supersedes 边
+                if self._link_manager:
+                    try:
+                        await self._link_manager.delete_links_for_uris([new_uri])
+                    except Exception:
+                        pass
                 return {
                     "merged_uri": "",
-                    "deprecated_count": deprecated_count,
+                    "deprecated_count": 0,
                     "success": False,
                 }
 

@@ -233,16 +233,21 @@ class MaintenanceRunner:
                             failed += 1
                             report.errors.append(f"op[{i}] new_link: {e}")
                         continue
-                    # destructive 操作缺少裁决 → fail closed
+                    # destructive 操作缺少裁决 → 转待审队列（reviewer 禁用时不静默丢弃）
+                    await self._enqueue_pending_review(
+                        op,
+                        {"verdict": "pending", "reason": "reviewer 未启用或缺失裁决"},
+                        report.session_id,
+                    )
                     skipped += 1
-                    logger.warning(
-                        f"[简单长期记忆] 操作 {i} 缺少审核裁决，跳过: {op.get('type')}"
+                    logger.info(
+                        f"[简单长期记忆] 操作 {i} 缺少审核裁决，转待审: {op.get('type')}"
                     )
                     continue
 
                 if verdict.get("verdict") == "approve":
                     # global 记忆操作必须经管理员人工确认（不可配置）
-                    if self._op_touches_global(op):
+                    if await self._op_touches_global(op):
                         await self._enqueue_pending_review(
                             op, verdict, report.session_id
                         )
@@ -479,29 +484,24 @@ class MaintenanceRunner:
             # auto: 从主人格提取（Phase 5 完善）
             return ""
 
-    def _op_touches_global(self, op: dict[str, Any]) -> bool:
-        """检查操作是否涉及 global 作用域记忆。"""
-        uris = []
+    async def _op_touches_global(self, op: dict[str, Any]) -> bool:
+        """检查操作是否涉及 global 作用域记忆（查询实际 metadata）。"""
+        uris: list[str] = []
         if op.get("uris"):
             uris.extend(op["uris"])
-        if op.get("uri"):
-            uris.append(op["uri"])
-        if op.get("source"):
-            uris.append(op["source"])
-        if op.get("target"):
-            uris.append(op["target"])
-        if op.get("old_uri"):
-            uris.append(op["old_uri"])
-        if op.get("new_uri"):
-            uris.append(op["new_uri"])
-        # 检查 merged_content 中的 metadata（organizer 可能携带 scope）
-        scope = op.get("scope", "")
-        if scope == "global":
-            return True
-        # 通过 URI 前缀粗判（facts://global_* 等）
+        for key in ("uri", "source", "target", "old_uri", "new_uri"):
+            val = op.get(key)
+            if isinstance(val, str) and val:
+                uris.append(val)
         for uri in uris:
-            if "global" in uri.lower():
-                return True
+            try:
+                mem = await self._memory_mgr._get_memory_by_uri(uri)
+                if mem:
+                    scope = mem.get("metadata", {}).get("memory_scope", "")
+                    if scope == "global":
+                        return True
+            except Exception:
+                pass
         return False
 
     async def _enqueue_pending_review(

@@ -741,11 +741,7 @@ class MemoryPlugin(Star):
             for c in candidates
             if c.get("metadata", {}).get("uri")
         ]
-        # 先标记原文 deprecated+compressed：成功后再写摘要，避免 mark 失败导致下轮重复巩固累积
-        marked = await mgr.mark_consolidated(source_uris)
-        if marked <= 0:
-            logger.debug("[简单长期记忆] 巩固：原文标记 0 条，跳过摘要写入")
-            return
+        # 先写摘要再标记源（避免 store 失败后源已 deprecated 但无替代）
         try:
             await mgr.store_memory(
                 event=event,
@@ -756,11 +752,15 @@ class MemoryPlugin(Star):
                 importance=4,
                 memory_scope=MemoryScope.PERSONAL,
             )
-            logger.info(
-                f"[简单长期记忆] 巩固 {len(candidates)} 条 → 1 条摘要，标记原文 {marked} 条"
-            )
         except Exception as e:
-            logger.warning(f"[简单长期记忆] 巩固写入失败: {e}")
+            logger.warning(f"[简单长期记忆] 巩固摘要写入失败，保留原文: {e}")
+            return
+        marked = await mgr.mark_consolidated(source_uris)
+        if marked <= 0:
+            logger.debug("[简单长期记忆] 巩固：原文标记 0 条（摘要已写入）")
+        logger.info(
+            f"[简单长期记忆] 巩固 {len(candidates)} 条 → 1 条摘要，标记原文 {marked} 条"
+        )
 
     def _cleanup_expired_snapshots(self, current_time: float | None = None) -> None:
         """清理过期的请求快照"""

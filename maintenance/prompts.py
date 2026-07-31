@@ -110,9 +110,10 @@ $original_data
 ## 输出格式（严格 JSON，不要输出其他内容）
 {
   "verdicts": [
-    {"index": 0, "verdict": "approve|reject", "reason": "..."}
+    {"index": 0, "verdict": "approve|reject", "reason": "...", "confidence": 0.0}
   ]
 }
+confidence 为你对该判断的确信程度（0~1），低于 0.5 的判断会被标记为争议项交管理员复核。
 """
 
 
