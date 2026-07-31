@@ -200,6 +200,18 @@
     "default": 50,
     "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
   },
+  "maintenance_analyst_max_new_links": {
+    "description": "分析师每次最多新建关联数",
+    "type": "int",
+    "default": 20,
+    "hint": "单个整理周期内分析师最多新建的关联边数量"
+  },
+  "maintenance_analyst_detect_contradiction": {
+    "description": "分析师同时检测矛盾",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后分析师会检测互相矛盾的记忆对"
+  },
   "auto_purge_enabled": {
     "description": "自动清理废弃记忆",
     "type": "bool",
