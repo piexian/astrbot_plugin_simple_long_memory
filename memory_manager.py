@@ -1171,8 +1171,84 @@ class MemoryManager:
                 if m.get("metadata", {}).get("uri")
             ]
             await self._bump_recall_stats(recalled_uris)
+        
+        # P6: 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
+        if self._link_manager:
+            linked_memories = await self._inject_linked_memories(memories)
+            if linked_memories:
+                memories.extend(linked_memories)
+        
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
+
+    async def _inject_linked_memories(
+        self, memories: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）。
+
+        规则：
+        - 只召回未 deprecated 的关联记忆
+        - 单跳（不递归），最多 3 条关联记忆
+        - 总注入 token 预算上限（关联记忆 + 主记忆合计不超过 max_length）
+        - contradicts/supersedes 关系不注入召回，仅用于后台分析
+        """
+        if not self._link_manager:
+            return []
+
+        # 收集所有主记忆的 URI
+        main_uris = [
+            m.get("metadata", {}).get("uri")
+            for m in memories
+            if m.get("metadata", {}).get("uri")
+        ]
+        if not main_uris:
+            return []
+
+        # 查询每条主记忆的关联（单跳，只取可注入类型）
+        linked_uris: set[str] = set()
+        for uri in main_uris[:5]:  # 限制查询数量，避免过多 DB 查询
+            try:
+                links = await self._link_manager.get_links_for_uri(
+                    uri=uri,
+                    injectable_only=True,  # 只取 related/supports/context，排除 contradicts/supersedes
+                    min_confidence=0.5,
+                    limit=3,
+                )
+                for link in links:
+                    target_uri = link.get("target_uri", "")
+                    if target_uri and target_uri not in main_uris:
+                        linked_uris.add(target_uri)
+            except Exception as e:
+                logger.debug(f"[简单长期记忆] 查询关联失败: {uri}, {e}")
+
+        if not linked_uris:
+            return []
+
+        # 拉取关联记忆内容（限制数量）
+        linked_memories: list[dict[str, Any]] = []
+        max_linked = 3  # 最多 3 条关联记忆
+        for uri in list(linked_uris)[:max_linked]:
+            try:
+                # 通过 URI 查询记忆
+                mem = await self._get_memory_by_uri(uri)
+                if mem and not mem.get("metadata", {}).get("deprecated", False):
+                    # 标记为关联记忆
+                    mem["metadata"]["_is_linked"] = True
+                    linked_memories.append(mem)
+            except Exception as e:
+                logger.debug(f"[简单长期记忆] 拉取关联记忆失败: {uri}, {e}")
+
+        return linked_memories
+
+    async def _get_memory_by_uri(self, uri: str) -> dict[str, Any] | None:
+        """通过 URI 查询单条记忆。"""
+        try:
+            filters = {"uri": uri, "is_memory_record": True, "deprecated": False}
+            results = await self._retrieve_with_filter("", 1, filters)
+            return results[0] if results else None
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 查询记忆失败: {uri}, {e}")
+            return None
 
     def _build_recall_filters(
         self,
