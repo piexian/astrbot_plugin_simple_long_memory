@@ -23,6 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
+from .maintenance.scheduler import MaintenanceScheduler
 from .memory_manager import MemoryManager, normalize_domain
 from .memory_protocol import (
     MemoryScope,
@@ -377,6 +378,7 @@ class MemoryPlugin(Star):
         self._last_ttl_expire = 0.0
         self._last_consolidation = 0.0
         self._background_tasks: set[asyncio.Task] = set()
+        self._scheduler: MaintenanceScheduler | None = None
 
     async def initialize(self):
         """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
@@ -398,6 +400,7 @@ class MemoryPlugin(Star):
         try:
             await self.memory_mgr.connect_kb()
             logger.info("[简单长期记忆] 插件初始化成功")
+            await self._start_scheduler()
         except Exception:
             # 首次启动时 KB 尚未就绪，由 on_astrbot_loaded 钩子处理
             logger.info("[简单长期记忆] 配置校验通过，等待知识库就绪")
@@ -424,6 +427,8 @@ class MemoryPlugin(Star):
         if not connected:
             self.memory_mgr = None
             return
+
+        await self._start_scheduler()
 
     async def _recover_interrupted_rebuild(self) -> None:
         """启动时检测并恢复上次中断的重建
@@ -505,9 +510,25 @@ class MemoryPlugin(Star):
 
     async def terminate(self):
         """插件销毁"""
+        if self._scheduler:
+            await self._scheduler.stop()
+            self._scheduler = None
         self._request_snapshots.clear()
         self._session_counters.clear()
         logger.info("[简单长期记忆] 插件已卸载")
+
+    async def _start_scheduler(self) -> None:
+        """KB 连接后启动后台整理调度器。"""
+        if not self.memory_mgr or not self.memory_mgr.is_kb_connected:
+            return
+        if self._scheduler:
+            return  # 已启动
+        self._scheduler = MaintenanceScheduler(
+            context=self.context,
+            memory_mgr=self.memory_mgr,
+            config=self.config,
+        )
+        await self._scheduler.start()
 
     def _get_cmd_prefix(self) -> str:
         """从 AstrBot 配置读取命令前缀，默认 /"""
@@ -1707,39 +1728,32 @@ class MemoryPlugin(Star):
         if not old_memory:
             return f"Error: memory not found or not yours: {uri}"
 
+        old_meta = old_memory.get("metadata", {})
+
+        # global 记忆不允许通过此工具修改，必须走管理员确认路径
+        if old_meta.get("memory_scope") == MemoryScope.GLOBAL:
+            return (
+                "Error: global memories cannot be updated via this tool. "
+                "Use /memory commands with admin confirmation instead."
+            )
+
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
 
-        # 从旧 metadata 保留关键属性
-        old_meta = old_memory.get("metadata", {})
-        old_domain = old_meta.get("domain", "facts")
-        old_importance = old_meta.get("importance", 3)
-        old_scope = old_meta.get("memory_scope", MemoryScope.PERSONAL)
-        old_entities = old_meta.get("entities", [])
-        old_topics = old_meta.get("topics", [])
-
-        # 删除旧记录
-        deleted = await self.memory_mgr.forget_memory(event, uri.strip())
-        if deleted == 0:
-            return f"Error: failed to delete old memory: {uri}"
-
-        # 写入新记录，保留旧属性
-        new_uri = str(MemoryURI.generate(old_domain))
-        await self.memory_mgr.store_memory(
-            event=event,
-            content=content,
-            domain=old_domain,
-            uri=new_uri,
-            memory_type=MemoryType.NORMAL,
-            disclosure=_sanitize_memory_content(disclosure)[:200]
-            if disclosure
-            else old_meta.get("disclosure", ""),
-            importance=old_importance,
-            memory_scope=old_scope,
-            entities=old_entities,
-            topics=old_topics,
+        # 使用 replace_memory 保留完整原始 metadata（租户/作用域/归属/关联）
+        new_disclosure = (
+            _sanitize_memory_content(disclosure)[:200] if disclosure else None
         )
+        try:
+            new_uri = await self.memory_mgr.replace_memory(
+                old_metadata=old_meta,
+                new_content=content,
+                new_disclosure=new_disclosure,
+            )
+        except Exception as e:
+            return f"Error: failed to update memory: {e}"
+
         return f"Memory updated: {uri} -> {new_uri}"
 
     @filter.llm_tool(name="memory_store_global")

@@ -1,6 +1,6 @@
 # 后台记忆整理系统 — 设计规格
 
-> 版本: draft v0.1 | 状态: 设计中
+> 版本: draft v0.2 | 状态: 实施中 | 分支: feat/maintenance-agent
 
 ## 概述
 
@@ -501,10 +501,69 @@ astrbot_plugin_simple_long_memory/
 
 | Phase | 内容 | 依赖 |
 |-------|------|------|
-| 1 | 物理清理（purge）+ 关联表 schema | 无 |
-| 2 | 调度器 + 执行管线框架 | Phase 1 |
-| 3 | 整理师（去重合并 + 质量精炼） | Phase 2 |
-| 4 | 分析师（关联发现 + 矛盾检测）+ 对话历史访问 | Phase 2 |
-| 5 | 审核员 + 互审模式 | Phase 3, 4 |
-| 6 | 召回时关联记忆注入 | Phase 1 |
+| 1 | deprecated_at 迁移 + 关联表 + purge + prompt 模板修复 + cron 调度 | 无 |
+| 2 | 执行管线框架 + manifest 校验 + 操作状态机 | Phase 1 |
+| 3 | 整理师（去重合并 + 质量精炼），替代旧 consolidation | Phase 2 |
+| 4 | 分析师（关联发现 + 矛盾检测）+ conversation_manager API | Phase 2 |
+| 5 | 审核员 + 互审模式 + 人工升级 | Phase 3, 4 |
+| 6 | 召回时关联记忆注入（可见性/预算/去重） | Phase 1 |
 | 7 | 配置 schema + i18n + README | 全部 |
+
+---
+
+## v0.2 审查修正（基于 .ccg review）
+
+### 阻断项修复
+
+**1. deprecated_at 字段**
+- `expire_stale_memories` 和 `mark_consolidated` 写入时补上 `deprecated_at: ISO timestamp`
+- 迁移补丁：已有 `deprecated=1` 但无 `deprecated_at` 的记录，用 `created_at` 回填
+- purge 按 `deprecated_at + N days` 判断，不用 `created_at`
+
+**2. 租户模型（无 event 场景）**
+- 后台任务不依赖 AstrMessageEvent，改为显式传入 owner_user_id / kb_id / scope
+- 整理师/分析师按 owner 逐个处理，不跨用户
+- 关联发现只在同一 owner 的记忆之间建立，不跨用户串联
+- 对话历史拉取按 UMO 限定，不跨会话读取
+
+**3. prompt 模板引擎**
+- 改用 `string.Template`（`$var` 语法），不用 `str.format()`
+- JSON 花括号不再被误解析
+- 用户自定义 prompt 中用 `$memories` 而非 `{memories}`
+
+### High 项修复
+
+**安全 executor**
+- manifest 用 Pydantic/dataclass 强类型校验，拒绝未知字段
+- 操作 allowlist：只允许 merge / archive / update / new_link / supersede
+- destructive 操作（archive/delete/merge）无审核员时也需人工确认
+- additive 操作（new_link）可直接执行
+- 每个操作带幂等 operation_id，崩溃重放不重复执行
+
+**旧 consolidation 迁移**
+- 新系统上线后禁用 `_maybe_consolidate_memories`
+- 旧巩固功能迁移为整理师的一个子任务（低频老记忆压缩）
+- 配置 `maintenance_enabled=true` 时自动关闭旧巩固，避免并发竞态
+
+**调度生命周期**
+- 使用 `context.cron_manager.add_basic_job()` 而非自建 60s 轮询
+- initialize 注册 / terminate 注销，不泄漏任务
+- single-flight：同一任务不并发执行
+
+**link 级联清理**
+- 所有物理删除路径（forget/clear/rebuild/purge）统一走 link-aware executor
+- 删除记忆时同步删除 memory_links 中 source_uri 或 target_uri 涉及的边
+
+**关联召回规则**
+- 只召回未 deprecated 的关联记忆
+- 单跳（不递归），最多 3 条关联记忆
+- 总注入 token 预算上限（关联记忆 + 主记忆 合计不超过 max_length）
+- contradicts/supersedes 关系不注入召回，仅用于后台分析
+
+**通知隐私**
+- 群聊 UMO 只发通用提示（“有 N 条待审”），不发具体内容
+- 详细争议内容只发到私聊 UMO
+
+**对话历史**
+- 使用 `context.conversation_manager` API，不直接读 SQLite
+- 按 UMO 限定拉取范围，明确截断顺序（时间 → 轮数 → 字符数）
