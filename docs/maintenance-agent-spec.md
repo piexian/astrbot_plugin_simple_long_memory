@@ -1,6 +1,6 @@
 # 后台记忆整理系统 — 设计规格
 
-> 版本: draft v0.3 | 状态: 实施中 | 基线分支: dev
+> 版本: v1.0 | 状态: 已完成 | 基线分支: dev
 > v0.3：结合 Memento 睡眠巩固引擎（/root/work/Memento）修订——两级预筛、裁决缓存、三态裁决、merge supersede 语义、单管线调度
 > v0.3 新增：分支迭代流程（每 Phase 独立分支 → Codex Review → PR dev → 合并后继续下一阶段）
 
@@ -584,15 +584,15 @@ astrbot_plugin_simple_long_memory/
 
 | Phase | 内容 | 依赖 | 状态 |
 |-------|------|------|------|
-| 1 | deprecated_at 迁移 + 关联表 + purge + prompt 模板修复 + cron 调度 | 无 | 🚧 进行中 |
-| 2 | 执行管线框架 + `llm.py` 唯一入口 + manifest 校验 + 三态裁决 + pair-hash 缓存 + MaintenanceReport | Phase 1 | 未开始 |
-| 3 | 整理师（去重合并 + 质量精炼）：余弦 ≥0.9 预筛候选对，merge 走 supersede 语义，替代旧 consolidation | Phase 2 | 未开始 |
-| 4 | 分析师（关联发现 + 矛盾检测）：余弦 ≥0.7 预筛、排除已连边、每周期调用上限，conversation_manager API | Phase 2 | 未开始 |
-| 5 | 审核员 + 互审模式 + 人工升级 | Phase 3, 4 | 未开始 |
-| 6 | 召回时关联记忆注入（可见性/预算/去重） | Phase 1 | 未开始 |
-| 7 | 配置 schema + i18n + README | 全部 | 未开始 |
+| 1 | deprecated_at 迁移 + 关联表 + purge + prompt 模板修复 + cron 调度 | 无 | ✅ 已完成 |
+| 2 | 执行管线框架 + `llm.py` 唯一入口 + manifest 校验 + 三态裁决 + pair-hash 缓存 + MaintenanceReport | Phase 1 | ✅ 已完成 |
+| 3 | 整理师（去重合并 + 质量精炼）：余弦 ≥0.9 预筛候选对，merge 走 supersede 语义，替代旧 consolidation | Phase 2 | ✅ 已完成 |
+| 4 | 分析师（关联发现 + 矛盾检测）：余弦 ≥0.7 预筛、排除已连边、每周期调用上限，conversation_manager API | Phase 2 | ✅ 已完成 |
+| 5 | 审核员 + 互审模式 + 人工升级（/memory review 命令 + KV 待审队列） | Phase 3, 4 | ✅ 已完成 |
+| 6 | 召回时关联记忆注入（可见性/预算/去重） | Phase 1 | ✅ 已完成 |
+| 7 | 配置 schema + i18n + README | 全部 | ✅ 已完成 |
 
-**Phase 1 剩余项：**
+**Phase 1 剩余项（已全部完成）：**
 - 根 `prompts.py`（提取/检索 prompt）从 `str.format` 迁移到 `string.Template`
 - `main.py` 补 `maintenance_tasks` template_list 配置 schema
 - forget / clear / rebuild 路径统一 link 级联清理（目前只有 purge 做了级联）
