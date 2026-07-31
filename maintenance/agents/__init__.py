@@ -2,5 +2,6 @@
 
 from .analyst import AnalystAgent
 from .organizer import OrganizerAgent
+from .reviewer import ReviewerAgent
 
-__all__ = ["AnalystAgent", "OrganizerAgent"]
+__all__ = ["AnalystAgent", "OrganizerAgent", "ReviewerAgent"]
