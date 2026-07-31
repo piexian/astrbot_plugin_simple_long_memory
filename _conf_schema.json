@@ -212,6 +212,18 @@
     "default": true,
     "hint": "开启后分析师会检测互相矛盾的记忆对"
   },
+  "maintenance_reviewer_enabled": {
+    "description": "启用审核员",
+    "type": "bool",
+    "default": true,
+    "hint": "复核整理师和分析师的操作建议，防止误删误改"
+  },
+  "maintenance_reviewer_model_id": {
+    "description": "审核模型",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
+  },
   "auto_purge_enabled": {
     "description": "自动清理废弃记忆",
     "type": "bool",

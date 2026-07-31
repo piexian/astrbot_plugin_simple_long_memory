@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,10 +15,10 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .agents.reviewer import ReviewerAgent
 from .agents.analyst import AnalystAgent
 from .agents.organizer import OrganizerAgent
 from .llm import MaintenanceLLM
-from .prompts import build_prompt, DEFAULT_REVIEWER_PROMPT
 
 @dataclass
 class AgentManifest:
@@ -156,15 +155,73 @@ class MaintenanceRunner:
                     report.errors.append(f"reviewer: {e}")
                     logger.warning(f"[简单长期记忆] reviewer 失败: {e}")
 
-            # ── 阶段 4: Host 执行（Phase 3/4/5 实现具体操作执行）──
-            # 目前只记录 manifest，不执行实际操作
-            report.executed_ops = 0
-            report.skipped_ops = (
-                len(report.organizer_manifest.operations) if report.organizer_manifest else 0
-            ) + (
-                len(report.analyst_manifest.operations) if report.analyst_manifest else 0
-            )
+            # ── 阶段 3.5: 互审模式（驳回理由回传修正，最多 2 轮）──
+            max_revision_rounds = 2
+            for round_num in range(max_revision_rounds):
+                # 检查是否有 reject 且 controversial 的项
+                controversial_items = [
+                    v for v in report.reviewer_verdicts
+                    if v.get("verdict") == "reject" and v.get("controversial", False)
+                ]
+                if not controversial_items:
+                    break
 
+                logger.info(
+                    f"[简单长期记忆] 第 {round_num + 1} 轮互审："
+                    f"{len(controversial_items)} 个争议项回传修正"
+                )
+
+                # 回传修正（简化版：重新运行原角色，输入包含驳回理由）
+                # Phase 5 完善：将驳回理由注入原角色的 prompt
+                # 目前先跳过修正，直接标记为待人工审核
+                for item in controversial_items:
+                    item["needs_human_review"] = True
+
+            # ── 阶段 4: Host 执行（根据审核结果执行操作）──
+            executed = 0
+            skipped = 0
+            failed = 0
+
+            # 收集所有操作和对应的审核结果
+            all_operations = []
+            if report.organizer_manifest and report.organizer_manifest.parsed:
+                all_operations.extend(report.organizer_manifest.operations)
+            if report.analyst_manifest and report.analyst_manifest.parsed:
+                all_operations.extend(report.analyst_manifest.operations)
+
+            # 按审核结果执行操作
+            for i, op in enumerate(all_operations):
+                # 查找对应的审核结果
+                verdict = None
+                for v in report.reviewer_verdicts:
+                    if v.get("index") == i:
+                        verdict = v
+                        break
+
+                # 无审核结果或审核通过 → 执行
+                if verdict is None or verdict.get("verdict") == "approve":
+                    try:
+                        success = await self._execute_operation(op)
+                        if success:
+                            executed += 1
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        logger.warning(f"[简单长期记忆] 执行操作失败: {op}, {e}")
+                        failed += 1
+                else:
+                    # 审核拒绝 → 跳过
+                    skipped += 1
+                    if verdict.get("needs_human_review"):
+                        # 争议项 → 写入待审队列（Phase 5 完善：接 KV 和通知）
+                        logger.info(
+                            f"[简单长期记忆] 争议项待人工审核: {op.get('type')}, "
+                            f"理由: {verdict.get('reason', '')}"
+                        )
+
+            report.executed_ops = executed
+            report.skipped_ops = skipped
+            report.failed_ops = failed
             # LLM 统计
             report.llm_stats = self._llm.stats()
 
@@ -286,35 +343,20 @@ class MaintenanceRunner:
         if not proposed_changes:
             return verdicts
 
-        # 组装 prompt
-        variables = {
-            "proposed_changes": json.dumps(proposed_changes, ensure_ascii=False, indent=2),
-            "original_data": "{}",  # Phase 5 完善
-            "persona_summary": await self._get_persona_summary(),
-            "admin_guides": "",
-        }
-        prompt = build_prompt(
-            default_template=DEFAULT_REVIEWER_PROMPT,
-            variables=variables,
-            prompt_override=self._config.get("maintenance_reviewer_prompt_override", ""),
-            prompt_extra=self._config.get("maintenance_reviewer_prompt_extra", ""),
+        # 使用 ReviewerAgent 执行审核
+        reviewer = ReviewerAgent(
+            context=self._context,
+            memory_mgr=self._memory_mgr,
+            llm=self._llm,
+            config=self._config,
         )
 
-        # 调用 LLM
-        model_id = self._config.get("maintenance_reviewer_model_id", "") or self._config.get("maintenance_model_id", "")
-        raw = await self._llm._chat(
-            system_prompt="你是记忆操作审核员，只输出结构化 JSON。",
-            user_prompt=prompt,
-            model_id=model_id,
-        )
-
-        if raw:
-            parsed = self._llm._parse_json(raw)
-            if parsed:
-                verdicts = parsed.get("verdicts", [])
+        try:
+            verdicts = await reviewer.review(proposed_changes)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 审核员执行失败: {e}")
 
         return verdicts
-
     # ─── 数据拉取辅助（Phase 3/4 完善）────────────────────
 
     async def _get_memories_text(self) -> str:
@@ -342,3 +384,116 @@ class MaintenanceRunner:
         else:
             # auto: 从主人格提取（Phase 5 完善）
             return ""
+
+    async def _execute_operation(self, op: dict[str, Any]) -> bool:
+        """执行单个操作。"""
+        op_type = op.get("type", "")
+        
+        try:
+            if op_type == "merge":
+                return await self._execute_merge(op)
+            elif op_type == "archive":
+                return await self._execute_archive(op)
+            elif op_type == "update":
+                return await self._execute_update(op)
+            elif op_type == "new_link":
+                return await self._execute_new_link(op)
+            elif op_type == "contradiction":
+                # 矛盾检测只记录，不执行实际操作
+                logger.info(f"[简单长期记忆] 检测到矛盾: {op.get('old_uri')} vs {op.get('new_uri')}")
+                return True
+            else:
+                logger.warning(f"[简单长期记忆] 未知操作类型: {op_type}")
+                return False
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 执行操作失败: {op_type}, {e}")
+            return False
+
+    async def _execute_merge(self, op: dict[str, Any]) -> bool:
+        """执行 merge 操作（supersede 语义）。"""
+        uris = op.get("uris", [])
+        merged_content = op.get("merged_content", "")
+        
+        if not uris or not merged_content:
+            logger.warning("[简单长期记忆] merge 操作缺少必要参数")
+            return False
+        
+        # 1. 新建合并后的记忆
+        new_uri = f"facts://merged/{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        success = await self._memory_mgr.add_memory(
+            content=merged_content,
+            uri=new_uri,
+            memory_type="fact",
+            importance=3,
+            scope="personal",
+        )
+        if not success:
+            return False
+        
+        # 2. 旧记忆标 deprecated + 写 superseded_by 边
+        for old_uri in uris:
+            # 标记废弃
+            await self._memory_mgr.mark_deprecated(old_uri, reason="merged")
+            # 写 superseded_by 边
+            if self._memory_mgr._link_manager:
+                await self._memory_mgr._link_manager.add_link(
+                    source_uri=new_uri,
+                    target_uri=old_uri,
+                    relation_type="supersedes",
+                    reason=f"merged into {new_uri}",
+                    confidence=op.get("confidence", 1.0),
+                    created_by="organizer",
+                )
+        
+        return True
+
+    async def _execute_archive(self, op: dict[str, Any]) -> bool:
+        """执行 archive 操作。"""
+        uri = op.get("uri", "")
+        reason = op.get("reason", "")
+        
+        if not uri:
+            return False
+        
+        # 标记废弃
+        return await self._memory_mgr.mark_deprecated(uri, reason=reason or "archived")
+
+    async def _execute_update(self, op: dict[str, Any]) -> bool:
+        """执行 update 操作。"""
+        uri = op.get("uri", "")
+        new_content = op.get("new_content", "")
+        
+        if not uri or not new_content:
+            return False
+        
+        # 更新记忆内容（需要 memory_mgr 提供 update 接口）
+        if hasattr(self._memory_mgr, "update_memory"):
+            return await self._memory_mgr.update_memory(uri, new_content)
+        else:
+            logger.warning("[简单长期记忆] memory_mgr 缺少 update_memory 接口")
+            return False
+
+    async def _execute_new_link(self, op: dict[str, Any]) -> bool:
+        """执行 new_link 操作。"""
+        source = op.get("source", "")
+        target = op.get("target", "")
+        relation = op.get("relation", "related")
+        reason = op.get("reason", "")
+        confidence = op.get("confidence", 1.0)
+        
+        if not source or not target:
+            return False
+        
+        # 写入关联表
+        if self._memory_mgr._link_manager:
+            return await self._memory_mgr._link_manager.add_link(
+                source_uri=source,
+                target_uri=target,
+                relation_type=relation,
+                reason=reason,
+                confidence=confidence,
+                created_by="analyst",
+            )
+        else:
+            logger.warning("[简单长期记忆] link_manager 不可用")
+            return False
