@@ -150,5 +150,80 @@
     "type": "int",
     "default": 30,
     "hint": "每次巩固任务处理的记忆条数上限"
+  },
+  "maintenance_enabled": {
+    "description": "后台整理总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后按 cron 定时执行记忆整理任务（需配置整理模型）"
+  },
+  "maintenance_model_id": {
+    "description": "整理模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于后台整理 Agent 的 LLM 模型，建议使用廉价模型（留空则使用会话主 LLM）"
+  },
+  "maintenance_window": {
+    "description": "整理时间窗口",
+    "type": "string",
+    "default": "02:00-06:00",
+    "hint": "单时间点如 03:00，或范围如 02:00-06:00（范围内空闲时执行）"
+  },
+  "auto_purge_enabled": {
+    "description": "自动清理废弃记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "定期物理删除已标记废弃超期的记忆"
+  },
+  "auto_purge_after_days": {
+    "description": "清理超期天数",
+    "type": "int",
+    "default": 7,
+    "hint": "deprecated 标记超过此天数后物理删除"
+  },
+  "auto_purge_cron": {
+    "description": "清理定时表达式",
+    "type": "string",
+    "default": "0 5 * * *",
+    "hint": "标准 cron 表达式，默认每天 05:00 执行"
+  },
+  "maintenance_tasks": {
+    "description": "整理团队编排",
+    "type": "list",
+    "items": {"type": "object"},
+    "default": [],
+    "hint": "添加后台整理角色（organizer/analyst/reviewer），配置执行时间和行为"
+  },
+  "context_max_rounds": {
+    "description": "最大拉取对话轮数",
+    "type": "int",
+    "default": 50,
+    "hint": "分析师拉取对话历史的最大轮数"
+  },
+  "context_max_chars": {
+    "description": "最大拉取字符数",
+    "type": "int",
+    "default": 30000,
+    "hint": "分析师拉取对话历史的最大总字符数"
+  },
+  "context_max_age_days": {
+    "description": "对话最大回溯天数",
+    "type": "int",
+    "default": 7,
+    "hint": "分析师只拉取最近 N 天的对话"
+  },
+  "persona_mode": {
+    "description": "人格加载模式",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "manual", "off"],
+    "hint": "auto=自动从主人格提取摘要, manual=使用下方自定义, off=不加载"
+  },
+  "persona_summary": {
+    "description": "自定义人格摘要",
+    "type": "text",
+    "default": "",
+    "hint": "manual 模式下填写，帮助整理 Agent 理解对话语境"
   }
 }
