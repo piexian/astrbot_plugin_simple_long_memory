@@ -15,9 +15,9 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .agents.reviewer import ReviewerAgent
 from .agents.analyst import AnalystAgent
 from .agents.organizer import OrganizerAgent
+from .agents.reviewer import ReviewerAgent
 from .llm import MaintenanceLLM
 
 
@@ -527,8 +527,31 @@ class MaintenanceRunner:
                 }
             )
             await self._kv_put("maintenance_pending_review", queue)
+            # 待审通知推送
+            if self._config.get("review_notify_enabled", True):
+                await self._send_review_notification(len(queue))
         except Exception as e:
             logger.warning(f"[简单长期记忆] 写入待审队列失败: {e}")
+
+    async def _send_review_notification(self, pending_count: int) -> None:
+        """向管理员推送待审通知。"""
+        try:
+            umo = self._config.get("review_notify_umo", "")
+            if not umo:
+                return
+            from astrbot.api.message_components import Plain
+            from astrbot.api.star import MessageChain
+
+            msg = MessageChain(
+                chain=[
+                    Plain(
+                        text=f"📝 记忆整理待审通知\n当前有 {pending_count} 条争议操作等待审查。\n回复 /memory review 查看详情并处理"
+                    )
+                ]
+            )
+            await self._context.send_message(umo, msg)
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 待审通知发送失败: {e}")
 
     async def _execute_operation(self, op: dict[str, Any]) -> bool:
         """执行单个操作。"""

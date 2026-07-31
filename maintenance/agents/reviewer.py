@@ -15,9 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
-
 from ..llm import MaintenanceLLM
-from ..prompts import build_prompt, DEFAULT_REVIEWER_PROMPT
+from ..prompts import DEFAULT_REVIEWER_PROMPT, build_prompt
 
 
 class ReviewerAgent:

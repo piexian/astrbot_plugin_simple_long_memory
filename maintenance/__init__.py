@@ -4,9 +4,9 @@
 """
 
 from .links import MemoryLinkManager
-from .llm import MaintenanceLLM, LLMVerdict
+from .llm import LLMVerdict, MaintenanceLLM
 from .purge import purge_deprecated_memories
-from .runner import MaintenanceRunner, MaintenanceReport
+from .runner import MaintenanceReport, MaintenanceRunner
 from .scheduler import MaintenanceScheduler
 
 __all__ = [

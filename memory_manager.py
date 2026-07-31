@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
 
+from .maintenance.links import MemoryLinkManager
 from .memory_protocol import (
     MemoryMetadata,
     MemoryScope,
@@ -35,8 +36,6 @@ from .memory_protocol import (
     format_memory_content,
     normalize_memory_scope,
 )
-
-from .maintenance.links import MemoryLinkManager
 
 if TYPE_CHECKING:
     from astrbot.core.knowledge_base.kb_helper import KBHelper
@@ -1205,6 +1204,9 @@ class MemoryManager:
             )
             if linked_memories:
                 memories.extend(linked_memories)
+                # 关联注入后截断到 top_k，避免超出调用方预期
+                if top_k and len(memories) > top_k:
+                    memories = memories[:top_k]
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
 
@@ -2269,9 +2271,11 @@ class MemoryManager:
                         metadata_filters={"kb_doc_id": old_doc_id}
                     )
                 except Exception as del_err:
+                    # 删除失败 → 原记录仍活跃，返回失败让调用方处理
                     logger.warning(
                         f"[简单长期记忆] deprecate 删除旧记录失败: {del_err}"
                     )
+                    return False
 
             logger.debug(f"[简单长期记忆] 已标记 deprecated: {uri}")
             return True
@@ -2358,6 +2362,12 @@ class MemoryManager:
                 metadata=new_metadata,
                 id=new_doc_id,
             )
+            # 注册 KB 文档（与其他写入路径一致）
+            try:
+                await self._register_kb_document(new_doc_id, new_uri, len(formatted))
+                await self._sync_kb_stats()
+            except Exception:
+                pass
 
             # 2. 旧记忆标 deprecated（全部成功才报成功，否则回滚新记录）
             deprecated_count = 0
@@ -2422,8 +2432,21 @@ class MemoryManager:
                                     metadata=dep_meta,
                                     id=restore_id,
                                 )
+                                # 同步 KB：注册恢复的 ID，注销 deprecated 的 ID
+                                try:
+                                    await self._register_kb_document(
+                                        restore_id,
+                                        ok_uri,
+                                        len(dep_docs[0].get("text", "")),
+                                    )
+                                except Exception:
+                                    pass
                                 old_id = dep_docs[0].get("doc_id", "")
                                 if old_id:
+                                    try:
+                                        await self._unregister_kb_documents([old_id])
+                                    except Exception:
+                                        pass
                                     await self.vec_db.delete_documents(
                                         metadata_filters={"kb_doc_id": old_id}
                                     )
