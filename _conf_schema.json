@@ -224,6 +224,47 @@
     "default": "",
     "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
   },
+  "maintenance_organizer_enabled": {
+    "description": "启用整理师",
+    "type": "bool",
+    "default": true,
+    "hint": "去重合并相似记忆、精炼措辞、归档无价值条目"
+  },
+  "maintenance_analyst_enabled": {
+    "description": "启用分析师",
+    "type": "bool",
+    "default": true,
+    "hint": "拉取对话历史，发现记忆间隐含关联，检测矛盾"
+  },
+  "review_notify_enabled": {
+    "description": "待审通知开关",
+    "type": "bool",
+    "default": true,
+    "hint": "争议操作产生时主动通知管理员"
+  },
+  "review_notify_umo": {
+    "description": "通知目标 UMO",
+    "type": "string",
+    "default": "",
+    "hint": "填写群聊或私聊的 unified_msg_origin，留空则自动发给最近一次执行管理命令的管理员"
+  },
+  "review_notify_schedule": {
+    "description": "通知频率",
+    "type": "string",
+    "default": "daily",
+    "options": [
+      "daily",
+      "weekly",
+      "monthly"
+    ],
+    "hint": "daily=每天固定时间, weekly=每周固定日, monthly=每月固定日"
+  },
+  "review_notify_time": {
+    "description": "通知时间",
+    "type": "string",
+    "default": "10:00",
+    "hint": "daily 为每天时刻，weekly 为周几+时刻如 mon:10:00，monthly 为几号+时刻如 1:10:00"
+  },
   "auto_purge_enabled": {
     "description": "自动清理废弃记忆",
     "type": "bool",
