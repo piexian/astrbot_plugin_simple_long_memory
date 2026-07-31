@@ -10,11 +10,13 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
 
+from .llm import MaintenanceLLM
+from .runner import MaintenanceRunner
+
 if TYPE_CHECKING:
     from astrbot.core.star.context import Context
 
     from ..memory_manager import MemoryManager
-
 
 class MaintenanceScheduler:
     """后台整理调度器，管理所有定时整理任务。"""
@@ -31,6 +33,19 @@ class MaintenanceScheduler:
         self._job_ids: list[str] = []
         self._running_tasks: set[str] = set()  # single-flight 防并发
 
+        # 初始化 LLM 客户端和执行管线
+        maintenance_model_id = config.get("maintenance_model_id", "")
+        self._llm = MaintenanceLLM(
+            context=context,
+            default_model_id=maintenance_model_id,
+            max_calls_per_cycle=config.get("maintenance_max_llm_calls", 50),
+        )
+        self._runner = MaintenanceRunner(
+            context=context,
+            memory_mgr=memory_mgr,
+            llm=self._llm,
+            config=config,
+        )
     async def start(self) -> None:
         """注册所有定时任务到 cron_manager。"""
         if not self._config.get("maintenance_enabled", False):
@@ -65,8 +80,24 @@ class MaintenanceScheduler:
             except Exception as e:
                 logger.warning(f"[简单长期记忆] 注册自动清理任务失败: {e}")
 
-        # TODO: Phase 3+ 注册整理师/分析师/审核员任务
-
+        # 整理周期（完整管线：purge → organizer → analyst → reviewer）
+        if self._config.get("maintenance_enabled", False):
+            maintenance_cron = self._config.get("maintenance_cron", "0 3 * * *")
+            try:
+                job = await cron_mgr.add_basic_job(
+                    name="memory_maintenance_cycle",
+                    cron_expression=maintenance_cron,
+                    handler=self._run_maintenance_cycle,
+                    description="完整记忆整理周期（purge + 整理师 + 分析师 + 审核员）",
+                    persistent=False,
+                    enabled=True,
+                )
+                self._job_ids.append(job.job_id)
+                logger.info(
+                    f"[简单长期记忆] 整理周期已注册: cron={maintenance_cron}"
+                )
+            except Exception as e:
+                logger.warning(f"[简单长期记忆] 注册整理周期任务失败: {e}")
     async def stop(self) -> None:
         """注销所有定时任务。"""
         cron_mgr = self._context.cron_manager
@@ -111,3 +142,29 @@ class MaintenanceScheduler:
             raise  # 传播到 cron manager，记录为失败而非 completed
         finally:
             self._running_tasks.discard("purge")
+
+    async def _run_maintenance_cycle(self, **kwargs: Any) -> None:
+        """执行完整整理周期（single-flight）。"""
+        if "maintenance_cycle" in self._running_tasks:
+            logger.debug("[简单长期记忆] 整理周期已在运行，跳过")
+            return
+        self._running_tasks.add("maintenance_cycle")
+        try:
+            if not self._memory_mgr.is_kb_connected:
+                logger.debug("[简单长期记忆] KB 未连接，跳过整理周期")
+                return
+
+            report = await self._runner.run_cycle()
+            logger.info(
+                f"[简单长期记忆] 整理周期完成: {report.session_id}, "
+                f"purge={report.purge_result.get('purged', 0)}, "
+                f"LLM 调用={report.llm_stats.get('calls', 0)}, "
+                f"错误={len(report.errors)}"
+            )
+            if report.errors:
+                raise RuntimeError(f"整理周期部分失败: {report.errors}")
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 整理周期失败: {e}")
+            raise
+        finally:
+            self._running_tasks.discard("maintenance_cycle")
