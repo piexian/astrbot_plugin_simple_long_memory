@@ -179,8 +179,14 @@ class MaintenanceLLM:
             pass
         return ""
 
-    # ─── 核心调用 ───────────────────────────────────────────
+    def _resolve_model_id(self, model_id: str = "") -> str:
+        """解析实际使用的 provider ID（缓存 key 和 LLM 调用共用）。"""
+        resolved = model_id or self._default_model_id
+        if not resolved:
+            resolved = self._resolve_default_provider()
+        return resolved
 
+    # ─── 核心调用 ───────────────────────────────────────────
     async def _chat(
         self, system_prompt: str, user_prompt: str, model_id: str = ""
     ) -> str | None:
@@ -190,11 +196,7 @@ class MaintenanceLLM:
                 f"[简单长期记忆] 本周期 LLM 调用已达上限 {self._max_calls_per_cycle}，跳过"
             )
             return None
-
-        provider_id = model_id or self._default_model_id
-        if not provider_id:
-            # 回退到 AstrBot 全局默认 provider
-            provider_id = self._resolve_default_provider()
+        provider_id = self._resolve_model_id(model_id)
         if not provider_id:
             logger.debug(
                 "[简单长期记忆] 未配置整理模型且无可用默认 provider，跳过 LLM 调用"
@@ -228,7 +230,10 @@ class MaintenanceLLM:
 
         候选对在调用前已做余弦预筛（由调用方负责），这里 LLM 只看文本。
         """
-        key = self._cache_key(text_a, text_b, task="judge_relation", model_id=model_id)
+        resolved_id = self._resolve_model_id(model_id)
+        key = self._cache_key(
+            text_a, text_b, task="judge_relation", model_id=resolved_id
+        )
         cached = self._cache_get(key)
         if cached is not None:
             self._cache_hits += 1

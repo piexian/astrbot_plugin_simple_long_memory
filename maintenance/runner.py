@@ -216,6 +216,20 @@ class MaintenanceRunner:
 
                 # 缺失裁决 → fail closed，拒绝执行（避免 reviewer 故障时放行破坏性操作）
                 if verdict is None:
+                    # additive 操作（new_link）无需审核可直接执行
+                    if op.get("type") == "new_link":
+                        try:
+                            success = await self._execute_operation(op)
+                            if success:
+                                executed += 1
+                            else:
+                                failed += 1
+                                report.errors.append(f"op[{i}] new_link 执行返回失败")
+                        except Exception as e:
+                            failed += 1
+                            report.errors.append(f"op[{i}] new_link: {e}")
+                        continue
+                    # destructive 操作缺少裁决 → fail closed
                     skipped += 1
                     logger.warning(
                         f"[简单长期记忆] 操作 {i} 缺少审核裁决，跳过: {op.get('type')}"

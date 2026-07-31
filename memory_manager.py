@@ -2153,12 +2153,14 @@ class MemoryManager:
         self,
         owner_filter: dict[str, Any] | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """拉取所有活跃记忆（后台整理用，无 event 场景）
+        """拉取活跃记忆（后台整理用，无 event 场景，支持分页）
 
         Args:
             owner_filter: 限定用户范围（如 {"user_id": "xxx"}），None 表示全部
-            limit: 最大返回条数
+            limit: 每页条数
+            offset: 分页偏移
 
         Returns:
             记忆列表，每条包含 uri / content / metadata
@@ -2174,6 +2176,7 @@ class MemoryManager:
             docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters=filters,
                 limit=limit,
+                offset=offset,
             )
             # 从 FAISS 索引加载向量（document_storage 不返回 vector 字段）
             faiss_index = None
@@ -2296,7 +2299,7 @@ class MemoryManager:
             new_metadata = {
                 **first_meta,
                 "uri": new_uri,
-                "content": merged_content,
+                "memory_content": merged_content,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "deprecated": False,
                 "merged_from": source_uris,

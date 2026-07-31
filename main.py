@@ -694,6 +694,9 @@ class MemoryPlugin(Star):
             return
         if not self.config.get("memory_consolidation_enabled", True):
             return
+        # 后台整理启用时禁用旧巩固，避免并发竞态（spec: 旧 consolidation 迁移）
+        if self.config.get("maintenance_enabled", False):
+            return
         min_age_days = _read_positive_int(
             self.config.get("consolidation_min_age_days", 14), 14
         )

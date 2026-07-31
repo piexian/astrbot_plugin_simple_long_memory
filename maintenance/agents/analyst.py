@@ -111,18 +111,29 @@ class AnalystAgent:
     async def _get_active_memories(
         self, owner_filter: dict[str, Any] | None
     ) -> list[dict[str, Any]]:
-        """拉取活跃记忆列表。"""
+        """分页拉取全部活跃记忆。"""
+        if not hasattr(self._memory_mgr, "get_all_active_memories"):
+            logger.warning(
+                "[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口"
+            )
+            return []
+        all_memories: list[dict[str, Any]] = []
+        page_size = 100
+        offset = 0
         try:
-            if hasattr(self._memory_mgr, "get_all_active_memories"):
-                return await self._memory_mgr.get_all_active_memories(owner_filter)
-            else:
-                logger.warning(
-                    "[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口"
+            while True:
+                page = await self._memory_mgr.get_all_active_memories(
+                    owner_filter, limit=page_size, offset=offset
                 )
-                return []
+                if not page:
+                    break
+                all_memories.extend(page)
+                if len(page) < page_size:
+                    break
+                offset += page_size
         except Exception as e:
             logger.warning(f"[简单长期记忆] 拉取记忆列表失败: {e}")
-            return []
+        return all_memories
 
     async def _get_conversation_history(
         self, owner_filter: dict[str, Any] | None
@@ -232,6 +243,34 @@ class AnalystAgent:
             logger.warning("[简单长期记忆] numpy 不可用，跳过向量预筛")
         except Exception as e:
             logger.warning(f"[简单长期记忆] 向量预筛失败: {e}")
+
+        # 排除已有关联边的对（避免重复提议）
+        link_mgr = getattr(self._memory_mgr, "_link_manager", None)
+        if link_mgr and candidates:
+            filtered: list[tuple[dict[str, Any], dict[str, Any], float]] = []
+            # 批量收集候选 URI 的已有边
+            existing_pairs: set[tuple[str, str]] = set()
+            checked_uris: set[str] = set()
+            for mem_a, mem_b, _ in candidates:
+                for uri in (mem_a["uri"], mem_b["uri"]):
+                    if uri not in checked_uris:
+                        checked_uris.add(uri)
+                        try:
+                            links = await link_mgr.get_links_for_uri(
+                                uri, injectable_only=False, limit=0
+                            )
+                            for lk in links:
+                                src = lk.get("source_uri", "")
+                                tgt = lk.get("target_uri", "")
+                                existing_pairs.add((src, tgt))
+                                existing_pairs.add((tgt, src))
+                        except Exception:
+                            pass
+            for mem_a, mem_b, cosine in candidates:
+                pair = (mem_a["uri"], mem_b["uri"])
+                if pair not in existing_pairs:
+                    filtered.append((mem_a, mem_b, cosine))
+            candidates = filtered
 
         return candidates
 

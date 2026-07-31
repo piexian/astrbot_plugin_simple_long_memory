@@ -74,7 +74,11 @@ class OrganizerAgent:
             return manifest
 
         # 3. 逐对调 LLM 裁决（受调用上限约束）
+        consumed_uris: set[str] = set()  # 已进入 merge 的 URI，防止重复
         for mem_a, mem_b, cosine in candidate_pairs:
+            # 跳过已消费的 URI（防止 A+B, A+C, B+C 重叠合并）
+            if mem_a["uri"] in consumed_uris or mem_b["uri"] in consumed_uris:
+                continue
             if self._llm.remaining_calls <= 0:
                 logger.warning("[简单长期记忆] 整理师 LLM 调用已达上限，跳剩余候选")
                 break
@@ -88,6 +92,8 @@ class OrganizerAgent:
             manifest["llm_calls"] = self._llm.calls
 
             if verdict.verdict == "merge":
+                consumed_uris.add(mem_a["uri"])
+                consumed_uris.add(mem_b["uri"])
                 manifest["merge"].append(
                     {
                         "uris": [mem_a["uri"], mem_b["uri"]],
@@ -107,24 +113,29 @@ class OrganizerAgent:
     async def _get_active_memories(
         self, owner_filter: dict[str, Any] | None
     ) -> list[dict[str, Any]]:
-        """拉取活跃记忆列表。
-
-        TODO: Phase 4 完善按 owner 过滤和批量拉取。
-        """
-        # 简化版：从 memory_mgr 拉取所有活跃记忆
-        # 这里需要 memory_mgr 提供批量查询接口
+        """分页拉取全部活跃记忆。"""
+        if not hasattr(self._memory_mgr, "get_all_active_memories"):
+            logger.warning(
+                "[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口"
+            )
+            return []
+        all_memories: list[dict[str, Any]] = []
+        page_size = 100
+        offset = 0
         try:
-            # 假设 memory_mgr 有 get_all_active_memories 方法
-            if hasattr(self._memory_mgr, "get_all_active_memories"):
-                return await self._memory_mgr.get_all_active_memories(owner_filter)
-            else:
-                logger.warning(
-                    "[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口"
+            while True:
+                page = await self._memory_mgr.get_all_active_memories(
+                    owner_filter, limit=page_size, offset=offset
                 )
-                return []
+                if not page:
+                    break
+                all_memories.extend(page)
+                if len(page) < page_size:
+                    break
+                offset += page_size
         except Exception as e:
             logger.warning(f"[简单长期记忆] 拉取记忆列表失败: {e}")
-            return []
+        return all_memories
 
     async def _screen_merge_candidates(
         self, memories: list[dict[str, Any]]
