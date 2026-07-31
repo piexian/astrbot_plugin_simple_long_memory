@@ -16,9 +16,10 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .agents.analyst import AnalystAgent
 from .agents.organizer import OrganizerAgent
 from .llm import MaintenanceLLM
-from .prompts import build_prompt, DEFAULT_ANALYST_PROMPT, DEFAULT_REVIEWER_PROMPT
+from .prompts import build_prompt, DEFAULT_REVIEWER_PROMPT
 
 @dataclass
 class AgentManifest:
@@ -232,48 +233,41 @@ class MaintenanceRunner:
         """运行分析师：关联发现、矛盾检测。"""
         manifest = AgentManifest(agent_type="analyst")
 
-        # 拉取数据
-        memories_text = await self._get_memories_text()
-        memory_count = await self._get_memory_count()
-        conversation_history = await self._get_conversation_history()
-
-        # 组装 prompt
-        variables = {
-            "persona_summary": await self._get_persona_summary(),
-            "memories": memories_text,
-            "memory_count": memory_count,
-            "memory_stats": "{}",
-            "current_time": datetime.now(timezone.utc).isoformat(),
-            "conversation_history": conversation_history,
-            "admin_guides": "",
-        }
-        prompt = build_prompt(
-            default_template=DEFAULT_ANALYST_PROMPT,
-            variables=variables,
-            prompt_override=self._config.get("maintenance_analyst_prompt_override", ""),
-            prompt_extra=self._config.get("maintenance_analyst_prompt_extra", ""),
+        # 使用 AnalystAgent 执行分析
+        analyst = AnalystAgent(
+            context=self._context,
+            memory_mgr=self._memory_mgr,
+            llm=self._llm,
+            config=self._config,
         )
 
-        # 调用 LLM
-        model_id = self._config.get("maintenance_model_id", "")
-        raw = await self._llm._chat(
-            system_prompt="你是记忆分析师，只输出结构化 JSON。",
-            user_prompt=prompt,
-            model_id=model_id,
-        )
-        manifest.raw_response = raw or ""
-
-        if raw:
-            parsed = self._llm._parse_json(raw)
-            if parsed:
-                manifest.parsed = True
-                manifest.operations = parsed.get("new_links", [])
-                manifest.notes = parsed.get("notes", "")
-            else:
-                manifest.error = "JSON parse failed"
+        try:
+            result = await analyst.run()
+            manifest.parsed = True
+            # 将 analyst 的输出转换为 operations 格式
+            for link_op in result.get("new_links", []):
+                manifest.operations.append({
+                    "type": "new_link",
+                    "source": link_op.get("source", ""),
+                    "target": link_op.get("target", ""),
+                    "relation": link_op.get("relation", "related"),
+                    "reason": link_op.get("reason", ""),
+                    "confidence": link_op.get("confidence", 0.0),
+                })
+            for contra_op in result.get("contradictions", []):
+                manifest.operations.append({
+                    "type": "contradiction",
+                    "old_uri": contra_op.get("old_uri", ""),
+                    "new_uri": contra_op.get("new_uri", ""),
+                    "reason": contra_op.get("reason", ""),
+                    "confidence": contra_op.get("confidence", 0.0),
+                })
+            manifest.notes = result.get("notes", "")
+        except Exception as e:
+            manifest.error = str(e)
+            logger.warning(f"[简单长期记忆] 分析师执行失败: {e}")
 
         return manifest
-
     async def _run_reviewer(
         self,
         organizer_manifest: AgentManifest | None,
