@@ -71,14 +71,16 @@ class ReviewerAgent:
         prompt = build_prompt(
             default_template=DEFAULT_REVIEWER_PROMPT,
             variables=variables,
-            prompt_override=self._config.get("maintenance_reviewer_prompt_override", ""),
+            prompt_override=self._config.get(
+                "maintenance_reviewer_prompt_override", ""
+            ),
             prompt_extra=self._config.get("maintenance_reviewer_prompt_extra", ""),
         )
 
         # 调用 LLM
-        model_id = self._config.get("maintenance_reviewer_model_id", "") or self._config.get(
-            "maintenance_model_id", ""
-        )
+        model_id = self._config.get(
+            "maintenance_reviewer_model_id", ""
+        ) or self._config.get("maintenance_model_id", "")
         raw = await self._llm._chat(
             system_prompt="你是记忆操作审核员，只输出结构化 JSON。",
             user_prompt=prompt,

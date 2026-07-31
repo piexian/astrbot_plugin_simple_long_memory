@@ -33,7 +33,9 @@ class AnalystAgent:
         self._config = config
         self._link_cosine_threshold = 0.7  # link 候选预筛阈值
         self._max_new_links = config.get("maintenance_analyst_max_new_links", 20)
-        self._detect_contradiction = config.get("maintenance_analyst_detect_contradiction", True)
+        self._detect_contradiction = config.get(
+            "maintenance_analyst_detect_contradiction", True
+        )
 
     async def run(self, owner_filter: dict[str, Any] | None = None) -> dict[str, Any]:
         """运行分析师，返回 manifest。
@@ -99,7 +101,9 @@ class AnalystAgent:
 
         # 5. 矛盾检测（简化版：基于对话历史和记忆内容的时序分析）
         if self._detect_contradiction and conversation_history:
-            contradictions = await self._detect_contradictions(memories, conversation_history)
+            contradictions = await self._detect_contradictions(
+                memories, conversation_history
+            )
             manifest["contradictions"] = contradictions
 
         return manifest
@@ -112,7 +116,9 @@ class AnalystAgent:
             if hasattr(self._memory_mgr, "get_all_active_memories"):
                 return await self._memory_mgr.get_all_active_memories(owner_filter)
             else:
-                logger.warning("[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口")
+                logger.warning(
+                    "[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口"
+                )
                 return []
         except Exception as e:
             logger.warning(f"[简单长期记忆] 拉取记忆列表失败: {e}")
@@ -134,7 +140,9 @@ class AnalystAgent:
         try:
             # 检查 context 是否有 conversation_manager
             if not hasattr(self._context, "conversation_manager"):
-                logger.debug("[简单长期记忆] conversation_manager 不可用，跳过对话历史拉取")
+                logger.debug(
+                    "[简单长期记忆] conversation_manager 不可用，跳过对话历史拉取"
+                )
                 return ""
 
             # conv_mgr = self._context.conversation_manager
@@ -185,10 +193,37 @@ class AnalystAgent:
             n = len(valid_memories)
             for i in range(n):
                 for j in range(i + 1, n):
+                    # 按 scope 实际边界分组，避免跨租户配对
+                    mem_a = valid_memories[i]
+                    mem_b = valid_memories[j]
+                    scope_a = mem_a.get("metadata", {}).get("memory_scope", "")
+                    scope_b = mem_b.get("metadata", {}).get("memory_scope", "")
+                    if scope_a != scope_b:
+                        continue
+                    if scope_a == "personal":
+                        owner_a = mem_a.get("metadata", {}).get("owner_user_id", "")
+                        owner_b = mem_b.get("metadata", {}).get("owner_user_id", "")
+                        if owner_a != owner_b:
+                            continue
+                    elif scope_a == "group":
+                        session_a = mem_a.get("metadata", {}).get(
+                            "owner_session_id", ""
+                        )
+                        session_b = mem_b.get("metadata", {}).get(
+                            "owner_session_id", ""
+                        )
+                        if session_a != session_b:
+                            continue
+                    elif scope_a == "conversation":
+                        umo_a = mem_a.get("metadata", {}).get("umo", "")
+                        umo_b = mem_b.get("metadata", {}).get("umo", "")
+                        if umo_a != umo_b:
+                            continue
+                    # global：无 per-user 限制
+
                     cosine = float(sims[i, j])
                     if cosine >= self._link_cosine_threshold:
-                        # TODO: 排除已连边的对（需要查询 memory_links 表）
-                        candidates.append((valid_memories[i], valid_memories[j], cosine))
+                        candidates.append((mem_a, mem_b, cosine))
 
             # 按余弦降序
             candidates.sort(key=lambda x: x[2], reverse=True)
@@ -227,12 +262,18 @@ class AnalystAgent:
                     words_a = set(content_a.split())
                     words_b = set(content_b.split())
                     if words_a and words_b:
-                        overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+                        overlap = len(words_a & words_b) / max(
+                            len(words_a), len(words_b)
+                        )
                         if overlap > 0.5:
                             contradictions.append(
                                 {
-                                    "old_uri": mem_a["uri"] if time_a < time_b else mem_b["uri"],
-                                    "new_uri": mem_b["uri"] if time_a < time_b else mem_a["uri"],
+                                    "old_uri": mem_a["uri"]
+                                    if time_a < time_b
+                                    else mem_b["uri"],
+                                    "new_uri": mem_b["uri"]
+                                    if time_a < time_b
+                                    else mem_a["uri"],
                                     "reason": f"内容高度相似（重叠度 {overlap:.2f}）但时间不同",
                                     "confidence": overlap,
                                 }

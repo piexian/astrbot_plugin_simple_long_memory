@@ -1079,18 +1079,22 @@ class MemoryManager:
                     await self.vec_db.delete_documents(
                         metadata_filters={"kb_doc_id": new_doc_id}
                     )
-                    logger.info(f"[简单长期记忆] replace 回滚成功，已删除新向量记录: {new_doc_id}")
+                    logger.info(
+                        f"[简单长期记忆] replace 回滚成功，已删除新向量记录: {new_doc_id}"
+                    )
                 except Exception as rollback_err:
                     logger.error(f"[简单长期记忆] replace 回滚向量失败: {rollback_err}")
-                
+
                 # 同时注销 KB 文档，避免 dangling entry
                 try:
                     await self._unregister_kb_documents([new_doc_id])
                     await self._sync_kb_stats()
-                    logger.info(f"[简单长期记忆] replace 回滚成功，已注销 KB 文档: {new_doc_id}")
+                    logger.info(
+                        f"[简单长期记忆] replace 回滚成功，已注销 KB 文档: {new_doc_id}"
+                    )
                 except Exception as kb_err:
                     logger.error(f"[简单长期记忆] replace 回滚 KB 文档失败: {kb_err}")
-                
+
                 raise RuntimeError(f"replace 失败：无法删除旧向量 {old_doc_id}: {e}")
             # 只有向量删除成功后才继续清理 KB 文档
             if vector_deleted:
@@ -1193,10 +1197,12 @@ class MemoryManager:
                 if m.get("metadata", {}).get("uri")
             ]
             await self._bump_recall_stats(recalled_uris)
-        
+
         # 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
         if self._link_manager:
-            linked_memories = await self._inject_linked_memories(memories, event, all_users=all_users)
+            linked_memories = await self._inject_linked_memories(
+                memories, event, all_users=all_users
+            )
             if linked_memories:
                 memories.extend(linked_memories)
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
@@ -1257,7 +1263,11 @@ class MemoryManager:
                 mem = await self._get_memory_by_uri(uri)
                 if mem and not mem.get("metadata", {}).get("deprecated", False):
                     # 验证可见性，确保关联记忆对当前用户可见（all_users 模式下跳过）
-                    if event and not all_users and not self._is_memory_visible(event, mem):
+                    if (
+                        event
+                        and not all_users
+                        and not self._is_memory_visible(event, mem)
+                    ):
                         logger.debug(f"[简单长期记忆] 关联记忆不可见，跳过: {uri}")
                         continue
                     # 标记为关联记忆
@@ -1275,7 +1285,7 @@ class MemoryManager:
         避免语义搜索的不确定性。
         """
         try:
-            if not self.vec_db or not hasattr(self.vec_db, 'document_storage'):
+            if not self.vec_db or not hasattr(self.vec_db, "document_storage"):
                 logger.warning("[简单长期记忆] document_storage 不可用")
                 return None
 
@@ -1296,7 +1306,12 @@ class MemoryManager:
                 row = result.first()
                 if row:
                     import json
-                    meta = json.loads(row.metadata) if isinstance(row.metadata, str) else row.metadata
+
+                    meta = (
+                        json.loads(row.metadata)
+                        if isinstance(row.metadata, str)
+                        else row.metadata
+                    )
                     return {
                         "doc_id": row.doc_id,
                         "content": row.text,
@@ -1307,7 +1322,9 @@ class MemoryManager:
             logger.debug(f"[简单长期记忆] 查询记忆失败: {uri}, {e}")
             return None
 
-    def _is_memory_visible(self, event: AstrMessageEvent, memory: dict[str, Any]) -> bool:
+    def _is_memory_visible(
+        self, event: AstrMessageEvent, memory: dict[str, Any]
+    ) -> bool:
         """检查记忆对当前事件是否可见。
 
         确保关联记忆注入时验证可见性，避免跨 scope 泄露。
@@ -2158,19 +2175,81 @@ class MemoryManager:
                 metadata_filters=filters,
                 limit=limit,
             )
+            # 从 FAISS 索引加载向量（document_storage 不返回 vector 字段）
+            faiss_index = None
+            embedding_storage = getattr(self.vec_db, "embedding_storage", None)
+            if embedding_storage is not None:
+                faiss_index = getattr(embedding_storage, "index", None)
+
             memories = []
             for doc in docs:
                 metadata = _safe_parse_metadata(doc.get("metadata", {}))
-                memories.append({
-                    "uri": metadata.get("uri", ""),
-                    "content": doc.get("text", ""),
-                    "metadata": metadata,
-                    "vector": doc.get("vector"),  # 可能为 None
-                })
+                vector = None
+                doc_int_id = doc.get("id")
+                if faiss_index is not None and doc_int_id is not None:
+                    try:
+                        vector = faiss_index.reconstruct(int(doc_int_id)).tolist()
+                    except Exception:
+                        pass  # 向量不存在时跳过，organizer/analyst 会过滤
+                memories.append(
+                    {
+                        "uri": metadata.get("uri", ""),
+                        "content": doc.get("text", ""),
+                        "metadata": metadata,
+                        "vector": vector,
+                    }
+                )
             return memories
         except Exception as e:
             logger.warning(f"[简单长期记忆] 拉取活跃记忆失败: {e}")
             return []
+
+    async def deprecate_memory(self, uri: str, reason: str = "") -> bool:
+        """标记单条记忆为 deprecated（delete + re-insert 保持 doc/vector 一致）。
+
+        Args:
+            uri: 记忆 URI
+            reason: 废弃原因
+
+        Returns:
+            是否成功
+        """
+        try:
+            old_docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters={"uri": uri, "is_memory_record": True},
+                limit=1,
+            )
+            if not old_docs:
+                logger.warning(f"[简单长期记忆] deprecate 找不到记忆: {uri}")
+                return False
+
+            doc = old_docs[0]
+            old_meta = _safe_parse_metadata(doc.get("metadata", {}))
+            old_meta["deprecated"] = True
+            old_meta["deprecated_at"] = datetime.now(timezone.utc).isoformat()
+            old_meta["deprecated_reason"] = reason or "deprecated"
+
+            # 删除旧记录（向量 + 文档）
+            old_doc_id = doc.get("doc_id", "")
+            if old_doc_id:
+                await self.vec_db.delete_documents(
+                    metadata_filters={"kb_doc_id": old_doc_id}
+                )
+
+            # 重新插入（自动生成新 embedding，保持 doc/vector 一致）
+            new_doc_id = old_meta.get("kb_doc_id", str(uuid.uuid4()))
+            old_meta["kb_doc_id"] = new_doc_id
+            text = doc.get("text", old_meta.get("memory_content", ""))
+            await self.vec_db.insert(
+                content=text,
+                metadata=old_meta,
+                id=new_doc_id,
+            )
+            logger.debug(f"[简单长期记忆] 已标记 deprecated: {uri}")
+            return True
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] deprecate 失败: {uri}, {e}")
+            return False
 
     async def merge_memories(
         self,
@@ -2205,7 +2284,9 @@ class MemoryManager:
                 limit=1,
             )
             if not first_doc:
-                logger.warning(f"[简单长期记忆] 合并失败：找不到源记忆 {source_uris[0]}")
+                logger.warning(
+                    f"[简单长期记忆] 合并失败：找不到源记忆 {source_uris[0]}"
+                )
                 return {"merged_uri": "", "deprecated_count": 0, "success": False}
 
             first_meta = _safe_parse_metadata(first_doc[0].get("metadata", {}))
@@ -2222,30 +2303,25 @@ class MemoryManager:
                 "merged_reason": reason,
             }
 
-            # 写入新记忆（简化版，直接写 document_storage）
-            await self.vec_db.document_storage.add_document(
-                text=merged_content,
+            # 写入新记忆（通过 vec_db.insert 自动生成 embedding）
+            new_doc_id = str(uuid.uuid4())
+            new_metadata["kb_doc_id"] = new_doc_id
+            new_metadata["is_memory_record"] = True
+            new_metadata["chunk_index"] = 0
+            formatted = format_memory_content(merged_content, new_metadata)
+            await self.vec_db.insert(
+                content=formatted,
                 metadata=new_metadata,
+                id=new_doc_id,
             )
 
-            # 2. 旧记忆标 deprecated
+            # 2. 旧记忆标 deprecated（delete + re-insert 保持 doc/vector 一致）
             deprecated_count = 0
             for old_uri in source_uris:
                 try:
-                    # 更新 metadata
-                    old_docs = await self.vec_db.document_storage.get_documents(
-                        metadata_filters={"uri": old_uri, "is_memory_record": True},
-                        limit=1,
-                    )
-                    if old_docs:
-                        old_meta = _safe_parse_metadata(old_docs[0].get("metadata", {}))
-                        old_meta["deprecated"] = True
-                        old_meta["deprecated_at"] = datetime.now(timezone.utc).isoformat()
-                        old_meta["deprecated_reason"] = "merged"
-                        # 更新 document（简化版，实际可能需要 delete + add）
-                        # TODO: Phase 4 完善 metadata 更新接口
+                    ok = await self.deprecate_memory(old_uri, reason="merged")
+                    if ok:
                         deprecated_count += 1
-
                         # 3. 写 supersedes 边
                         if self._link_manager:
                             await self._link_manager.add_link(
@@ -2257,8 +2333,9 @@ class MemoryManager:
                                 created_by=created_by,
                             )
                 except Exception as e:
-                    logger.warning(f"[简单长期记忆] 标记旧记忆 deprecated 失败: {old_uri}, {e}")
-
+                    logger.warning(
+                        f"[简单长期记忆] 标记旧记忆 deprecated 失败: {old_uri}, {e}"
+                    )
             logger.info(
                 f"[简单长期记忆] 合并完成: {len(source_uris)} 条 → {new_uri}, "
                 f"deprecated {deprecated_count} 条"

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     from ..memory_manager import MemoryManager
 
+
 class MaintenanceScheduler:
     """后台整理调度器，管理所有定时整理任务。"""
 
@@ -46,6 +47,7 @@ class MaintenanceScheduler:
             llm=self._llm,
             config=config,
         )
+
     async def start(self) -> None:
         """注册所有定时任务到 cron_manager。"""
         if not self._config.get("maintenance_enabled", False):
@@ -93,11 +95,10 @@ class MaintenanceScheduler:
                     enabled=True,
                 )
                 self._job_ids.append(job.job_id)
-                logger.info(
-                    f"[简单长期记忆] 整理周期已注册: cron={maintenance_cron}"
-                )
+                logger.info(f"[简单长期记忆] 整理周期已注册: cron={maintenance_cron}")
             except Exception as e:
                 logger.warning(f"[简单长期记忆] 注册整理周期任务失败: {e}")
+
     async def stop(self) -> None:
         """注销所有定时任务。"""
         cron_mgr = self._context.cron_manager

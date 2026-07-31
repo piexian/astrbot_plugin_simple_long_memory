@@ -62,7 +62,12 @@ class MaintenanceLLM:
             try:
                 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-                cache_dir = Path(get_astrbot_data_path()) / "plugin_data" / "simple_long_memory" / "llm_cache"
+                cache_dir = (
+                    Path(get_astrbot_data_path())
+                    / "plugin_data"
+                    / "simple_long_memory"
+                    / "llm_cache"
+                )
             except Exception:
                 cache_dir = Path("data") / "llm_cache"
         self._cache_dir = Path(cache_dir)
@@ -154,6 +159,26 @@ class MaintenanceLLM:
         except Exception:
             return None
 
+    def _resolve_default_provider(self) -> str:
+        """回退到 AstrBot 全局默认 provider（maintenance_model_id 留空时）。"""
+        try:
+            config = self._context.get_config()
+            provider_settings = config.get("provider_settings", {})
+            default_id = provider_settings.get("default_provider_id", "")
+            if default_id:
+                return default_id
+        except Exception:
+            pass
+        # 最后尝试取第一个可用 provider
+        try:
+            insts = self._context.provider_manager.provider_insts
+            if insts:
+                first = insts[0]
+                return getattr(first, "provider_id", "") or getattr(first, "id", "")
+        except Exception:
+            pass
+        return ""
+
     # ─── 核心调用 ───────────────────────────────────────────
 
     async def _chat(
@@ -168,7 +193,12 @@ class MaintenanceLLM:
 
         provider_id = model_id or self._default_model_id
         if not provider_id:
-            logger.debug("[简单长期记忆] 未配置整理模型，跳过 LLM 调用")
+            # 回退到 AstrBot 全局默认 provider
+            provider_id = self._resolve_default_provider()
+        if not provider_id:
+            logger.debug(
+                "[简单长期记忆] 未配置整理模型且无可用默认 provider，跳过 LLM 调用"
+            )
             return None
 
         # 在调用前计数，确保失败也计入限额
@@ -184,6 +214,7 @@ class MaintenanceLLM:
             self._errors += 1
             logger.warning(f"[简单长期记忆] LLM 调用失败: {e}")
             return None
+
     # ─── 任务接口 ───────────────────────────────────────────
 
     async def judge_relation(

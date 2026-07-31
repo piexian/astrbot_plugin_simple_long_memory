@@ -118,7 +118,9 @@ class OrganizerAgent:
             if hasattr(self._memory_mgr, "get_all_active_memories"):
                 return await self._memory_mgr.get_all_active_memories(owner_filter)
             else:
-                logger.warning("[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口")
+                logger.warning(
+                    "[简单长期记忆] memory_mgr 缺少 get_all_active_memories 接口"
+                )
                 return []
         except Exception as e:
             logger.warning(f"[简单长期记忆] 拉取记忆列表失败: {e}")
@@ -165,11 +167,11 @@ class OrganizerAgent:
                     mem_b = valid_memories[j]
                     scope_a = mem_a.get("metadata", {}).get("memory_scope", "")
                     scope_b = mem_b.get("metadata", {}).get("memory_scope", "")
-                    
+
                     # scope 必须相同
                     if scope_a != scope_b:
                         continue
-                    
+
                     # 根据 scope 类型确定分组键
                     if scope_a == "personal":
                         # personal：按 owner_user_id 分组
@@ -179,8 +181,12 @@ class OrganizerAgent:
                             continue
                     elif scope_a == "group":
                         # group：按 session 分组（session_id 含群聊标识）
-                        session_a = mem_a.get("metadata", {}).get("owner_session_id", "")
-                        session_b = mem_b.get("metadata", {}).get("owner_session_id", "")
+                        session_a = mem_a.get("metadata", {}).get(
+                            "owner_session_id", ""
+                        )
+                        session_b = mem_b.get("metadata", {}).get(
+                            "owner_session_id", ""
+                        )
                         if session_a != session_b:
                             continue
                     elif scope_a == "conversation":

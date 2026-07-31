@@ -20,6 +20,7 @@ from .agents.analyst import AnalystAgent
 from .agents.organizer import OrganizerAgent
 from .llm import MaintenanceLLM
 
+
 @dataclass
 class AgentManifest:
     """Agent 输出的结构化操作清单。"""
@@ -37,7 +38,9 @@ class MaintenanceReport:
     """一次整理周期的结构化报告。"""
 
     session_id: str
-    started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    started_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     finished_at: str = ""
     duration_ms: float = 0.0
 
@@ -64,13 +67,23 @@ class MaintenanceReport:
             "duration_ms": self.duration_ms,
             "purge_result": self.purge_result,
             "organizer": {
-                "ops_count": len(self.organizer_manifest.operations) if self.organizer_manifest else 0,
-                "parsed": self.organizer_manifest.parsed if self.organizer_manifest else False,
-                "error": self.organizer_manifest.error if self.organizer_manifest else "",
+                "ops_count": len(self.organizer_manifest.operations)
+                if self.organizer_manifest
+                else 0,
+                "parsed": self.organizer_manifest.parsed
+                if self.organizer_manifest
+                else False,
+                "error": self.organizer_manifest.error
+                if self.organizer_manifest
+                else "",
             },
             "analyst": {
-                "ops_count": len(self.analyst_manifest.operations) if self.analyst_manifest else 0,
-                "parsed": self.analyst_manifest.parsed if self.analyst_manifest else False,
+                "ops_count": len(self.analyst_manifest.operations)
+                if self.analyst_manifest
+                else 0,
+                "parsed": self.analyst_manifest.parsed
+                if self.analyst_manifest
+                else False,
                 "error": self.analyst_manifest.error if self.analyst_manifest else "",
             },
             "reviewer_verdicts_count": len(self.reviewer_verdicts),
@@ -119,7 +132,9 @@ class MaintenanceRunner:
             if self._config.get("auto_purge_enabled", True):
                 purge_days = self._config.get("auto_purge_after_days", 7)
                 try:
-                    purge_result = await self._memory_mgr.purge_deprecated(after_days=purge_days)
+                    purge_result = await self._memory_mgr.purge_deprecated(
+                        after_days=purge_days
+                    )
                     report.purge_result = purge_result
                     logger.info(
                         f"[简单长期记忆] purge 完成: {purge_result.get('purged', 0)} 条记忆"
@@ -160,7 +175,8 @@ class MaintenanceRunner:
             for round_num in range(max_revision_rounds):
                 # 检查是否有 reject 且 controversial 的项
                 controversial_items = [
-                    v for v in report.reviewer_verdicts
+                    v
+                    for v in report.reviewer_verdicts
                     if v.get("verdict") == "reject" and v.get("controversial", False)
                 ]
                 if not controversial_items:
@@ -198,17 +214,28 @@ class MaintenanceRunner:
                         verdict = v
                         break
 
-                # 无审核结果或审核通过 → 执行
-                if verdict is None or verdict.get("verdict") == "approve":
+                # 缺失裁决 → fail closed，拒绝执行（避免 reviewer 故障时放行破坏性操作）
+                if verdict is None:
+                    skipped += 1
+                    logger.warning(
+                        f"[简单长期记忆] 操作 {i} 缺少审核裁决，跳过: {op.get('type')}"
+                    )
+                    continue
+
+                if verdict.get("verdict") == "approve":
                     try:
                         success = await self._execute_operation(op)
                         if success:
                             executed += 1
                         else:
                             failed += 1
+                            report.errors.append(
+                                f"op[{i}] {op.get('type')} 执行返回失败"
+                            )
                     except Exception as e:
                         logger.warning(f"[简单长期记忆] 执行操作失败: {op}, {e}")
                         failed += 1
+                        report.errors.append(f"op[{i}] {op.get('type')}: {e}")
                 else:
                     # 审核拒绝 → 跳过
                     skipped += 1
@@ -260,32 +287,39 @@ class MaintenanceRunner:
             manifest.parsed = True
             # 将 organizer 的输出转换为 operations 格式
             for merge_op in result.get("merge", []):
-                manifest.operations.append({
-                    "type": "merge",
-                    "uris": merge_op.get("uris", []),
-                    "merged_content": merge_op.get("merged_content", ""),
-                    "reason": merge_op.get("reason", ""),
-                    "confidence": merge_op.get("confidence", 0.0),
-                })
+                manifest.operations.append(
+                    {
+                        "type": "merge",
+                        "uris": merge_op.get("uris", []),
+                        "merged_content": merge_op.get("merged_content", ""),
+                        "reason": merge_op.get("reason", ""),
+                        "confidence": merge_op.get("confidence", 0.0),
+                    }
+                )
             for archive_op in result.get("archive", []):
-                manifest.operations.append({
-                    "type": "archive",
-                    "uri": archive_op.get("uri", ""),
-                    "reason": archive_op.get("reason", ""),
-                })
+                manifest.operations.append(
+                    {
+                        "type": "archive",
+                        "uri": archive_op.get("uri", ""),
+                        "reason": archive_op.get("reason", ""),
+                    }
+                )
             for update_op in result.get("update", []):
-                manifest.operations.append({
-                    "type": "update",
-                    "uri": update_op.get("uri", ""),
-                    "new_content": update_op.get("new_content", ""),
-                    "reason": update_op.get("reason", ""),
-                })
+                manifest.operations.append(
+                    {
+                        "type": "update",
+                        "uri": update_op.get("uri", ""),
+                        "new_content": update_op.get("new_content", ""),
+                        "reason": update_op.get("reason", ""),
+                    }
+                )
             manifest.notes = result.get("notes", "")
         except Exception as e:
             manifest.error = str(e)
             logger.warning(f"[简单长期记忆] 整理师执行失败: {e}")
 
         return manifest
+
     async def _run_analyst(self) -> AgentManifest:
         """运行分析师：关联发现、矛盾检测。"""
         manifest = AgentManifest(agent_type="analyst")
@@ -303,28 +337,33 @@ class MaintenanceRunner:
             manifest.parsed = True
             # 将 analyst 的输出转换为 operations 格式
             for link_op in result.get("new_links", []):
-                manifest.operations.append({
-                    "type": "new_link",
-                    "source": link_op.get("source", ""),
-                    "target": link_op.get("target", ""),
-                    "relation": link_op.get("relation", "related"),
-                    "reason": link_op.get("reason", ""),
-                    "confidence": link_op.get("confidence", 0.0),
-                })
+                manifest.operations.append(
+                    {
+                        "type": "new_link",
+                        "source": link_op.get("source", ""),
+                        "target": link_op.get("target", ""),
+                        "relation": link_op.get("relation", "related"),
+                        "reason": link_op.get("reason", ""),
+                        "confidence": link_op.get("confidence", 0.0),
+                    }
+                )
             for contra_op in result.get("contradictions", []):
-                manifest.operations.append({
-                    "type": "contradiction",
-                    "old_uri": contra_op.get("old_uri", ""),
-                    "new_uri": contra_op.get("new_uri", ""),
-                    "reason": contra_op.get("reason", ""),
-                    "confidence": contra_op.get("confidence", 0.0),
-                })
+                manifest.operations.append(
+                    {
+                        "type": "contradiction",
+                        "old_uri": contra_op.get("old_uri", ""),
+                        "new_uri": contra_op.get("new_uri", ""),
+                        "reason": contra_op.get("reason", ""),
+                        "confidence": contra_op.get("confidence", 0.0),
+                    }
+                )
             manifest.notes = result.get("notes", "")
         except Exception as e:
             manifest.error = str(e)
             logger.warning(f"[简单长期记忆] 分析师执行失败: {e}")
 
         return manifest
+
     async def _run_reviewer(
         self,
         organizer_manifest: AgentManifest | None,
@@ -357,6 +396,7 @@ class MaintenanceRunner:
             logger.warning(f"[简单长期记忆] 审核员执行失败: {e}")
 
         return verdicts
+
     # ─── 数据拉取辅助（Phase 3/4 完善）────────────────────
 
     async def _get_memories_text(self) -> str:
@@ -400,7 +440,9 @@ class MaintenanceRunner:
                 return await self._execute_new_link(op)
             elif op_type == "contradiction":
                 # 矛盾检测只记录，不执行实际操作
-                logger.info(f"[简单长期记忆] 检测到矛盾: {op.get('old_uri')} vs {op.get('new_uri')}")
+                logger.info(
+                    f"[简单长期记忆] 检测到矛盾: {op.get('old_uri')} vs {op.get('new_uri')}"
+                )
                 return True
             else:
                 logger.warning(f"[简单长期记忆] 未知操作类型: {op_type}")
@@ -410,7 +452,7 @@ class MaintenanceRunner:
             return False
 
     async def _execute_merge(self, op: dict[str, Any]) -> bool:
-        """执行 merge 操作（supersede 语义）。"""
+        """执行 merge 操作（supersede 语义，委托 merge_memories 统一处理）。"""
         uris = op.get("uris", [])
         merged_content = op.get("merged_content", "")
 
@@ -418,59 +460,58 @@ class MaintenanceRunner:
             logger.warning("[简单长期记忆] merge 操作缺少必要参数")
             return False
 
-        # 1. 新建合并后的记忆
-        new_uri = f"facts://merged/{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        success = await self._memory_mgr.add_memory(
-            content=merged_content,
-            uri=new_uri,
-            memory_type="fact",
-            importance=3,
-            scope="personal",
+        result = await self._memory_mgr.merge_memories(
+            source_uris=uris,
+            merged_content=merged_content,
+            reason=op.get("reason", "organizer merge"),
+            created_by="organizer",
         )
-        if not success:
-            return False
-
-        # 2. 旧记忆标 deprecated + 写 superseded_by 边
-        for old_uri in uris:
-            # 标记废弃
-            await self._memory_mgr.mark_deprecated(old_uri, reason="merged")
-            # 写 superseded_by 边
-            if self._memory_mgr._link_manager:
-                await self._memory_mgr._link_manager.add_link(
-                    source_uri=new_uri,
-                    target_uri=old_uri,
-                    relation_type="supersedes",
-                    reason=f"merged into {new_uri}",
-                    confidence=op.get("confidence", 1.0),
-                    created_by="organizer",
-                )
-
-        return True
+        return result.get("success", False)
 
     async def _execute_archive(self, op: dict[str, Any]) -> bool:
-        """执行 archive 操作。"""
+        """执行 archive 操作（标记 deprecated）。"""
         uri = op.get("uri", "")
         reason = op.get("reason", "")
 
         if not uri:
             return False
 
-        # 标记废弃
-        return await self._memory_mgr.mark_deprecated(uri, reason=reason or "archived")
+        return await self._memory_mgr.deprecate_memory(uri, reason=reason or "archived")
 
     async def _execute_update(self, op: dict[str, Any]) -> bool:
-        """执行 update 操作。"""
+        """执行 update 操作（通过 replace_memory 替换内容）。"""
         uri = op.get("uri", "")
         new_content = op.get("new_content", "")
 
         if not uri or not new_content:
             return False
 
-        # 更新记忆内容（需要 memory_mgr 提供 update 接口）
-        if hasattr(self._memory_mgr, "update_memory"):
-            return await self._memory_mgr.update_memory(uri, new_content)
-        else:
-            logger.warning("[简单长期记忆] memory_mgr 缺少 update_memory 接口")
+        # 先拉取旧记忆的 metadata
+        old_docs = await self._memory_mgr.vec_db.document_storage.get_documents(
+            metadata_filters={"uri": uri, "is_memory_record": True},
+            limit=1,
+        )
+        if not old_docs:
+            logger.warning(f"[简单长期记忆] update 找不到记忆: {uri}")
+            return False
+
+        raw_meta = old_docs[0].get("metadata", {})
+        if isinstance(raw_meta, str):
+            import json as _json
+
+            try:
+                raw_meta = _json.loads(raw_meta)
+            except Exception:
+                raw_meta = {}
+        old_metadata = raw_meta if isinstance(raw_meta, dict) else {}
+        try:
+            new_uri = await self._memory_mgr.replace_memory(
+                old_metadata=old_metadata,
+                new_content=new_content,
+            )
+            return bool(new_uri)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] update 失败: {uri}, {e}")
             return False
 
     async def _execute_new_link(self, op: dict[str, Any]) -> bool:
