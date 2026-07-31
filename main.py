@@ -721,7 +721,7 @@ class MemoryPlugin(Star):
         if not joined.strip():
             return
         try:
-            prompt = MEMORY_CONSOLIDATION_PROMPT.format(memories=joined)
+            prompt = MEMORY_CONSOLIDATION_PROMPT.substitute(memories=joined)
             llm_response = await self.context.llm_generate(
                 chat_provider_id=provider_id, prompt=prompt
             )
@@ -884,7 +884,7 @@ class MemoryPlugin(Star):
         if not provider_id:
             return raw_query
 
-        prompt = RECALL_QUERY_PROMPT.format(context=raw_query[:1000])
+        prompt = RECALL_QUERY_PROMPT.substitute(context=raw_query[:1000])
         try:
             timeout = _clamp_timeout(
                 self.config.get(
@@ -1022,7 +1022,7 @@ class MemoryPlugin(Star):
             parsed_umo = UMOInfo.parse(event.unified_msg_origin)
 
             # 调用 LLM 提取记忆
-            prompt = MEMORY_EXTRACTION_PROMPT.format(
+            prompt = MEMORY_EXTRACTION_PROMPT.substitute(
                 platform_id=parsed_umo.platform_id,
                 session_type=parsed_umo.session_type,
                 session_id=parsed_umo.session_id,
