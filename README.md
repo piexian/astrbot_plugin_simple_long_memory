@@ -42,7 +42,22 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | optimize_recall_query | 启用检索优化（LLM 提炼关键词） | `false` |
 | optimize_recall_query_timeout | 检索优化超时（秒） | `10` |
 | enable_admin_global_memory_tool | 启用管理员全局记忆工具 | `false` |
-
+| enable_admin_global_memory_tool | 启用管理员全局记忆工具 | `false` |
+| maintenance_enabled | 后台记忆整理总开关 | `false` |
+| maintenance_model_id | 整理模型（建议廉价模型） | 留空 |
+| maintenance_cron | 整理周期 cron 表达式 | `0 2 * * *` |
+| maintenance_max_llm_calls | 每周期 LLM 调用上限 | `50` |
+| auto_purge_enabled | 自动清理废弃记忆 | `true` |
+| auto_purge_after_days | 清理超期天数 | `7` |
+| maintenance_organizer_enabled | 启用整理师（去重合并） | `true` |
+| maintenance_analyst_enabled | 启用分析师（关联发现） | `true` |
+| maintenance_reviewer_enabled | 启用审核员（复核操作） | `true` |
+| maintenance_reviewer_model_id | 审核模型（留空用全局模型） | 留空 |
+| context_max_rounds | 最大拉取对话轮数 | `50` |
+| context_max_chars | 最大拉取字符数 | `30000` |
+| context_max_age_days | 对话最大回溯天数 | `7` |
+| persona_mode | 人格加载模式 | `auto` |
+| review_notify_enabled | 待审通知开关 | `true` |
 ## 使用方法
 
 ### 用户命令
@@ -129,6 +144,37 @@ AI 可以通过以下工具主动操作记忆：
 2. **自动提取**：每隔 `extraction_interval` 轮对话，将累积的对话内容发送给 LLM 提取值得记忆的信息并自动存储
 3. **用户隔离**：所有记忆操作通过 metadata 中的 `user_id` 字段过滤，确保用户间记忆完全隔离
 4. **记忆存储**：记忆以向量形式存储在知识库中，支持语义检索
+4. **记忆存储**：记忆以向量形式存储在知识库中，支持语义检索
+5. **后台整理**（可选）：开启 `maintenance_enabled` 后，定时执行记忆去重合并、关联发现、矛盾检测和质量精炼，保持记忆池长期健康
+### 后台记忆整理
+
+开启 `maintenance_enabled` 后，系统会在后台定时执行记忆整理任务，保持记忆池长期健康：
+
+**整理团队角色**：
+
+| 角色 | 职责 | 默认状态 |
+|------|------|----------|
+| 📋 整理师 | 去重合并相似记忆、精炼措辞、归档无价值条目 | 启用 |
+| 🔍 分析师 | 拉取对话历史，发现记忆间隐含关联，检测矛盾 | 启用 |
+| ✅ 审核员 | 复核整理师和分析师的操作建议，防止误删误改 | 启用 |
+
+**整理流程**：
+1. **物理清理**：删除废弃超期的记忆（FAISS + SQLite + KB 文档记录）
+2. **整理师**：余弦 ≥0.9 预筛候选对，LLM 裁决 merge/none，merge 走 supersede 语义（不物理删除）
+3. **分析师**：余弦 ≥0.7 预筛候选对，排除已连边，发现关联和矛盾
+4. **审核员**：复核操作建议，approve 执行 / reject 跳过 / controversial 待人工审核
+
+**安全机制**：
+- 两级预筛：候选先经向量余弦预筛，再交 LLM 裁决，不全量喂记忆池
+- 裁决缓存：候选对按内容 hash 磁盘缓存，同对同模型永不重判
+- 三态裁决：LLM 不可用/解析失败返回"不确定"，保持现状
+- 保守原则：不确定时选择 reject，保持现状永远比误删安全
+- 关联召回：只注入 related/supports/context，排除 contradicts/supersedes
+
+**配置建议**：
+- `maintenance_model_id`：建议使用廉价模型（如 gpt-4o-mini）
+- `maintenance_cron`：建议设置在低峰期（如凌晨 2 点）
+- `maintenance_max_llm_calls`：根据记忆数量调整，默认 50 次/周期
 
 ## 注意事项
 
