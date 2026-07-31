@@ -388,7 +388,7 @@ class MaintenanceRunner:
     async def _execute_operation(self, op: dict[str, Any]) -> bool:
         """执行单个操作。"""
         op_type = op.get("type", "")
-        
+
         try:
             if op_type == "merge":
                 return await self._execute_merge(op)
@@ -413,11 +413,11 @@ class MaintenanceRunner:
         """执行 merge 操作（supersede 语义）。"""
         uris = op.get("uris", [])
         merged_content = op.get("merged_content", "")
-        
+
         if not uris or not merged_content:
             logger.warning("[简单长期记忆] merge 操作缺少必要参数")
             return False
-        
+
         # 1. 新建合并后的记忆
         new_uri = f"facts://merged/{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
         success = await self._memory_mgr.add_memory(
@@ -429,7 +429,7 @@ class MaintenanceRunner:
         )
         if not success:
             return False
-        
+
         # 2. 旧记忆标 deprecated + 写 superseded_by 边
         for old_uri in uris:
             # 标记废弃
@@ -444,17 +444,17 @@ class MaintenanceRunner:
                     confidence=op.get("confidence", 1.0),
                     created_by="organizer",
                 )
-        
+
         return True
 
     async def _execute_archive(self, op: dict[str, Any]) -> bool:
         """执行 archive 操作。"""
         uri = op.get("uri", "")
         reason = op.get("reason", "")
-        
+
         if not uri:
             return False
-        
+
         # 标记废弃
         return await self._memory_mgr.mark_deprecated(uri, reason=reason or "archived")
 
@@ -462,10 +462,10 @@ class MaintenanceRunner:
         """执行 update 操作。"""
         uri = op.get("uri", "")
         new_content = op.get("new_content", "")
-        
+
         if not uri or not new_content:
             return False
-        
+
         # 更新记忆内容（需要 memory_mgr 提供 update 接口）
         if hasattr(self._memory_mgr, "update_memory"):
             return await self._memory_mgr.update_memory(uri, new_content)
@@ -480,10 +480,10 @@ class MaintenanceRunner:
         relation = op.get("relation", "related")
         reason = op.get("reason", "")
         confidence = op.get("confidence", 1.0)
-        
+
         if not source or not target:
             return False
-        
+
         # 写入关联表
         if self._memory_mgr._link_manager:
             return await self._memory_mgr._link_manager.add_link(

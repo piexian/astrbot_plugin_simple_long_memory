@@ -1,6 +1,8 @@
 # 后台记忆整理系统 — 设计规格
 
-> 版本: draft v0.2 | 状态: 实施中 | 分支: feat/maintenance-agent
+> 版本: draft v0.3 | 状态: 实施中 | 基线分支: dev
+> v0.3：结合 Memento 睡眠巩固引擎（/root/work/Memento）修订——两级预筛、裁决缓存、三态裁决、merge supersede 语义、单管线调度
+> v0.3 新增：分支迭代流程（每 Phase 独立分支 → Codex Review → PR dev → 合并后继续下一阶段）
 
 ## 概述
 
@@ -12,6 +14,9 @@
 - **Agent 只建议，Host 执行**：Agent 输出结构化 JSON manifest，插件代码解析后才执行 DB 写入。LLM 幻觉不会直接破坏数据。
 - **结构化输出**：所有 Agent 操作以 JSON manifest 形式返回，不依赖自由文本解析。
 - **可配置提示词**：内置默认模板 + 变量注入，用户可完全覆盖或追加指引。
+- **两级预筛**：候选先经向量余弦 + 已有边排除预筛，再交 LLM 裁决，不全量喂记忆池。
+- **裁决缓存**：候选对按内容 hash 磁盘缓存，同对同模型永不重判。
+- **三态裁决**：LLM 不可用/解析失败返回"不确定"，调用方保持现状，而非当作"无操作"。
 
 ---
 
@@ -59,6 +64,18 @@ CREATE INDEX idx_links_target ON memory_links(target_uri);
 ### 召回时关联记忆的使用
 
 当一条记忆被召回时，查询其关联记忆中 confidence >= 阈值的条目，将关联记忆作为补充上下文一并注入（标记为 `[关联记忆]`）。
+
+### merge 的 supersede 语义（不物理删除）
+
+整理师的 merge 不直接改写或删除旧记忆：
+
+1. 新建一条合并后的记忆（新 URI）
+2. 旧记忆标 `deprecated` + `deprecated_at`，`deprecated_reason="merged"`
+3. `memory_links` 写入 `新 URI --supersedes--> 旧 URI` 边
+4. 旧记忆由 purge 在宽限期后统一物理清除
+
+merge 全程可回滚（删除新记忆 + 去掉 deprecated 标记即可），与 Memento 的
+`status="superseded" + superseded_by` 状态机对齐。
 
 ---
 
@@ -171,7 +188,7 @@ CREATE INDEX idx_links_target ON memory_links(target_uri);
         "hint": "复核整理师和分析师的操作建议，防止误删误改",
         "items": {
           "enabled": {"type": "bool", "default": true, "description": "启用"},
-          "schedule": {"type": "string", "default": "after", "description": "执行时机", "hint": "after=在其他角色完成后自动运行，也可指定时间如 04:00"},
+          "schedule": {"type": "string", "default": "after", "description": "执行时机", "hint": "after=整理管线内顺序执行（推荐），也可指定独立时间如 04:00"},
           "model_id": {"type": "string", "_special": "select_provider", "default": "", "description": "审核模型", "hint": "留空使用全局整理模型"},
           "prompt_override": {"type": "text", "default": "", "description": "自定义提示词（完全覆盖）", "hint": "变量: {proposed_changes} {original_data} {persona_summary}"},
           "prompt_extra": {"type": "text", "default": "", "description": "追加指引"}
@@ -258,10 +275,26 @@ def build_prompt(task_config, default_template, variables):
 
 ### 调度
 
-1. 插件启动时注册 asyncio 定时器，每 60 秒检查一次
-2. 检查当前时间是否在各任务的 schedule 窗口内
-3. 窗口内且距上次执行超过最小间隔 → 触发
-4. `schedule: "after"` 的审核员在其他角色产出 manifest 后自动触发
+1. 使用 `context.cron_manager.add_basic_job()` 注册定时任务，initialize 注册 / terminate 注销，single-flight 防并发
+2. 一次整理周期 = 一条顺序管线，在同一个 cron 触发内跑完：
+   `purge（纯逻辑）→ organizer → analyst → reviewer（复核前两个角色的 manifest）`
+3. 每个周期分配 `session_id`，所有角色共享上下文；周期结束产出 `MaintenanceReport` 落 KV
+4. reviewer 不再独立调度，配置中的 `schedule: "after"` 即"管线内顺序执行"
+
+### LLM 调用约束（借自 Memento SleepEngine）
+
+后台整理的所有 LLM 调用遵守四条硬约束，统一收口在 `maintenance/llm.py`：
+
+1. **唯一入口**：所有 agent 只能经由 `maintenance/llm.py` 调用模型，不直接访问 provider；
+   全局默认使用 `maintenance_model_id`（廉价模型），任务级 `model_id` 可覆盖。
+2. **两级预筛**：候选先经算法层预筛，再交 LLM 裁决，不全量喂记忆池。
+   - organizer 的 merge 候选：向量余弦 ≥ 0.9 的对（破坏性操作，阈值更高）
+   - analyst 的 link 候选：向量余弦 ≥ 0.7 且**排除已有关联边**的对
+   - 每个周期 LLM 调用次数硬上限，超出预算的候选顺延到下周期
+3. **pair-hash 裁决缓存**：按 `sha256(model + task + 规范化对称文本对)` 磁盘缓存裁决结果，
+   同对同模型永不重判；换模型自动失效；进程重启不丢。
+4. **三态裁决**：LLM 返回 `link / merge / none` 之外，另有 `None`（不可用/解析失败/超时）。
+   `None` ≠ `none`：调用方对 `None` 保持现状、不做任何改动，也不写缓存负面结论。
 
 ### 执行管线
 
@@ -424,7 +457,6 @@ Agent 返回修正后的操作结果（展示给管理员）
 主动推送通过 `context.send_message(umo, message_chain)` 发送。
 管理员在目标会话（私聊或群聊）中与机器人交互一次，发送 `/sid` 指令获取当前会话的 UMO，填入配置即可。
 
-
 推送内容示例：
 ```
 📝 记忆整理待审通知
@@ -441,6 +473,9 @@ Agent 返回修正后的操作结果（展示给管理员）
 ```
 
 无待审项时不推送（不骚扰）。
+
+---
+
 ## 对话历史访问
 
 AstrBot 本地存储对话记录。访问方式待确认：
@@ -484,6 +519,7 @@ astrbot_plugin_simple_long_memory/
 │   ├── __init__.py
 │   ├── scheduler.py           # 调度器：时间窗口检查、任务触发
 │   ├── runner.py              # 执行管线：拉取数据→组装prompt→调LLM→解析manifest→执行
+│   ├── llm.py                 # 唯一 LLM 入口：预筛约束 + pair-hash 缓存 + 三态裁决
 │   ├── agents/
 │   │   ├── organizer.py       # 整理师：去重合并、质量精炼
 │   │   ├── analyst.py         # 分析师：关联发现、矛盾检测
@@ -497,17 +533,69 @@ astrbot_plugin_simple_long_memory/
 
 ---
 
+## 分支迭代流程（v0.3 新增）
+
+每个 Phase 独立分支开发，确保代码质量和审查覆盖：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase N 开始                                                   │
+│    │                                                            │
+│    ▼                                                            │
+│  1. 从 dev 新建分支: feat/phase-N-<short-name>                   │
+│    │                                                            │
+│    ▼                                                            │
+│  2. 开发迭代（本地提交，自测通过）                                │
+│    │                                                            │
+│    ▼                                                            │
+│  3. 自评完成 → 提交 Codex Review                                 │
+│    │                                                            │
+│    ▼                                                            │
+│  4. Codex Review 反馈                                            │
+│    │                                                            │
+│    ├── 有 P1 级别问题 → 修复 → 重新 Review                       │
+│    │                                                            │
+│    └── 无 P1 级别问题 → 推送远程                                 │
+│         │                                                       │
+│         ▼                                                       │
+│  5. 创建 PR: feat/phase-N-* → dev                               │
+│    │                                                            │
+│    ▼                                                            │
+│  6. 仓库审查（maintainer review）                                │
+│    │                                                            │
+│    ├── 不符合要求 → 修改 → 重新审查                              │
+│    │                                                            │
+│    └── 符合要求 → 合并到 dev                                     │
+│         │                                                       │
+│         ▼                                                       │
+│  7. Phase N 完成，继续 Phase N+1                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键规则：**
+- 每个 Phase 必须完成 Codex Review 且 **无 P1 级别问题** 才能推送
+- PR 目标分支固定为 `dev`，不直接推送到 `master`
+- 仓库审查通过后才能合并，合并后删除功能分支
+- 所有 Phase 完成后，`dev` 分支整体 PR 到 `master` 作为大版本发布
+
+---
+
 ## 实施阶段
 
-| Phase | 内容 | 依赖 |
-|-------|------|------|
-| 1 | deprecated_at 迁移 + 关联表 + purge + prompt 模板修复 + cron 调度 | 无 |
-| 2 | 执行管线框架 + manifest 校验 + 操作状态机 | Phase 1 |
-| 3 | 整理师（去重合并 + 质量精炼），替代旧 consolidation | Phase 2 |
-| 4 | 分析师（关联发现 + 矛盾检测）+ conversation_manager API | Phase 2 |
-| 5 | 审核员 + 互审模式 + 人工升级 | Phase 3, 4 |
-| 6 | 召回时关联记忆注入（可见性/预算/去重） | Phase 1 |
-| 7 | 配置 schema + i18n + README | 全部 |
+| Phase | 内容 | 依赖 | 状态 |
+|-------|------|------|------|
+| 1 | deprecated_at 迁移 + 关联表 + purge + prompt 模板修复 + cron 调度 | 无 | 🚧 进行中 |
+| 2 | 执行管线框架 + `llm.py` 唯一入口 + manifest 校验 + 三态裁决 + pair-hash 缓存 + MaintenanceReport | Phase 1 | 未开始 |
+| 3 | 整理师（去重合并 + 质量精炼）：余弦 ≥0.9 预筛候选对，merge 走 supersede 语义，替代旧 consolidation | Phase 2 | 未开始 |
+| 4 | 分析师（关联发现 + 矛盾检测）：余弦 ≥0.7 预筛、排除已连边、每周期调用上限，conversation_manager API | Phase 2 | 未开始 |
+| 5 | 审核员 + 互审模式 + 人工升级 | Phase 3, 4 | 未开始 |
+| 6 | 召回时关联记忆注入（可见性/预算/去重） | Phase 1 | 未开始 |
+| 7 | 配置 schema + i18n + README | 全部 | 未开始 |
+
+**Phase 1 剩余项：**
+- 根 `prompts.py`（提取/检索 prompt）从 `str.format` 迁移到 `string.Template`
+- `main.py` 补 `maintenance_tasks` template_list 配置 schema
+- forget / clear / rebuild 路径统一 link 级联清理（目前只有 purge 做了级联）
 
 ---
 
@@ -567,3 +655,21 @@ astrbot_plugin_simple_long_memory/
 **对话历史**
 - 使用 `context.conversation_manager` API，不直接读 SQLite
 - 按 UMO 限定拉取范围，明确截断顺序（时间 → 轮数 → 字符数）
+
+---
+
+## v0.3 修订记录（结合 Memento 分析）
+
+参考 `/root/work/Memento` 的 SleepEngine / LLMClient / ConceptGraph，吸收以下设计：
+
+| 来源 | 吸收的设计 | 落地位置 |
+|------|-----------|---------|
+| `engine/sleep.py::_llm_curate_edges` | 候选对向量预筛 + 排除已有边 + 每周期调用上限 | Phase 4 分析师 |
+| `engine/sleep.py::_fuse_duplicates` | merge 预筛阈值高于 link；merge 走 supersede 状态机 | Phase 3 整理师 |
+| `engine/llm_client.py` | 唯一 LLM 入口、pair-hash 磁盘缓存、三态裁决 | Phase 2 `maintenance/llm.py` |
+| `engine/sleep.py::SleepReport` | 每周期结构化报告落 KV | Phase 2 MaintenanceReport |
+| `concept/concept_graph.py::dedup_concept_keywords` | specificity 降序 + 余弦贪心归入（备选，供 organizer 预筛参考） | Phase 3 |
+
+明确不吸收的：
+- 图扩散召回（`engine/diffusion.py`）：对话场景召回预算紧，单跳 ≤3 条已够，不做递归扩散
+- 概念副节点图：与插件的扁平记忆模型不匹配，属于过度设计
