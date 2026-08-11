@@ -23,6 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
+from .maintenance.scheduler import MaintenanceScheduler
 from .memory_manager import MemoryManager, normalize_domain
 from .memory_protocol import (
     MemoryScope,
@@ -43,6 +44,8 @@ from .prompts import (
     MEMORY_CONSOLIDATION_PROMPT,
     MEMORY_EXTRACTION_PROMPT,
     RECALL_QUERY_PROMPT,
+    VALID_TOOL_DOMAINS,
+    VALID_TOOL_SCOPES,
 )
 from .prompts import (
     sanitize_memory_content as _sanitize_memory_content,
@@ -375,6 +378,7 @@ class MemoryPlugin(Star):
         self._last_ttl_expire = 0.0
         self._last_consolidation = 0.0
         self._background_tasks: set[asyncio.Task] = set()
+        self._scheduler: MaintenanceScheduler | None = None
 
     async def initialize(self):
         """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
@@ -396,6 +400,7 @@ class MemoryPlugin(Star):
         try:
             await self.memory_mgr.connect_kb()
             logger.info("[简单长期记忆] 插件初始化成功")
+            await self._start_scheduler()
         except Exception:
             # 首次启动时 KB 尚未就绪，由 on_astrbot_loaded 钩子处理
             logger.info("[简单长期记忆] 配置校验通过，等待知识库就绪")
@@ -422,6 +427,8 @@ class MemoryPlugin(Star):
         if not connected:
             self.memory_mgr = None
             return
+
+        await self._start_scheduler()
 
     async def _recover_interrupted_rebuild(self) -> None:
         """启动时检测并恢复上次中断的重建
@@ -503,9 +510,27 @@ class MemoryPlugin(Star):
 
     async def terminate(self):
         """插件销毁"""
+        if self._scheduler:
+            await self._scheduler.stop()
+            self._scheduler = None
         self._request_snapshots.clear()
         self._session_counters.clear()
         logger.info("[简单长期记忆] 插件已卸载")
+
+    async def _start_scheduler(self) -> None:
+        """KB 连接后启动后台整理调度器。"""
+        if not self.memory_mgr or not self.memory_mgr.is_kb_connected:
+            return
+        if self._scheduler:
+            return  # 已启动
+        self._scheduler = MaintenanceScheduler(
+            context=self.context,
+            memory_mgr=self.memory_mgr,
+            config=self.config,
+            kv_put=self.put_kv_data,
+            kv_get=self.get_kv_data,
+        )
+        await self._scheduler.start()
 
     def _get_cmd_prefix(self) -> str:
         """从 AstrBot 配置读取命令前缀，默认 /"""
@@ -671,6 +696,9 @@ class MemoryPlugin(Star):
             return
         if not self.config.get("memory_consolidation_enabled", True):
             return
+        # 后台整理启用时禁用旧巩固，避免并发竞态（spec: 旧 consolidation 迁移）
+        if self.config.get("maintenance_enabled", False):
+            return
         min_age_days = _read_positive_int(
             self.config.get("consolidation_min_age_days", 14), 14
         )
@@ -698,7 +726,7 @@ class MemoryPlugin(Star):
         if not joined.strip():
             return
         try:
-            prompt = MEMORY_CONSOLIDATION_PROMPT.format(memories=joined)
+            prompt = MEMORY_CONSOLIDATION_PROMPT.substitute(memories=joined)
             llm_response = await self.context.llm_generate(
                 chat_provider_id=provider_id, prompt=prompt
             )
@@ -713,11 +741,7 @@ class MemoryPlugin(Star):
             for c in candidates
             if c.get("metadata", {}).get("uri")
         ]
-        # 先标记原文 deprecated+compressed：成功后再写摘要，避免 mark 失败导致下轮重复巩固累积
-        marked = await mgr.mark_consolidated(source_uris)
-        if marked <= 0:
-            logger.debug("[简单长期记忆] 巩固：原文标记 0 条，跳过摘要写入")
-            return
+        # 先写摘要再标记源（避免 store 失败后源已 deprecated 但无替代）
         try:
             await mgr.store_memory(
                 event=event,
@@ -728,11 +752,15 @@ class MemoryPlugin(Star):
                 importance=4,
                 memory_scope=MemoryScope.PERSONAL,
             )
-            logger.info(
-                f"[简单长期记忆] 巩固 {len(candidates)} 条 → 1 条摘要，标记原文 {marked} 条"
-            )
         except Exception as e:
-            logger.warning(f"[简单长期记忆] 巩固写入失败: {e}")
+            logger.warning(f"[简单长期记忆] 巩固摘要写入失败，保留原文: {e}")
+            return
+        marked = await mgr.mark_consolidated(source_uris)
+        if marked <= 0:
+            logger.debug("[简单长期记忆] 巩固：原文标记 0 条（摘要已写入）")
+        logger.info(
+            f"[简单长期记忆] 巩固 {len(candidates)} 条 → 1 条摘要，标记原文 {marked} 条"
+        )
 
     def _cleanup_expired_snapshots(self, current_time: float | None = None) -> None:
         """清理过期的请求快照"""
@@ -861,7 +889,7 @@ class MemoryPlugin(Star):
         if not provider_id:
             return raw_query
 
-        prompt = RECALL_QUERY_PROMPT.format(context=raw_query[:1000])
+        prompt = RECALL_QUERY_PROMPT.substitute(context=raw_query[:1000])
         try:
             timeout = _clamp_timeout(
                 self.config.get(
@@ -999,7 +1027,7 @@ class MemoryPlugin(Star):
             parsed_umo = UMOInfo.parse(event.unified_msg_origin)
 
             # 调用 LLM 提取记忆
-            prompt = MEMORY_EXTRACTION_PROMPT.format(
+            prompt = MEMORY_EXTRACTION_PROMPT.substitute(
                 platform_id=parsed_umo.platform_id,
                 session_type=parsed_umo.session_type,
                 session_id=parsed_umo.session_id,
@@ -1513,6 +1541,85 @@ class MemoryPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"重建失败: {e}")
 
+    @memory_group.command("review")
+    async def cmd_review(self, event: AstrMessageEvent):
+        """争议审查 /memory review [approve|reject|clear] [id]"""
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可用")
+            return
+        args = _parse_command_args(event, "memory review").strip().split()
+        action = args[0] if args else "list"
+
+        if action == "list":
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            pending = [q for q in queue if q.get("status") == "pending"]
+            if not pending:
+                yield event.plain_result("✅ 无待审争议项")
+                return
+            lines = [f"📝 待审争议 ({len(pending)} 条)："]
+            for item in pending:
+                lines.append(
+                    f"#{item['id']} [{item.get('op_type', '?')}] "
+                    f"{item.get('verdict_reason', '')} "
+                    f"({item.get('created_at', '')})"
+                )
+            lines.append("\n/memory review approve <id> 批准")
+            lines.append("/memory review reject <id> 废案")
+            lines.append("/memory review clear 清空")
+            yield event.plain_result("\n".join(lines))
+
+        elif action == "clear":
+            await self.put_kv_data("maintenance_pending_review", [])
+            yield event.plain_result("✅ 待审队列已清空")
+
+        elif action in ("approve", "reject"):
+            if len(args) < 2:
+                yield event.plain_result(f"用法: /memory review {action} <id>")
+                return
+            try:
+                target_id = int(args[1])
+            except ValueError:
+                yield event.plain_result("id 必须是数字")
+                return
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            found = None
+            for item in queue:
+                if item.get("id") == target_id and item.get("status") == "pending":
+                    found = item
+                    break
+            if not found:
+                yield event.plain_result(f"未找到待审项 #{target_id}")
+                return
+            if action == "reject":
+                found["status"] = "rejected"
+                await self.put_kv_data("maintenance_pending_review", queue)
+                yield event.plain_result(f"🚫 #{target_id} 已废案")
+            elif action == "approve":
+                # 先执行，成功后才标记 approved（失败保留可重试）
+                # execute_approved 与后台周期阶段 4 互斥，避免并发写竞态
+                runner = self._scheduler.runner if self._scheduler else None
+                if not runner:
+                    yield event.plain_result(f"⚠️ #{target_id} 调度器未运行，无法执行")
+                    return
+                try:
+                    ok = await runner.execute_approved(found.get("op", {}))
+                    if ok:
+                        found["status"] = "approved"
+                        await self.put_kv_data("maintenance_pending_review", queue)
+                        yield event.plain_result(f"✅ #{target_id} 已批准并执行")
+                    else:
+                        found["status"] = "failed"
+                        await self.put_kv_data("maintenance_pending_review", queue)
+                        yield event.plain_result(
+                            f"⚠️ #{target_id} 执行失败，已标记 failed"
+                        )
+                except Exception as e:
+                    yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
+        else:
+            yield event.plain_result(
+                "用法: /memory review [list|approve <id>|reject <id>|clear]"
+            )
+
     async def _run_memory_test(self, event: AstrMessageEvent) -> str:
         """执行一次记忆写入-读取测试并返回报告"""
         test_content = "memory_test_probe_这是一条测试记忆"
@@ -1566,16 +1673,43 @@ class MemoryPlugin(Star):
     # ==================== LLM 工具 ====================
 
     @filter.llm_tool(name="memory_recall")
-    async def tool_recall(self, event: AstrMessageEvent, query: str) -> str:
+    async def tool_recall(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        domain: str = "",
+        scope: str = "",
+    ) -> str:
         """Search long-term memory for relevant information
 
         Args:
             query(string): search keywords or question
+            domain(string): optional filter by memory domain (user_profile/preferences/facts/events/context)
+            scope(string): optional filter by memory scope (personal/group/conversation/global)
         """
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
-        memories = await self.memory_mgr.recall_memories(event, query)
+        # 参数校验：错误即报错，不静默降级
+        domain_filter: str | None = None
+        if domain:
+            domain_lower = domain.lower().strip()
+            if domain_lower not in VALID_TOOL_DOMAINS:
+                valid = ", ".join(sorted(VALID_TOOL_DOMAINS))
+                return f"Error: invalid domain '{domain}'. Valid domains: {valid}"
+            domain_filter = domain_lower
+
+        scope_filter: str | None = None
+        if scope:
+            scope_lower = scope.lower().strip()
+            if scope_lower not in (*VALID_TOOL_SCOPES, MemoryScope.GLOBAL):
+                valid = ", ".join(sorted((*VALID_TOOL_SCOPES, MemoryScope.GLOBAL)))
+                return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+            scope_filter = scope_lower
+
+        memories = await self.memory_mgr.recall_memories(
+            event, query, domain=domain_filter, memory_scope=scope_filter
+        )
         if not memories:
             return "No relevant memories found"
 
@@ -1589,6 +1723,8 @@ class MemoryPlugin(Star):
         content: str,
         memory_type: str = "fact",
         disclosure: str = "",
+        importance: int = 3,
+        scope: str = "personal",
     ) -> str:
         """Store information to long-term memory
 
@@ -1596,15 +1732,46 @@ class MemoryPlugin(Star):
             content(string): content to remember
             memory_type(string): memory type (fact/preference/event/context)
             disclosure(string): condition description for triggering recall
+            importance(int): importance level 1-5, where 5 is most important
+            scope(string): memory scope (personal/group/conversation)
         """
         if not self.memory_mgr:
             return "Memory plugin not initialized"
+
+        # 参数校验：错误即报错，不静默降级
+        mem_type_lower = memory_type.lower().strip()
+        if mem_type_lower not in ALLOWED_MEMORY_TYPES:
+            valid = ", ".join(sorted(ALLOWED_MEMORY_TYPES))
+            return f"Error: invalid memory_type '{memory_type}'. Valid types: {valid}"
+
+        scope_lower = scope.lower().strip()
+        if scope_lower == MemoryScope.GLOBAL:
+            return (
+                "Error: scope 'global' is not allowed here. "
+                "Use the memory_store_global tool instead."
+            )
+        if scope_lower not in VALID_TOOL_SCOPES:
+            valid = ", ".join(sorted(VALID_TOOL_SCOPES))
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+
+        try:
+            importance_val = int(importance)
+        except (TypeError, ValueError):
+            return f"Error: importance must be an integer between 1 and 5, got '{importance}'"
+        if importance_val < 1 or importance_val > 5:
+            return f"Error: importance must be between 1 and 5, got {importance_val}"
+
+        # group scope 必须在群聊中使用
+        if scope_lower == MemoryScope.GROUP:
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            if parsed_umo.session_type != "group":
+                return "Error: scope 'group' can only be used in group chats"
 
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
 
-        domain = normalize_domain(memory_type)
+        domain = normalize_domain(mem_type_lower)
         uri = str(MemoryURI.generate(domain))
 
         await self.memory_mgr.store_memory(
@@ -1614,8 +1781,64 @@ class MemoryPlugin(Star):
             uri=uri,
             memory_type=MemoryType.NORMAL,
             disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
+            importance=importance_val,
+            memory_scope=scope_lower,
         )
         return f"Memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_update")
+    async def tool_update(
+        self,
+        event: AstrMessageEvent,
+        uri: str,
+        content: str,
+        disclosure: str = "",
+    ) -> str:
+        """Update an existing memory by URI, preserving its domain, importance and scope
+
+        Args:
+            uri(string): URI of the memory to update
+            content(string): new content to replace the old memory
+            disclosure(string): optional new condition description for triggering recall
+        """
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        if not uri or not uri.strip():
+            return "Error: uri is required"
+
+        # 查找旧记忆（按 user_id 隔离，找不到或不属于自己都报错）
+        old_memory = await self.memory_mgr.get_memory_by_uri(event, uri.strip())
+        if not old_memory:
+            return f"Error: memory not found or not yours: {uri}"
+
+        old_meta = old_memory.get("metadata", {})
+
+        # global 记忆不允许通过此工具修改，必须走管理员确认路径
+        if old_meta.get("memory_scope") == MemoryScope.GLOBAL:
+            return (
+                "Error: global memories cannot be updated via this tool. "
+                "Use /memory commands with admin confirmation instead."
+            )
+
+        content = _sanitize_memory_content(content)
+        if not content:
+            return "Invalid memory content"
+
+        # 使用 replace_memory 保留完整原始 metadata（租户/作用域/归属/关联）
+        new_disclosure = (
+            _sanitize_memory_content(disclosure)[:200] if disclosure else None
+        )
+        try:
+            new_uri = await self.memory_mgr.replace_memory(
+                old_metadata=old_meta,
+                new_content=content,
+                new_disclosure=new_disclosure,
+            )
+        except Exception as e:
+            return f"Error: failed to update memory: {e}"
+
+        return f"Memory updated: {uri} -> {new_uri}"
 
     @filter.llm_tool(name="memory_store_global")
     async def tool_store_global(
@@ -1644,11 +1867,17 @@ class MemoryPlugin(Star):
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
+        # 参数校验
+        mem_type_lower = memory_type.lower().strip()
+        if mem_type_lower not in ALLOWED_MEMORY_TYPES:
+            valid = ", ".join(sorted(ALLOWED_MEMORY_TYPES))
+            return f"Error: invalid memory_type '{memory_type}'. Valid types: {valid}"
+
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
 
-        domain = normalize_domain(memory_type)
+        domain = normalize_domain(mem_type_lower)
         uri = str(MemoryURI.generate(domain))
 
         await self.memory_mgr.store_memory(

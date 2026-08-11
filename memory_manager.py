@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
 
+from .maintenance.links import MemoryLinkManager
 from .memory_protocol import (
     MemoryMetadata,
     MemoryScope,
@@ -170,6 +171,8 @@ class MemoryManager:
         self._kv_put = kv_put
         self._kv_get = kv_get
         self._kv_delete = kv_delete
+        # 关联表管理器（connect_kb 后初始化）
+        self._link_manager: MemoryLinkManager | None = None
 
     # ---------- public state accessors ----------
     @property
@@ -186,6 +189,24 @@ class MemoryManager:
     def is_rebuilding(self) -> bool:
         """当前是否正在执行重建/迁移。"""
         return self._rebuilding
+
+    @property
+    def link_manager(self) -> MemoryLinkManager | None:
+        """关联表管理器（KB 连接后可用）"""
+        return self._link_manager
+
+    async def purge_deprecated(self, after_days: int = 7) -> dict[str, int]:
+        """物理清理废弃超期记忆（含关联边级联清理）。"""
+        if not self._kb_helper:
+            return {"purged": 0, "links_cleaned": 0}
+        from .maintenance.purge import purge_deprecated_memories
+
+        return await purge_deprecated_memories(
+            vec_db=self.vec_db,
+            kb_helper=self._kb_helper,
+            link_manager=self._link_manager,
+            after_days=after_days,
+        )
 
     def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
         """从外部恢复重建期间未落盘的写入缓冲（启动恢复用）"""
@@ -221,6 +242,10 @@ class MemoryManager:
         self._kb_helper = kb
         logger.info(f"[简单长期记忆] 已连接知识库: {self._kb_name}")
         await self._migrate_patch_chunk_index()
+        await self._migrate_patch_deprecated_at()
+        # 初始化关联表
+        self._link_manager = MemoryLinkManager(self.vec_db)
+        await self._link_manager.ensure_table()
 
     async def _migrate_patch_chunk_index(self) -> None:
         """迁移补丁：为缺少 chunk_index 字段的旧记忆条目写入默认值 0。
@@ -251,6 +276,41 @@ class MemoryManager:
                     )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 迁移补丁执行失败（不影响功能）: {e}")
+
+    async def _migrate_patch_deprecated_at(self) -> None:
+        """迁移补丁：为已废弃但缺少 deprecated_at 的记忆回填时间戳。
+
+        旧版废弃操作只写 deprecated=1，没有记录废弃时间。
+        回填迁移执行时间（而非 created_at），确保宽限期从迁移时刻开始计算，
+        不会导致历史废弃记忆被立即清理。
+        """
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session, session.begin():
+                from sqlalchemy import text as sa_text
+
+                # 用 Python UTC ISO 格式，与 purge cutoff 的 isoformat() 保持一致
+                now_iso = datetime.now(timezone.utc).isoformat()
+                result = await session.execute(
+                    sa_text(
+                        "UPDATE documents "
+                        "SET metadata = json_set(metadata, '$.deprecated_at', "
+                        "    :now_iso) "
+                        "WHERE json_extract(metadata, '$.deprecated') = 1 "
+                        "  AND json_extract(metadata, '$.deprecated_at') IS NULL "
+                        "  AND json_extract(metadata, '$.is_memory_record') = 1"
+                    ),
+                    {"now_iso": now_iso},
+                )
+                patched = result.rowcount
+                if patched:
+                    logger.info(
+                        f"[简单长期记忆] 迁移补丁：已为 {patched} 条废弃记忆回填 deprecated_at"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"[简单长期记忆] deprecated_at 迁移补丁失败（不影响功能）: {e}"
+            )
 
     @property
     def vec_db(self):
@@ -317,7 +377,9 @@ class MemoryManager:
             return 0
         kb_id = self._kb_helper.kb.kb_id
         cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
-        set_clause = "json_set(metadata, '$.deprecated', 1)"
+        set_clause = (
+            "json_set(metadata, '$.deprecated', 1, '$.deprecated_at', :now_iso)"
+        )
         where_clause = (
             "json_extract(metadata,'$.is_memory_record') = 1 "
             "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
@@ -326,7 +388,11 @@ class MemoryManager:
             "AND json_extract(metadata,'$.memory_type') != 'permanent' "
             "AND json_extract(metadata,'$.memory_scope') != 'global'"
         )
-        params: dict[str, Any] = {"kb_id": kb_id, "cutoff": cutoff_iso}
+        params: dict[str, Any] = {
+            "kb_id": kb_id,
+            "cutoff": cutoff_iso,
+            "now_iso": datetime.now(timezone.utc).isoformat(),
+        }
         return await self._exec_metadata_update(set_clause, where_clause, params)
 
     async def fetch_consolidation_candidates(
@@ -393,17 +459,24 @@ class MemoryManager:
         uris = [u for u in uris if u]
         if not uris:
             return 0
-        set_clause = "json_set(metadata, '$.deprecated', 1, '$.compressed', 1)"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        set_clause = (
+            "json_set(metadata, '$.deprecated', 1, '$.compressed', 1, "
+            "'$.deprecated_at', :now_iso)"
+        )
         placeholders = ",".join(f":u{i}" for i in range(len(uris)))
         where_clause = (
             f"json_extract(metadata,'$.uri') IN ({placeholders}) "
             "AND json_extract(metadata,'$.is_memory_record') = 1"
         )
         params: dict[str, Any] = {f"u{i}": u for i, u in enumerate(uris)}
+        params["now_iso"] = now_iso
         return await self._exec_metadata_update(set_clause, where_clause, params)
 
-    def _rerank_by_signal(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """根据 importance/recall_count/recency 对召回结果二次加权排序（P0.2）。
+    def _rerank_by_signal(
+        self, memories: list[dict[str, Any]], query: str = ""
+    ) -> list[dict[str, Any]]:
+        """根据 importance/recall_count/recency/disclosure 对召回结果二次加权排序。
 
         纯本地计算，不依赖 AstrBot。权重可经配置调整。
         """
@@ -414,6 +487,15 @@ class MemoryManager:
         w_importance = self.config.get("recall_weight_importance", 0.4)
         w_frequency = self.config.get("recall_weight_frequency", 0.3)
         w_recency = self.config.get("recall_weight_recency", 0.3)
+        disclosure_bonus = self.config.get("recall_disclosure_bonus", 0.25)
+
+        # 预计算 query tokens 用于 disclosure 匹配
+        query_tokens: set[str] = set()
+        if query and disclosure_bonus > 0:
+            tokens = self._tokenize_query(query)
+            if not tokens:
+                tokens = [t for t in query.lower().split() if len(t) >= 2]
+            query_tokens = set(tokens)
 
         def _score(mem: dict[str, Any]) -> float:
             meta = mem.get("metadata", {})
@@ -439,11 +521,21 @@ class MemoryManager:
                     recency = math.exp(-max(0.0, now - ts) / half_life)
                 except (ValueError, TypeError):
                     recency = 0.5
-            return (
+            score = (
                 w_importance * importance
                 + w_frequency * frequency
                 + w_recency * recency
             )
+            # disclosure 匹配加成：query 关键词与 disclosure 文本有交集时加分
+            if query_tokens:
+                disclosure = str(meta.get("disclosure", "")).lower()
+                if disclosure:
+                    disc_tokens = self._tokenize_query(disclosure)
+                    if not disc_tokens:
+                        disc_tokens = [t for t in disclosure.split() if len(t) >= 2]
+                    if query_tokens & set(disc_tokens):
+                        score += disclosure_bonus
+            return score
 
         return sorted(memories, key=_score, reverse=True)
 
@@ -910,6 +1002,140 @@ class MemoryManager:
         logger.debug(f"[简单长期记忆] 存储记忆: {uri}, 用户: {metadata['user_id']}")
         return uri
 
+    async def replace_memory(
+        self,
+        old_metadata: dict[str, Any],
+        new_content: str,
+        new_disclosure: str | None = None,
+    ) -> str:
+        """替换记忆内容，完整保留原始租户/作用域/归属元数据。
+
+        与 store_memory 不同，此方法不从 event 重建 owner/session/UMO，
+        而是直接复制旧 metadata，仅更新 content/disclosure/version/URI。
+        先写入新记录，成功后再删除旧记录。
+
+        Args:
+            old_metadata: 旧记忆的完整 metadata dict
+            new_content: 新的记忆内容
+            new_disclosure: 新的触发条件（None 表示保留旧值）
+
+        Returns:
+            新的记忆 URI
+
+        Raises:
+            RuntimeError: 写入新记录失败
+        """
+        old_domain = old_metadata.get("domain", "facts")
+        old_uri = old_metadata.get("uri", "")
+        new_uri = str(MemoryURI.generate(old_domain))
+        new_doc_id = str(uuid.uuid4())
+
+        # 构建新 metadata：复制全部旧字段，只更新内容相关字段
+        new_metadata = {**old_metadata}
+        new_metadata["uri"] = new_uri
+        new_metadata["kb_doc_id"] = new_doc_id
+        new_metadata["memory_content"] = new_content
+        new_metadata["version"] = old_metadata.get("version", 1) + 1
+        new_metadata["deprecated"] = False
+        if new_disclosure is not None:
+            new_metadata["disclosure"] = new_disclosure
+        # kb_id 保持当前连接的 KB
+        if self._kb_helper:
+            new_metadata["kb_id"] = self._kb_helper.kb.kb_id
+
+        formatted_content = format_memory_content(new_content, new_metadata)
+
+        # 先写入新记录
+        await self.vec_db.insert(
+            content=formatted_content,
+            metadata=new_metadata,
+            id=new_doc_id,
+        )
+
+        # 注册 KB 文档
+        try:
+            await self._register_kb_document(
+                new_doc_id, new_uri, len(formatted_content)
+            )
+            await self._sync_kb_stats()
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] replace KB 文档注册失败: {e}")
+
+        # 删除旧记录（向量 + KB 文档）
+        # 删除旧向量失败时中止，避免数据不一致
+        old_doc_id = old_metadata.get("kb_doc_id", "")
+        if old_doc_id:
+            vector_deleted = False
+            try:
+                await self.vec_db.delete_documents(
+                    metadata_filters={"kb_doc_id": old_doc_id}
+                )
+                vector_deleted = True
+            except Exception as e:
+                logger.error(f"[简单长期记忆] replace 删除旧向量失败，中止操作: {e}")
+                # 尝试回滚：删除刚写入的新记录（向量 + KB 文档）
+                try:
+                    await self.vec_db.delete_documents(
+                        metadata_filters={"kb_doc_id": new_doc_id}
+                    )
+                    logger.info(
+                        f"[简单长期记忆] replace 回滚成功，已删除新向量记录: {new_doc_id}"
+                    )
+                except Exception as rollback_err:
+                    logger.error(f"[简单长期记忆] replace 回滚向量失败: {rollback_err}")
+
+                # 同时注销 KB 文档，避免 dangling entry
+                try:
+                    await self._unregister_kb_documents([new_doc_id])
+                    await self._sync_kb_stats()
+                    logger.info(
+                        f"[简单长期记忆] replace 回滚成功，已注销 KB 文档: {new_doc_id}"
+                    )
+                except Exception as kb_err:
+                    logger.error(f"[简单长期记忆] replace 回滚 KB 文档失败: {kb_err}")
+
+                raise RuntimeError(f"replace 失败：无法删除旧向量 {old_doc_id}: {e}")
+            # 只有向量删除成功后才继续清理 KB 文档
+            if vector_deleted:
+                try:
+                    await self._unregister_kb_documents([old_doc_id])
+                    await self._sync_kb_stats()
+                except Exception as e:
+                    logger.warning(f"[简单长期记忆] replace 删除旧 KB 文档失败: {e}")
+        # 迁移关联边
+        if self._link_manager and old_uri:
+            try:
+                out_links = await self._link_manager.get_links_for_uri(
+                    old_uri, injectable_only=False, limit=0
+                )
+                in_links = await self._link_manager.get_links_to_uri(
+                    old_uri, injectable_only=False, limit=0
+                )
+                for link in out_links:
+                    await self._link_manager.add_link(
+                        new_uri,
+                        link["target_uri"],
+                        link["relation_type"],
+                        reason=link.get("reason", ""),
+                        confidence=link.get("confidence", 1.0),
+                        created_by="replace",
+                    )
+                for link in in_links:
+                    await self._link_manager.add_link(
+                        link["source_uri"],
+                        new_uri,
+                        link["relation_type"],
+                        reason=link.get("reason", ""),
+                        confidence=link.get("confidence", 1.0),
+                        created_by="replace",
+                    )
+                await self._link_manager.delete_links_for_uris([old_uri])
+            except Exception as e:
+                logger.warning(f"[简单长期记忆] replace 关联迁移失败: {e}")
+
+        logger.debug(f"[简单长期记忆] 替换记忆: {old_uri} -> {new_uri}")
+        return new_uri
+
     async def recall_memories(
         self,
         event: AstrMessageEvent,
@@ -960,8 +1186,8 @@ class MemoryManager:
             results = self._filter_visible_shared_personal(event, results)
             memories = self._dedupe_memories(results)[:top_k]
 
-        # P0.2 信号加权重排（importance / recall_count / recency）
-        memories = self._rerank_by_signal(memories)
+        # P0.2 信号加权重排（importance / recall_count / recency / disclosure 匹配）
+        memories = self._rerank_by_signal(memories, query=query)
         # P0.1 召回反馈：仅注入路径递增 recall_count（避免 search/selftest/工具调用污染频次信号）
         if bump:
             recalled_uris = [
@@ -970,8 +1196,184 @@ class MemoryManager:
                 if m.get("metadata", {}).get("uri")
             ]
             await self._bump_recall_stats(recalled_uris)
+
+        # 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
+        if self._link_manager:
+            linked_memories = await self._inject_linked_memories(
+                memories, event, all_users=all_users
+            )
+            if linked_memories:
+                memories.extend(linked_memories)
+                # 关联注入后截断到 top_k，避免超出调用方预期
+                if top_k and len(memories) > top_k:
+                    memories = memories[:top_k]
         logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
         return memories
+
+    async def _inject_linked_memories(
+        self,
+        memories: list[dict[str, Any]],
+        event: AstrMessageEvent | None = None,
+        all_users: bool = False,
+    ) -> list[dict[str, Any]]:
+        """注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）。
+
+        规则：
+        - 只召回未 deprecated 的关联记忆
+        - 单跳（不递归），最多 3 条关联记忆
+        - 总注入 token 预算上限（关联记忆 + 主记忆合计不超过 max_length）
+        - contradicts/supersedes 关系不注入召回，仅用于后台分析
+        """
+        if not self._link_manager:
+            return []
+
+        # 收集所有主记忆的 URI
+        main_uris = [
+            m.get("metadata", {}).get("uri")
+            for m in memories
+            if m.get("metadata", {}).get("uri")
+        ]
+        if not main_uris:
+            return []
+
+        # 查询每条主记忆的关联（单跳，出边 + 入边，只取可注入类型）
+        linked_uris: set[str] = set()
+        for uri in main_uris[:5]:  # 限制查询数量，避免过多 DB 查询
+            try:
+                # 出边：uri → target
+                out_links = await self._link_manager.get_links_for_uri(
+                    uri=uri,
+                    injectable_only=True,
+                    min_confidence=0.5,
+                    limit=3,
+                )
+                for link in out_links:
+                    target_uri = link.get("target_uri", "")
+                    if target_uri and target_uri not in main_uris:
+                        linked_uris.add(target_uri)
+                # 入边：source → uri（对称关系反向查询）
+                in_links = await self._link_manager.get_links_to_uri(
+                    uri=uri,
+                    injectable_only=True,
+                    min_confidence=0.5,
+                    limit=3,
+                )
+                for link in in_links:
+                    source_uri = link.get("source_uri", "")
+                    if source_uri and source_uri not in main_uris:
+                        linked_uris.add(source_uri)
+            except Exception as e:
+                logger.debug(f"[简单长期记忆] 查询关联失败: {uri}, {e}")
+        if not linked_uris:
+            return []
+
+        # 拉取关联记忆内容（限制数量）
+        linked_memories: list[dict[str, Any]] = []
+        max_linked = 3  # 最多 3 条关联记忆
+        for uri in list(linked_uris)[:max_linked]:
+            try:
+                # 通过 URI 查询记忆
+                mem = await self._get_memory_by_uri(uri)
+                if mem and not mem.get("metadata", {}).get("deprecated", False):
+                    # 验证可见性，确保关联记忆对当前用户可见（all_users 模式下跳过）
+                    if (
+                        event
+                        and not all_users
+                        and not self._is_memory_visible(event, mem)
+                    ):
+                        logger.debug(f"[简单长期记忆] 关联记忆不可见，跳过: {uri}")
+                        continue
+                    # 标记为关联记忆
+                    mem["metadata"]["_is_linked"] = True
+                    linked_memories.append(mem)
+            except Exception as e:
+                logger.debug(f"[简单长期记忆] 拉取关联记忆失败: {uri}, {e}")
+
+        return linked_memories
+
+    async def _get_memory_by_uri(self, uri: str) -> dict[str, Any] | None:
+        """通过 URI 查询单条记忆。
+
+        使用 document_storage.get_documents() 直接查询，
+        避免语义搜索的不确定性。
+        """
+        try:
+            if not self.vec_db or not hasattr(self.vec_db, "document_storage"):
+                logger.warning("[简单长期记忆] document_storage 不可用")
+                return None
+
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                result = await session.execute(
+                    sa_text(
+                        "SELECT doc_id, text, metadata FROM documents "
+                        "WHERE json_extract(metadata, '$.uri') = :uri "
+                        "AND json_extract(metadata, '$.is_memory_record') = 1 "
+                        "AND json_extract(metadata, '$.deprecated') = 0 "
+                        "LIMIT 1"
+                    ),
+                    {"uri": uri},
+                )
+                row = result.first()
+                if row:
+                    import json
+
+                    meta = (
+                        json.loads(row.metadata)
+                        if isinstance(row.metadata, str)
+                        else row.metadata
+                    )
+                    return {
+                        "doc_id": row.doc_id,
+                        "content": row.text,
+                        "metadata": meta,
+                    }
+                return None
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 查询记忆失败: {uri}, {e}")
+            return None
+
+    def _is_memory_visible(
+        self, event: AstrMessageEvent, memory: dict[str, Any]
+    ) -> bool:
+        """检查记忆对当前事件是否可见。
+
+        确保关联记忆注入时验证可见性，避免跨 scope 泄露。
+        """
+        meta = memory.get("metadata", {})
+        scope = meta.get("memory_scope", MemoryScope.PERSONAL)
+        owner = meta.get("owner_user_id", "")
+
+        # global 记忆所有人可见
+        if scope == MemoryScope.GLOBAL:
+            return True
+
+        # 获取当前用户信息（build_user_id 统一命名空间）
+        current_user = self._current_owner_user_id(event)
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        # personal 记忆：仅 owner 可见（包括多 owner 共享场景）
+        if scope == MemoryScope.PERSONAL:
+            # 单 owner：直接比较
+            if owner == current_user:
+                return True
+            # 多 owner 共享：检查 owner_user_ids
+            return self._is_visible_shared_personal(event, meta)
+
+        # group 记忆：同群可见（session_id 含群聊标识）
+        if scope == MemoryScope.GROUP:
+            mem_session = meta.get("owner_session_id", "")
+            current_session = build_session_id(parsed.platform_id, parsed.session_id)
+            return mem_session == current_session
+
+        # conversation 记忆：精确匹配完整 UMO，避免私聊/群聊 ID 碰撞
+        if scope == MemoryScope.CONVERSATION:
+            mem_umo = meta.get("umo", "")
+            return bool(mem_umo) and mem_umo == event.unified_msg_origin
+
+        # 默认不可见
+        return False
 
     def _build_recall_filters(
         self,
@@ -1039,17 +1441,25 @@ class MemoryManager:
                 }
             )
 
-        # P0.3 稀疏检索（FTS5）+ RRF 融合
+        # P0.3 稀疏检索（FTS5）
+        sparse_memories: list[dict[str, Any]] = []
         if self.config.get("recall_sparse_fusion", True):
             sparse_memories = await self._sparse_retrieve(query, top_k, filters)
-            memories = (
-                self._rrf_fuse(dense_memories, sparse_memories, limit=top_k)
-                if sparse_memories
-                else dense_memories
-            )
-        else:
-            memories = dense_memories
 
+        # Disclosure 精确匹配通道
+        disclosure_memories = await self._disclosure_retrieve(query, top_k, filters)
+
+        # RRF 多通道融合（空列表自动跳过）
+        channels = [dense_memories]
+        if sparse_memories:
+            channels.append(sparse_memories)
+        if disclosure_memories:
+            channels.append(disclosure_memories)
+        memories = (
+            self._rrf_fuse(*channels, limit=top_k)
+            if len(channels) > 1
+            else dense_memories
+        )
         # 融合后统一 rerank（复用知识库配置的 rerank provider）
         if use_rerank and memories:
             rerank_provider = getattr(self.vec_db, "rerank_provider", None)
@@ -1142,38 +1552,137 @@ class MemoryManager:
                 return False
         return True
 
+    @staticmethod
+    def _filters_to_sql(filters: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """将 metadata_filters dict 转为参数化 SQL WHERE 子句。
+
+        返回 (where_clause, params)，where_clause 不含 WHERE 关键字。
+        """
+        clauses: list[str] = []
+        params: dict[str, Any] = {}
+        for key, value in filters.items():
+            if key == "is_memory_record":
+                clauses.append("json_extract(metadata,'$.is_memory_record') = 1")
+            elif key == "deprecated":
+                # deprecated=False 意为“未废弃”，NULL 也视为未废弃
+                clauses.append("json_extract(metadata,'$.deprecated') IS NOT 1")
+            else:
+                param_name = f"f_{key}"
+                clauses.append(f"json_extract(metadata,'$.{key}') = :{param_name}")
+                params[param_name] = value
+        return " AND ".join(clauses) if clauses else "1=1", params
+
+    async def _disclosure_retrieve(
+        self, query: str, top_k: int, filters: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Disclosure 精确匹配检索通道。
+
+        查找 disclosure 字段与查询关键词有交集的记忆，
+        确保“当用户问 X 时”类型的触发条件不会被向量相似度漏掉。
+        """
+        if not self._kb_helper:
+            return []
+
+        # 分词：优先用 AstrBot 分词器，不可用时 fallback 到空格分词
+        query_tokens = self._tokenize_query(query)
+        if not query_tokens:
+            query_tokens = [t for t in query.lower().split() if len(t) >= 2]
+        if not query_tokens:
+            return []
+
+        # 构建 SQL：在现有 filters 基础上追加 disclosure 非空条件
+        where_clause, params = self._filters_to_sql(filters)
+        where_clause += (
+            " AND json_extract(metadata,'$.disclosure') IS NOT NULL"
+            " AND json_extract(metadata,'$.disclosure') != ''"
+        )
+        # 分页扫描直到找到足够匹配或遍历完所有候选
+        try:
+            scan_limit = int(self.config.get("disclosure_scan_limit", 200))
+        except (TypeError, ValueError):
+            scan_limit = 200
+        scan_limit = max(10, min(scan_limit, 5000))
+
+        query_token_set = set(query_tokens)
+        matched: list[dict[str, Any]] = []
+        target_matches = min(top_k * 2, 10)
+        page_size = min(scan_limit, 200)
+        offset = 0
+
+        try:
+            doc_storage = self.vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                while offset < scan_limit and len(matched) < target_matches:
+                    batch_limit = min(page_size, scan_limit - offset)
+                    rows = (
+                        await session.execute(
+                            sa_text(
+                                f"SELECT text, metadata FROM documents "
+                                f"WHERE {where_clause} "
+                                "ORDER BY json_extract(metadata,'$.created_at') DESC "
+                                "LIMIT :batch_lim OFFSET :batch_off"
+                            ),
+                            {**params, "batch_lim": batch_limit, "batch_off": offset},
+                        )
+                    ).all()
+                    if not rows:
+                        break
+                    offset += len(rows)
+
+                    for row in rows:
+                        meta = _safe_parse_metadata(getattr(row, "metadata", {}) or {})
+                        disclosure = str(meta.get("disclosure", "")).lower()
+                        if not disclosure:
+                            continue
+                        disc_tokens = self._tokenize_query(disclosure)
+                        if not disc_tokens:
+                            disc_tokens = [t for t in disclosure.split() if len(t) >= 2]
+                        if query_token_set & set(disc_tokens):
+                            matched.append(
+                                {
+                                    "text": getattr(row, "text", "") or "",
+                                    "metadata": meta,
+                                    "similarity": 0.0,
+                                }
+                            )
+                            if len(matched) >= target_matches:
+                                break
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] disclosure 检索失败: {e}")
+            return []
+
+        if matched:
+            logger.debug(f"[简单长期记忆] disclosure 匹配 {len(matched)} 条记忆")
+        return matched
+
     def _rrf_fuse(
         self,
-        dense: list[dict[str, Any]],
-        sparse: list[dict[str, Any]],
+        *channels: list[dict[str, Any]],
         k: int = 60,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Reciprocal Rank Fusion 融合稠密与稀疏结果（P0.3）。
+        """Reciprocal Rank Fusion 融合多路检索结果。
 
         score(doc) = sum(1 / (k + rank))，同 AstrBot rank_fusion.py 公式；uri 作去重主键。
+        接受任意数量的排序列表（稠密/稀疏/disclosure 等），空列表自动跳过。
         """
         scores: dict[str, float] = {}
-        dense_by_uri: dict[str, dict[str, Any]] = {}
-        sparse_by_uri: dict[str, dict[str, Any]] = {}
+        mem_by_uri: dict[str, dict[str, Any]] = {}
 
-        for rank, mem in enumerate(dense):
-            uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
-            if not uri:
-                continue
-            scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
-            dense_by_uri.setdefault(uri, mem)
-        for rank, mem in enumerate(sparse):
-            uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
-            if not uri:
-                continue
-            scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
-            sparse_by_uri.setdefault(uri, mem)
+        for channel in channels:
+            for rank, mem in enumerate(channel):
+                uri = mem.get("metadata", {}).get("uri") or mem.get("text", "")
+                if not uri:
+                    continue
+                scores[uri] = scores.get(uri, 0.0) + 1.0 / (k + rank + 1)
+                mem_by_uri.setdefault(uri, mem)
 
         ordered = sorted(scores, key=lambda u: scores[u], reverse=True)[:limit]
         fused: list[dict[str, Any]] = []
         for uri in ordered:
-            mem = dense_by_uri.get(uri) or sparse_by_uri.get(uri)
+            mem = mem_by_uri.get(uri)
             if mem:
                 # 保留原始 similarity（dense cosine / sparse 负分），RRF 分独立存放；
                 # 勿覆盖 similarity，否则 smart_update_memory 的 0.85 阈值与 _dedupe 排序失效
@@ -1249,15 +1758,19 @@ class MemoryManager:
             实际删除的记录数
         """
         doc_ids: list[str] = []
+        uris: list[str] = []
         deleted = 0
+        collection_ok = False
         try:
-            doc_ids, deleted = await self._collect_kb_doc_ids_for_filters(filters)
+            doc_ids, uris, deleted = await self._collect_kb_doc_ids_for_filters(filters)
+            collection_ok = True
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
-            try:
-                deleted = await self.vec_db.count_documents(metadata_filter=filters)
-            except Exception as ce:
-                logger.warning(f"[简单长期记忆] 统计待删除文档失败: {ce}")
+
+        if not collection_ok:
+            # 收集失败时禁止进入删除，防止无法跟踪删除结果
+            logger.warning("[简单长期记忆] 候选收集失败，跳过删除")
+            return 0
 
         await self.vec_db.delete_documents(metadata_filters=filters)
 
@@ -1268,14 +1781,17 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档删除失败: {e}")
 
+        # 级联清理关联边
+        if self._link_manager and uris:
+            await self._link_manager.delete_links_for_uris(uris)
         logger.info(f"[简单长期记忆] 删除记忆: {uri}, 实际删除 {deleted} 条")
         return deleted
 
     async def _collect_kb_doc_ids_for_filters(
         self,
         filters: dict[str, Any],
-    ) -> tuple[list[str], int]:
-        """分页收集匹配向量文档的 KB 文档 ID，避免固定上限截断。"""
+    ) -> tuple[list[str], list[str], int]:
+        """分页收集匹配向量文档的 KB 文档 ID 和 URI，避免固定上限截断。"""
         try:
             page_size = int(self.config.get("memory_delete_scan_page_size", 1000))
         except (TypeError, ValueError):
@@ -1283,6 +1799,7 @@ class MemoryManager:
         page_size = max(1, page_size)
 
         doc_ids: list[str] = []
+        uris: list[str] = []
         count = 0
         offset = 0
         while True:
@@ -1299,10 +1816,12 @@ class MemoryManager:
                 md = _safe_parse_metadata(doc.get("metadata", {}))
                 if md.get("kb_doc_id"):
                     doc_ids.append(md["kb_doc_id"])
+                if md.get("uri"):
+                    uris.append(md["uri"])
             if len(docs) < page_size:
                 break
 
-        return list(dict.fromkeys(doc_ids)), count
+        return list(dict.fromkeys(doc_ids)), list(dict.fromkeys(uris)), count
 
     async def clear_memories(
         self,
@@ -1349,9 +1868,10 @@ class MemoryManager:
     ) -> int:
         """底层清空逻辑：查询 doc_ids → 删除 → 反注册 → 同步统计"""
         doc_ids: list[str] = []
+        uris: list[str] = []
         count = 0
         try:
-            doc_ids, count = await self._collect_kb_doc_ids_for_filters(filters)
+            doc_ids, uris, count = await self._collect_kb_doc_ids_for_filters(filters)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待清空文档失败: {e}")
             try:
@@ -1367,6 +1887,9 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档批量删除失败: {e}")
 
+        # 级联清理关联边
+        if self._link_manager and uris:
+            await self._link_manager.delete_links_for_uris(uris)
         logger.info(f"[简单长期记忆] 清空 {count} 条记忆, 范围: {scope_label}")
         return count
 
@@ -1638,6 +2161,324 @@ class MemoryManager:
             "normal": normal,
             "compressed": compressed,
         }
+
+    async def get_all_active_memories(
+        self,
+        owner_filter: dict[str, Any] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """拉取活跃记忆（后台整理用，无 event 场景，支持分页）
+
+        Args:
+            owner_filter: 限定用户范围（如 {"user_id": "xxx"}），None 表示全部
+            limit: 每页条数
+            offset: 分页偏移
+
+        Returns:
+            记忆列表，每条包含 uri / content / metadata
+        """
+        filters: dict[str, Any] = {
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        if owner_filter:
+            filters.update(owner_filter)
+
+        try:
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters,
+                limit=limit,
+                offset=offset,
+            )
+            # 从 FAISS 索引加载向量（document_storage 不返回 vector 字段）
+            faiss_index = None
+            embedding_storage = getattr(self.vec_db, "embedding_storage", None)
+            if embedding_storage is not None:
+                faiss_index = getattr(embedding_storage, "index", None)
+
+            memories = []
+            for doc in docs:
+                metadata = _safe_parse_metadata(doc.get("metadata", {}))
+                vector = None
+                doc_int_id = doc.get("id")
+                if faiss_index is not None and doc_int_id is not None:
+                    try:
+                        vector = faiss_index.reconstruct(int(doc_int_id)).tolist()
+                    except Exception:
+                        pass  # 向量不存在时跳过，organizer/analyst 会过滤
+                memories.append(
+                    {
+                        "uri": metadata.get("uri", ""),
+                        "content": doc.get("text", ""),
+                        "metadata": metadata,
+                        "vector": vector,
+                    }
+                )
+            return memories
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 拉取活跃记忆失败: {e}")
+            return []
+
+    async def deprecate_memory(self, uri: str, reason: str = "") -> bool:
+        """标记单条记忆为 deprecated（delete + re-insert 保持 doc/vector 一致）。
+
+        Args:
+            uri: 记忆 URI
+            reason: 废弃原因
+
+        Returns:
+            是否成功
+        """
+        try:
+            old_docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters={"uri": uri, "is_memory_record": True},
+                limit=1,
+            )
+            if not old_docs:
+                logger.warning(f"[简单长期记忆] deprecate 找不到记忆: {uri}")
+                return False
+
+            doc = old_docs[0]
+            old_meta = _safe_parse_metadata(doc.get("metadata", {}))
+            old_meta["deprecated"] = True
+            old_meta["deprecated_at"] = datetime.now(timezone.utc).isoformat()
+            old_meta["deprecated_reason"] = reason or "deprecated"
+
+            # 先插入新记录（原子性：插入失败时原记录不受影响）
+            new_doc_id = str(uuid.uuid4())
+            old_meta["kb_doc_id"] = new_doc_id
+            text = doc.get("text", old_meta.get("memory_content", ""))
+            await self.vec_db.insert(
+                content=text,
+                metadata=old_meta,
+                id=new_doc_id,
+            )
+
+            # 插入成功后同步 KBDocument（注册新 ID，注销旧 ID）
+            old_doc_id = doc.get("doc_id", "")
+            try:
+                await self._register_kb_document(new_doc_id, uri, len(text))
+            except Exception:
+                pass
+            if old_doc_id:
+                try:
+                    await self._unregister_kb_documents([old_doc_id])
+                except Exception:
+                    pass
+                try:
+                    await self.vec_db.delete_documents(
+                        metadata_filters={"kb_doc_id": old_doc_id}
+                    )
+                except Exception as del_err:
+                    # 删除失败 → 原记录仍活跃，返回失败让调用方处理
+                    logger.warning(
+                        f"[简单长期记忆] deprecate 删除旧记录失败: {del_err}"
+                    )
+                    return False
+
+            logger.debug(f"[简单长期记忆] 已标记 deprecated: {uri}")
+            return True
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] deprecate 失败: {uri}, {e}")
+            return False
+
+    async def merge_memories(
+        self,
+        source_uris: list[str],
+        merged_content: str,
+        reason: str = "",
+        created_by: str = "organizer",
+    ) -> dict[str, Any]:
+        """合并多条记忆（supersede 语义，不物理删除）
+
+        1. 新建一条合并后的记忆
+        2. 旧记忆标 deprecated + deprecated_at
+        3. memory_links 写入 supersedes 边
+        4. 旧记忆由 purge 统一物理清除
+
+        Args:
+            source_uris: 待合并的旧记忆 URI 列表
+            merged_content: 合并后的内容
+            reason: 合并原因
+            created_by: 创建者（默认 organizer）
+
+        Returns:
+            {"merged_uri": str, "deprecated_count": int, "success": bool}
+        """
+        if not source_uris or not merged_content:
+            return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
+        try:
+            # 0. 预验证：所有源必须存在且未 deprecated，否则不做任何修改
+            for pre_uri in source_uris:
+                pre_docs = await self.vec_db.document_storage.get_documents(
+                    metadata_filters={
+                        "uri": pre_uri,
+                        "is_memory_record": True,
+                        "deprecated": False,
+                    },
+                    limit=1,
+                )
+                if not pre_docs:
+                    logger.warning(
+                        f"[简单长期记忆] 合并预验证失败: {pre_uri} 不存在或已 deprecated"
+                    )
+                    return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
+            # 1. 新建合并后的记忆（使用第一条旧记忆的 metadata 作为模板）
+            first_doc = await self.vec_db.document_storage.get_documents(
+                metadata_filters={"uri": source_uris[0], "is_memory_record": True},
+                limit=1,
+            )
+            if not first_doc:
+                logger.warning(
+                    f"[简单长期记忆] 合并失败：找不到源记忆 {source_uris[0]}"
+                )
+                return {"merged_uri": "", "deprecated_count": 0, "success": False}
+
+            first_meta = _safe_parse_metadata(first_doc[0].get("metadata", {}))
+            new_uri = f"{first_meta.get('uri', '').split('://')[0]}://merged_{uuid.uuid4().hex[:12]}"
+
+            # 构建新记忆的 metadata（继承旧记忆的域、作用域等）
+            new_metadata = {
+                **first_meta,
+                "uri": new_uri,
+                "memory_content": merged_content,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "deprecated": False,
+                "merged_from": source_uris,
+                "merged_reason": reason,
+            }
+
+            # 写入新记忆（通过 vec_db.insert 自动生成 embedding）
+            new_doc_id = str(uuid.uuid4())
+            new_metadata["kb_doc_id"] = new_doc_id
+            new_metadata["is_memory_record"] = True
+            new_metadata["chunk_index"] = 0
+            formatted = format_memory_content(merged_content, new_metadata)
+            await self.vec_db.insert(
+                content=formatted,
+                metadata=new_metadata,
+                id=new_doc_id,
+            )
+            # 注册 KB 文档（与其他写入路径一致）
+            try:
+                await self._register_kb_document(new_doc_id, new_uri, len(formatted))
+                await self._sync_kb_stats()
+            except Exception:
+                pass
+
+            # 2. 旧记忆标 deprecated（全部成功才报成功，否则回滚新记录）
+            deprecated_count = 0
+            failed_uris: list[str] = []
+            for old_uri in source_uris:
+                try:
+                    ok = await self.deprecate_memory(old_uri, reason="merged")
+                    if ok:
+                        deprecated_count += 1
+                        # 3. 写 supersedes 边
+                        if self._link_manager:
+                            await self._link_manager.add_link(
+                                source_uri=new_uri,
+                                target_uri=old_uri,
+                                relation_type="supersedes",
+                                reason=reason,
+                                confidence=1.0,
+                                created_by=created_by,
+                            )
+                    else:
+                        failed_uris.append(old_uri)
+                except Exception as e:
+                    logger.warning(
+                        f"[简单长期记忆] 标记旧记忆 deprecated 失败: {old_uri}, {e}"
+                    )
+                    failed_uris.append(old_uri)
+
+            if failed_uris:
+                # 回滚：删除合并记录 + 恢复已 deprecate 的源
+                logger.warning(
+                    f"[简单长期记忆] 合并回滚: {len(failed_uris)} 条源未能 deprecated"
+                )
+                try:
+                    await self.vec_db.delete_documents(
+                        metadata_filters={"kb_doc_id": new_doc_id}
+                    )
+                except Exception:
+                    pass
+                # 恢复已成功 deprecate 的源（去掉 deprecated 标记）
+                for ok_uri in source_uris:
+                    if ok_uri not in failed_uris:
+                        try:
+                            dep_docs = await self.vec_db.document_storage.get_documents(
+                                metadata_filters={
+                                    "uri": ok_uri,
+                                    "is_memory_record": True,
+                                    "deprecated": True,
+                                },
+                                limit=1,
+                            )
+                            if dep_docs:
+                                dep_meta = _safe_parse_metadata(
+                                    dep_docs[0].get("metadata", {})
+                                )
+                                dep_meta["deprecated"] = False
+                                dep_meta.pop("deprecated_at", None)
+                                dep_meta.pop("deprecated_reason", None)
+                                restore_id = str(uuid.uuid4())
+                                dep_meta["kb_doc_id"] = restore_id
+                                await self.vec_db.insert(
+                                    content=dep_docs[0].get("text", ""),
+                                    metadata=dep_meta,
+                                    id=restore_id,
+                                )
+                                # 同步 KB：注册恢复的 ID，注销 deprecated 的 ID
+                                try:
+                                    await self._register_kb_document(
+                                        restore_id,
+                                        ok_uri,
+                                        len(dep_docs[0].get("text", "")),
+                                    )
+                                except Exception:
+                                    pass
+                                old_id = dep_docs[0].get("doc_id", "")
+                                if old_id:
+                                    try:
+                                        await self._unregister_kb_documents([old_id])
+                                    except Exception:
+                                        pass
+                                    await self.vec_db.delete_documents(
+                                        metadata_filters={"kb_doc_id": old_id}
+                                    )
+                        except Exception as restore_err:
+                            logger.warning(
+                                f"[简单长期记忆] 恢复源失败: {ok_uri}, {restore_err}"
+                            )
+                # 清理回滚产生的 supersedes 边
+                if self._link_manager:
+                    try:
+                        await self._link_manager.delete_links_for_uris([new_uri])
+                    except Exception:
+                        pass
+                return {
+                    "merged_uri": "",
+                    "deprecated_count": 0,
+                    "success": False,
+                }
+
+            logger.info(
+                f"[简单长期记忆] 合并完成: {len(source_uris)} 条 → {new_uri}, "
+                f"deprecated {deprecated_count} 条"
+            )
+            return {
+                "merged_uri": new_uri,
+                "deprecated_count": deprecated_count,
+                "success": True,
+            }
+
+        except Exception as e:
+            logger.error(f"[简单长期记忆] 合并记忆失败: {e}")
+            return {"merged_uri": "", "deprecated_count": 0, "success": False}
 
     async def forget_memory_by_user(
         self,
@@ -2150,6 +2991,11 @@ class MemoryManager:
             if is_migration:
                 if failed == 0:
                     try:
+                        # 先导出源关联表（在删除源记录之前）
+                        exported_links: list[dict] = []
+                        if self._link_manager:
+                            exported_links = await self._link_manager.export_all()
+
                         await self._delete_rebuild_source_records(
                             source_kb, memory_records
                         )
@@ -2159,6 +3005,20 @@ class MemoryManager:
                             )
                         self._kb_helper = target_kb
                         self._kb_name = target_kb_name
+                        # 目标建表 + 导入关联
+                        self._link_manager = MemoryLinkManager(self.vec_db)
+                        await self._link_manager.ensure_table()
+                        if exported_links:
+                            imported = await self._link_manager.import_all(
+                                exported_links
+                            )
+                            if imported != len(exported_links):
+                                logger.warning(
+                                    f"[简单长期记忆] 关联迁移数量不一致: "
+                                    f"导出 {len(exported_links)}, 导入 {imported}"
+                                )
+                            else:
+                                logger.info(f"[简单长期记忆] 迁移关联表: {imported} 条")
                         migration_committed = True
                         logger.info(f"[简单长期记忆] 已迁移到知识库: {target_kb_name}")
                     except Exception as e:
