@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.4.0 (2026-08-11)
+
+### 新增
+- **后台记忆整理系统（Maintenance Agent）**：开启 `maintenance_enabled` 后，按 cron 定时执行记忆去重合并、关联发现、矛盾检测和质量精炼，保持记忆池长期健康。整理团队分三角色：
+  - **整理师（organizer）**：向量余弦 ≥0.9 预筛候选对，LLM 裁决 merge/none；merge 走 supersede 语义（新建融合节点 + 旧节点标 deprecated + 建立 supersedes 边），不物理删除。
+  - **分析师（analyst）**：向量余弦 ≥0.7 预筛候选对并排除已连边，发现 related/supports/context 关联；基于对话历史检测 contradicts 矛盾对。
+  - **审核员（reviewer）**：复核整理师和分析师的操作建议，破坏性操作默认 reject、证据充分才 approve，争议项（confidence < 0.5）转人工审核。
+- **记忆关联表**：独立 SQLite 表存储记忆间显式关联（related/supports/context/contradicts/supersedes），召回时单跳注入最多 3 条关联记忆（排除 contradicts/supersedes），同时查出边和入边，注入前做可见性过滤。
+- **物理清理管线（purge）**：按 `deprecated_at` + 宽限期判断，物理删除 FAISS 向量、SQLite 文档记录和 KB 文档记录，并级联清理关联边；只用成功删除的子集清理下游，保证跨存储一致性。
+- **`deprecated_at` 迁移补丁**：为旧版废弃记录回填时间戳（用迁移时刻而非 created_at），避免历史废弃记忆被立即清理。
+- **`/memory review` 命令**：list/approve/reject/clear 争议操作，配合 KV 待审队列持久化；global 记忆操作强制走人工审批。
+- **LLM 工具增强**：`memory_recall` 新增 domain/scope 过滤参数；`memory_store` 新增 importance/scope 参数并做合法性校验；新增 `memory_update` 工具（保留原 metadata 替换内容）；`memory_store_global` 新增 memory_type 校验。
+- **召回增强**：新增 disclosure 精确匹配检索通道，与稠密/稀疏三路 RRF 融合；rerank 阶段对 disclosure 命中 query 关键词的记忆加分。
+- **统一 prompt 模板**：全部 prompt 迁移至 `string.Template`（`$var` 语法），彻底解决 JSON 花括号与 `{var}` 占位符冲突。
+- 新增 48 项 maintenance 相关配置项，覆盖整理开关、cron 周期、LLM 调用上限、各角色开关、清理策略、人格摘要等。
+
+### 修复
+- **巩固流程顺序**：改为先写摘要成功后再标记原文 deprecated，避免"原文已废弃但无替代"的空洞（原顺序在 store 失败时会丢数据）。
+- **审批执行并发竞态**：新增 `MaintenanceRunner._op_lock` 互斥锁，`run_cycle` 阶段 4 与 `/memory review approve` 共用同一锁；Scheduler 暴露公开 `runner` 属性，替换对私有成员的穿透访问。
+- **增量操作免审判定**：`new_link` 仅在审核员整体禁用时直接放行；审核员启用但缺失裁决（LLM 漏判/乱序）同样 fail closed 转待审，并提前告警裁决数不一致。
+- **deprecate 原子性**：改为先插入新记录再删旧记录，删除失败时回滚新向量 + KB 文档，返回失败让调用方处理。
+- **merge 回滚**：部分源 deprecate 失败时回滚合并记录并恢复已成功的源；回滚时同步注销/注册 KB 文档。
+- **`_delete_by_filters` 候选收集失败保护**：收集失败时禁止进入删除流程，防止无法跟踪删除结果。
+- **`memory_update` global 保护**：global 记忆不允许通过 `memory_update` 修改，必须走管理员确认路径。
+- **scope 边界分组**：整理师/分析师按 personal（owner_user_id）/group（session_id）/conversation（完整 UMO）精确分组，防止跨租户合并或关联。
+- **关联注入可见性**：关联记忆注入时验证对当前用户可见，避免跨 scope 泄露；`all_users` 召回跳过可见性过滤。
+- **import 排序、缓存 key 规范化、分页边界、入边召回对称性、confidence 字段缺失兜底**等多项细节修复。
+
+### 变更
+- 后台整理启用时自动禁用旧版巩固逻辑，避免并发竞态。
+- `_rrf_fuse` 重构为接受任意数量检索通道的泛化实现。
+- `_collect_kb_doc_ids_for_filters` 返回值新增 URI 列表，供级联清理关联边使用。
+
 ## v0.3.4 (2026-07-10)
 
 ### 修复
