@@ -55,6 +55,11 @@ class MaintenanceScheduler:
             kv_get=kv_get,
         )
 
+    @property
+    def runner(self) -> MaintenanceRunner:
+        """执行管线（供人工审批等外部入口使用，如 /memory review approve）。"""
+        return self._runner
+
     async def start(self) -> None:
         """注册所有定时任务到 cron_manager。"""
         if not self._config.get("maintenance_enabled", False):

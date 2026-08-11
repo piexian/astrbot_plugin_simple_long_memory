@@ -1596,12 +1596,13 @@ class MemoryPlugin(Star):
                 yield event.plain_result(f"🚫 #{target_id} 已废案")
             elif action == "approve":
                 # 先执行，成功后才标记 approved（失败保留可重试）
-                runner = self._scheduler._runner if self._scheduler else None
+                # execute_approved 与后台周期阶段 4 互斥，避免并发写竞态
+                runner = self._scheduler.runner if self._scheduler else None
                 if not runner:
                     yield event.plain_result(f"⚠️ #{target_id} 调度器未运行，无法执行")
                     return
                 try:
-                    ok = await runner._execute_operation(found.get("op", {}))
+                    ok = await runner.execute_approved(found.get("op", {}))
                     if ok:
                         found["status"] = "approved"
                         await self.put_kv_data("maintenance_pending_review", queue)

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -114,6 +115,9 @@ class MaintenanceRunner:
         self._kv_put = kv_put
         self._kv_get = kv_get
         self._running = False
+        # 执行阶段与人工审批共用的互斥锁：
+        # run_cycle 阶段 4 与 /memory review approve 都会写记忆存储，必须互斥
+        self._op_lock = asyncio.Lock()
 
     async def run_cycle(self) -> MaintenanceReport:
         """执行一次完整整理周期。"""
@@ -198,6 +202,32 @@ class MaintenanceRunner:
                     item["needs_human_review"] = True
 
             # ── 阶段 4: Host 执行（根据审核结果执行操作）──
+            await self._execute_operations(report)
+
+        except Exception as e:
+            report.errors.append(f"cycle: {e}")
+            logger.error(f"[简单长期记忆] 整理周期异常: {e}")
+        finally:
+            finished = datetime.now(timezone.utc)
+            report.finished_at = finished.isoformat()
+            report.duration_ms = (finished - started).total_seconds() * 1000
+            self._running = False
+
+            # 落 KV（Phase 2 先日志输出，Phase 3 接 KV）
+            logger.info(
+                f"[简单长期记忆] 整理周期完成: {session_id}, "
+                f"耗时 {report.duration_ms:.0f}ms, "
+                f"LLM 调用 {report.llm_stats.get('calls', 0)} 次"
+            )
+
+        return report
+
+    async def _execute_operations(self, report: MaintenanceReport) -> None:
+        """阶段 4：按审核结果执行操作。
+
+        与人工审批（execute_approved）共用 _op_lock，避免与审批路径并发写竞态。
+        """
+        async with self._op_lock:
             executed = 0
             skipped = 0
             failed = 0
@@ -208,6 +238,19 @@ class MaintenanceRunner:
                 all_operations.extend(report.organizer_manifest.operations)
             if report.analyst_manifest and report.analyst_manifest.parsed:
                 all_operations.extend(report.analyst_manifest.operations)
+
+            reviewer_enabled = self._config.get("maintenance_reviewer_enabled", True)
+            # reviewer 启用时裁决数应与操作数一致，不一致说明 LLM 漏判/乱序，提前告警
+            if reviewer_enabled and all_operations:
+                verdict_indices = {v.get("index") for v in report.reviewer_verdicts}
+                missing = [
+                    i for i in range(len(all_operations)) if i not in verdict_indices
+                ]
+                if missing:
+                    logger.warning(
+                        f"[简单长期记忆] 审核员启用但缺失 {len(missing)} 条裁决"
+                        f"（共 {len(all_operations)} 条操作），相关操作将 fail closed 转待审"
+                    )
 
             # 按审核结果执行操作
             for i, op in enumerate(all_operations):
@@ -220,8 +263,9 @@ class MaintenanceRunner:
 
                 # 缺失裁决 → fail closed，拒绝执行（避免 reviewer 故障时放行破坏性操作）
                 if verdict is None:
-                    # additive 操作（new_link）无需审核可直接执行
-                    if op.get("type") == "new_link":
+                    # additive 操作（new_link）仅在审核员整体禁用时直接放行；
+                    # 审核员启用却缺失裁决属于异常（LLM 漏判），同样 fail closed 转待审
+                    if op.get("type") == "new_link" and not reviewer_enabled:
                         try:
                             success = await self._execute_operation(op)
                             if success:
@@ -233,10 +277,15 @@ class MaintenanceRunner:
                             failed += 1
                             report.errors.append(f"op[{i}] new_link: {e}")
                         continue
-                    # destructive 操作缺少裁决 → 转待审队列（reviewer 禁用时不静默丢弃）
+                    # 其余情况（破坏性操作，或审核员启用但裁决缺失）→ 转待审队列
+                    reason = (
+                        "reviewer 未启用"
+                        if not reviewer_enabled
+                        else "reviewer 缺失裁决（LLM 漏判或输出异常）"
+                    )
                     await self._enqueue_pending_review(
                         op,
-                        {"verdict": "pending", "reason": "reviewer 未启用或缺失裁决"},
+                        {"verdict": "pending", "reason": reason},
                         report.session_id,
                     )
                     skipped += 1
@@ -288,23 +337,14 @@ class MaintenanceRunner:
             # LLM 统计
             report.llm_stats = self._llm.stats()
 
-        except Exception as e:
-            report.errors.append(f"cycle: {e}")
-            logger.error(f"[简单长期记忆] 整理周期异常: {e}")
-        finally:
-            finished = datetime.now(timezone.utc)
-            report.finished_at = finished.isoformat()
-            report.duration_ms = (finished - started).total_seconds() * 1000
-            self._running = False
+    async def execute_approved(self, op: dict[str, Any]) -> bool:
+        """公开入口：执行一条经管理员批准的操作。
 
-            # 落 KV（Phase 2 先日志输出，Phase 3 接 KV）
-            logger.info(
-                f"[简单长期记忆] 整理周期完成: {session_id}, "
-                f"耗时 {report.duration_ms:.0f}ms, "
-                f"LLM 调用 {report.llm_stats.get('calls', 0)} 次"
-            )
-
-        return report
+        与整理周期阶段 4 共用 _op_lock，避免与后台周期并发写竞态。
+        供 /memory review approve 等外部命令调用，不应用 _execute_operation。
+        """
+        async with self._op_lock:
+            return await self._execute_operation(op)
 
     async def _run_organizer(self) -> AgentManifest:
         """运行整理师：去重合并、质量精炼。"""
