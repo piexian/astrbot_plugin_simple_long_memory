@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.1 (2026-08-13)
 
 ### 修复
 - **矛盾检测失控**：`_detect_contradictions` 改为基于预筛候选对（同 scope 分组 + 余弦达标 + 未连边），不再全量 O(n²) 裸配对；新增 `maintenance_analyst_max_contradictions` 上限（默认 20）；排除已提议建边的对。修复单周期产出 2 万+ 矛盾操作的事故。
