@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### 修复
+- **矛盾检测失控**：`_detect_contradictions` 改为基于预筛候选对（同 scope 分组 + 余弦达标 + 未连边），不再全量 O(n²) 裸配对；新增 `maintenance_analyst_max_contradictions` 上限（默认 20）；排除已提议建边的对。修复单周期产出 2 万+ 矛盾操作的事故。
+- **审核员 prompt 溢出**：审核改为逐条单操作调用（不再全量操作塞一个 prompt 导致超模型上下文）；关联操作仅以"编号+类型+理由"提醒，模型置 `needs_context=true` 时才注入关联全文重审一次；审核裁决按操作哈希+模型磁盘缓存，同操作永不重判。
+- **待审入队 O(n²)**：改为周期内内存累积、结束单次 KV 读写；按操作签名跨周期去重；新增 `maintenance_pending_queue_max` 容量上限（默认 500）；日志聚合为一条汇总，通知每周期最多一次。
+- **周期操作数硬上限**：新增 `maintenance_max_ops_per_cycle`（默认 100），超出部分本周期跳过并告警。
+- **配置 schema**：`maintenance_reviewer_model_id` 补 `_special: select_provider`，由输入框改为模型选择器。
+
 ## v0.4.0 (2026-08-11)
 
 ### 新增

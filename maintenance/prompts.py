@@ -101,19 +101,19 @@ DEFAULT_REVIEWER_PROMPT = """\
 
 $admin_guides
 
-## 待审核的操作
+## 待审核的操作（单条）
 $proposed_changes
 
 ## 原始数据
 $original_data
 
+## 关联操作
+$related_changes
+
 ## 输出格式（严格 JSON，不要输出其他内容）
-{
-  "verdicts": [
-    {"index": 0, "verdict": "approve|reject", "reason": "...", "confidence": 0.0}
-  ]
-}
-confidence 为你对该判断的确信程度（0~1），低于 0.5 的判断会被标记为争议项交管理员复核。
+{"verdict": "approve|reject", "reason": "...", "confidence": 0.0, "needs_context": false}
+- needs_context：仅凭本条操作与原始数据无法判断时置 true，宿主会补充关联操作完整内容后请你重审一次
+- confidence 为你对该判断的确信程度（0~1），低于 0.5 的判断会被标记为争议项交管理员复核。
 """
 
 

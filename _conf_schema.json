@@ -200,6 +200,12 @@
     "default": 50,
     "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
   },
+  "maintenance_max_ops_per_cycle": {
+    "description": "每周期操作数上限",
+    "type": "int",
+    "default": 100,
+    "hint": "整理师+分析师单周期产出的操作总数硬上限，超出部分本周期跳过（下周期重新评估），防止异常放大"
+  },
   "maintenance_analyst_max_new_links": {
     "description": "分析师每次最多新建关联数",
     "type": "int",
@@ -212,6 +218,12 @@
     "default": true,
     "hint": "开启后分析师会检测互相矛盾的记忆对"
   },
+  "maintenance_analyst_max_contradictions": {
+    "description": "分析师每次最多报告矛盾数",
+    "type": "int",
+    "default": 20,
+    "hint": "单个整理周期内分析师最多报告的矛盾记忆对数量，超出部分截断"
+  },
   "maintenance_reviewer_enabled": {
     "description": "启用审核员",
     "type": "bool",
@@ -222,6 +234,7 @@
     "description": "审核模型",
     "type": "string",
     "default": "",
+    "_special": "select_provider",
     "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
   },
   "maintenance_organizer_enabled": {
@@ -264,6 +277,12 @@
     "type": "string",
     "default": "10:00",
     "hint": "daily 为每天时刻，weekly 为周几+时刻如 mon:10:00，monthly 为几号+时刻如 1:10:00"
+  },
+  "maintenance_pending_queue_max": {
+    "description": "待审队列容量上限",
+    "type": "int",
+    "default": 500,
+    "hint": "待人工审核队列的最大长度，满了之后新争议项直接丢弃并记日志，防止队列无限膨胀"
   },
   "auto_purge_enabled": {
     "description": "自动清理废弃记忆",

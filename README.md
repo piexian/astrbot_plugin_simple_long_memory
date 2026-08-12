@@ -53,6 +53,9 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | maintenance_analyst_enabled | 启用分析师（关联发现） | `true` |
 | maintenance_reviewer_enabled | 启用审核员（复核操作） | `true` |
 | maintenance_reviewer_model_id | 审核模型（留空用全局模型） | 留空 |
+| maintenance_analyst_max_contradictions | 分析师每次最多报告矛盾数 | `20` |
+| maintenance_max_ops_per_cycle | 每周期操作数硬上限 | `100` |
+| maintenance_pending_queue_max | 待审队列容量上限 | `500` |
 | context_max_rounds | 最大拉取对话轮数 | `50` |
 | context_max_chars | 最大拉取字符数 | `30000` |
 | context_max_age_days | 对话最大回溯天数 | `7` |
