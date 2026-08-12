@@ -43,6 +43,11 @@ class ReviewerAgent:
         self._llm = llm
         self._config = config
         self._controversial_threshold = 0.5  # 置信度低于此值标记争议
+        # 最近一次 review() 中未产出裁决的原因分布（供宿主区分有意部分评审与异常）
+        self.last_unresolved: dict[str, int] = {
+            "budget_exhausted": 0,
+            "invalid_output": 0,
+        }
 
     async def review(
         self,
@@ -79,9 +84,14 @@ class ReviewerAgent:
         ) or self._config.get("maintenance_model_id", "")
         resolved_model = self._llm._resolve_model_id(model_id)
 
+        # 单次运行内的源记忆缓存：同一 URI 只拉取一次
+        source_cache: dict[str, dict[str, Any] | None] = {}
+        self.last_unresolved = {"budget_exhausted": 0, "invalid_output": 0}
+
         verdicts: list[dict[str, Any]] = []
         for index, op in enumerate(proposed_changes):
             if self._llm.remaining_calls <= 0:
+                self.last_unresolved["budget_exhausted"] = len(proposed_changes) - index
                 logger.warning(
                     f"[简单长期记忆] 审核员 LLM 预算耗尽，剩余 "
                     f"{len(proposed_changes) - index} 条操作未审，将 fail closed 转待审"
@@ -92,12 +102,15 @@ class ReviewerAgent:
                 op=op,
                 proposed_changes=proposed_changes,
                 related_map=related_map,
+                source_cache=source_cache,
                 persona_summary=persona_summary,
                 admin_guides=admin_guides,
                 resolved_model=resolved_model,
             )
             if verdict is not None:
                 verdicts.append(verdict)
+            else:
+                self.last_unresolved["invalid_output"] += 1
         return verdicts
 
     async def _review_one(
@@ -107,6 +120,7 @@ class ReviewerAgent:
         op: dict[str, Any],
         proposed_changes: list[dict[str, Any]],
         related_map: dict[int, list[int]],
+        source_cache: dict[str, dict[str, Any] | None],
         persona_summary: str,
         admin_guides: str,
         resolved_model: str,
@@ -118,7 +132,7 @@ class ReviewerAgent:
         if cached is not None:
             return self._normalize_verdict(index, cached)
 
-        source_data = await self._get_op_source_data(op)
+        source_data = await self._get_op_source_data(op, source_cache)
         related_indices = related_map.get(index, [])
         parsed = await self._call_llm(
             op=op,
@@ -226,18 +240,22 @@ class ReviewerAgent:
     def _build_related_map(
         cls, proposed_changes: list[dict[str, Any]]
     ) -> dict[int, list[int]]:
-        """按共享 URI 找出互相关联的操作：{操作下标: [关联操作下标]}。"""
-        uri_to_indices: dict[str, list[int]] = {}
+        """按共享 URI 找出互相关联的操作：{操作下标: [关联操作下标]}。
+
+        跨 URI 分组的关联取并集（同一条操作触及多个记忆时不能互相覆盖）；
+        单条操作内重复 URI 先去重，避免自关联产生空列表。
+        """
+        uri_to_indices: dict[str, set[int]] = {}
         for i, op in enumerate(proposed_changes):
-            for uri in cls._op_uris(op):
-                uri_to_indices.setdefault(uri, []).append(i)
-        related: dict[int, list[int]] = {}
+            for uri in set(cls._op_uris(op)):
+                uri_to_indices.setdefault(uri, set()).add(i)
+        related_sets: dict[int, set[int]] = {}
         for indices in uri_to_indices.values():
             if len(indices) < 2:
                 continue
             for i in indices:
-                related[i] = sorted(j for j in indices if j != i)
-        return related
+                related_sets.setdefault(i, set()).update(indices - {i})
+        return {i: sorted(others) for i, others in related_sets.items()}
 
     @staticmethod
     def _format_related(
@@ -262,19 +280,26 @@ class ReviewerAgent:
             + "\n".join(lines)
         )
 
-    async def _get_op_source_data(self, op: dict[str, Any]) -> dict[str, Any]:
-        """拉取本操作涉及的源记忆（仅本条操作，单条内容截断兜底防超长）。"""
+    async def _get_op_source_data(
+        self, op: dict[str, Any], cache: dict[str, dict[str, Any] | None]
+    ) -> dict[str, Any]:
+        """拉取本操作涉及的源记忆（仅本条操作，单条内容截断兜底防超长）。
+
+        cache 为单次 review() 运行共享：同一 URI 只拉取一次，含未命中的负缓存。
+        """
         memories: dict[str, Any] = {}
         for uri in self._op_uris(op)[:10]:
-            try:
-                mem = await self._memory_mgr._get_memory_by_uri(uri)
-                if mem:
-                    memories[uri] = {
-                        "content": str(mem.get("content", ""))[:2000],
-                        "metadata": mem.get("metadata", {}),
-                    }
-            except Exception:
-                pass
+            if uri not in cache:
+                try:
+                    cache[uri] = await self._memory_mgr._get_memory_by_uri(uri)
+                except Exception:
+                    cache[uri] = None
+            mem = cache[uri]
+            if mem:
+                memories[uri] = {
+                    "content": str(mem.get("content", ""))[:2000],
+                    "metadata": mem.get("metadata", {}),
+                }
         return {"memories": memories}
 
     async def _get_persona_summary(self) -> str:

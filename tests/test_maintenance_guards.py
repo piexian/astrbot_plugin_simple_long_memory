@@ -67,8 +67,10 @@ class _FakeLLM:
 class _FakeMemoryMgr:
     def __init__(self, memories: dict | None = None):
         self._memories = memories or {}
+        self.fetch_calls: list[str] = []
 
     async def _get_memory_by_uri(self, uri: str):
+        self.fetch_calls.append(uri)
         return self._memories.get(uri)
 
 
@@ -132,8 +134,13 @@ class AnalystContradictionTests(unittest.TestCase):
 
 
 class ReviewerPerOpTests(unittest.IsolatedAsyncioTestCase):
-    def _reviewer(self, llm: _FakeLLM, config: dict | None = None) -> ReviewerAgent:
-        return ReviewerAgent(None, _FakeMemoryMgr(), llm, config or {})
+    def _reviewer(
+        self,
+        llm: _FakeLLM,
+        config: dict | None = None,
+        memory_mgr: _FakeMemoryMgr | None = None,
+    ) -> ReviewerAgent:
+        return ReviewerAgent(None, memory_mgr or _FakeMemoryMgr(), llm, config or {})
 
     async def test_reviews_ops_one_by_one(self):
         llm = _FakeLLM()
@@ -185,12 +192,28 @@ class ReviewerPerOpTests(unittest.IsolatedAsyncioTestCase):
         ops = [{"type": "archive", "uri": f"u://{i}", "reason": "r"} for i in range(5)]
         verdicts = await reviewer.review(ops)
         self.assertEqual(len(verdicts), 1)  # 预算只够 1 条，其余 fail closed
+        self.assertEqual(reviewer.last_unresolved["budget_exhausted"], 4)
+        self.assertEqual(reviewer.last_unresolved["invalid_output"], 0)
 
     async def test_invalid_output_returns_no_verdict(self):
         llm = _FakeLLM(responses=["not json at all"])
         reviewer = self._reviewer(llm)
         verdicts = await reviewer.review([{"type": "archive", "uri": "u://1"}])
         self.assertEqual(verdicts, [])
+        self.assertEqual(reviewer.last_unresolved["invalid_output"], 1)
+
+    async def test_source_cache_shared_across_ops(self):
+        mgr = _FakeMemoryMgr({"u://1": {"content": "记忆一", "metadata": {}}})
+        llm = _FakeLLM()
+        reviewer = self._reviewer(llm, memory_mgr=mgr)
+        ops = [
+            {"type": "merge", "uris": ["u://1", "u://2"], "reason": "r1"},
+            {"type": "archive", "uri": "u://1", "reason": "r2"},
+        ]
+        verdicts = await reviewer.review(ops)
+        self.assertEqual(len(verdicts), 2)
+        # 两条操作都引用 u://1，但单次运行内只拉取一次
+        self.assertEqual(mgr.fetch_calls.count("u://1"), 1)
 
     def test_related_map_by_shared_uri(self):
         ops = [
@@ -202,6 +225,30 @@ class ReviewerPerOpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(related[0], [1])
         self.assertEqual(related[1], [0])
         self.assertNotIn(2, related)
+
+    def test_related_map_unions_across_uri_groups(self):
+        # op0 触及 u://1 和 u://2，两个 URI 分组的关联必须合并而不是覆盖
+        ops = [
+            {"type": "merge", "uris": ["u://1", "u://2"]},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+        ]
+        related = ReviewerAgent._build_related_map(ops)
+        self.assertEqual(related[0], [1, 2])
+        self.assertEqual(related[1], [0])
+        self.assertEqual(related[2], [0])
+
+    def test_related_map_duplicate_uri_in_one_op(self):
+        # 同一操作内重复 URI 不产生自关联，也不清掉真实关联
+        ops = [
+            {"type": "merge", "uris": ["u://1", "u://1"]},
+            {"type": "archive", "uri": "u://1"},
+        ]
+        related = ReviewerAgent._build_related_map(ops)
+        self.assertEqual(related[0], [1])
+        self.assertEqual(related[1], [0])
+        # 单独一条含重复 URI 的操作无任何关联
+        self.assertEqual(ReviewerAgent._build_related_map(ops[:1]), {})
 
 
 class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
@@ -234,6 +281,58 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
         queue = kv.store["maintenance_pending_review"]
         self.assertEqual(len(queue), 2)
 
+    async def test_capacity_counts_pending_only(self):
+        kv = _FakeKV()
+        # 已有 3 条终态条目，不应占容量
+        kv.store["maintenance_pending_review"] = [
+            {"id": i, "status": s, "op": {"type": "archive", "uri": f"u://old{i}"}}
+            for i, s in enumerate(("approved", "rejected", "failed"), start=1)
+        ]
+        runner = self._runner(kv, {"maintenance_pending_queue_max": 2})
+        items = [
+            ({"type": "archive", "uri": f"u://new{i}"}, {"reason": "x"})
+            for i in range(3)
+        ]
+        await runner._flush_pending_review(items, "s1")
+        queue = kv.store["maintenance_pending_review"]
+        # 终态被清理，新条目按 pending 容量只入 2 条
+        self.assertEqual(len(queue), 2)
+        self.assertTrue(all(it["status"] == "pending" for it in queue))
+
+    async def test_id_monotonic_after_prune(self):
+        kv = _FakeKV()
+        # pending id 1、终态最大 id 5：新条目 id 必须 > 5，不能复用
+        kv.store["maintenance_pending_review"] = [
+            {
+                "id": 1,
+                "status": "pending",
+                "op": {"type": "archive", "uri": "u://p1"},
+            },
+            {"id": 5, "status": "approved", "op": {"type": "archive", "uri": "u://t5"}},
+        ]
+        runner = self._runner(kv)
+        await runner._flush_pending_review(
+            [({"type": "archive", "uri": "u://new"}, {"reason": "x"})], "s1"
+        )
+        queue = kv.store["maintenance_pending_review"]
+        ids = [it["id"] for it in queue]
+        self.assertEqual(ids, [1, 6])
+        self.assertEqual(kv.store["maintenance_pending_review_seq"], 6)
+
+    async def test_approved_op_can_be_reproposed(self):
+        kv = _FakeKV()
+        op = {"type": "archive", "uri": "u://1", "reason": "r"}
+        runner = self._runner(kv)
+        await runner._flush_pending_review([(op, {"reason": "x"})], "s1")
+        # 管理员批准执行后变为终态
+        kv.store["maintenance_pending_review"][0]["status"] = "approved"
+        # 同操作下周期重新提议：终态已清理，可再次入队
+        await runner._flush_pending_review([(op, {"reason": "x"})], "s2")
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["status"], "pending")
+        self.assertEqual(queue[0]["id"], 2)
+
     async def test_single_kv_write_per_cycle(self):
         kv = _FakeKV()
         runner = self._runner(kv)
@@ -249,7 +348,9 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
             ({"type": "archive", "uri": f"u://{i}"}, {"reason": "x"}) for i in range(10)
         ]
         await runner._flush_pending_review(items, "s1")
-        self.assertEqual(len(writes), 1)
+        # 队列本体每周期只写一次（另有一次单调 id 计数器写入）
+        self.assertEqual(writes.count("maintenance_pending_review"), 1)
+        self.assertEqual(writes.count("maintenance_pending_review_seq"), 1)
 
     def test_op_signature_stable(self):
         op1 = {"type": "archive", "uri": "u://1", "reason": "r"}
