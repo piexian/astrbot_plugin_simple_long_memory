@@ -118,6 +118,8 @@ class MaintenanceRunner:
         # 执行阶段与人工审批共用的互斥锁：
         # run_cycle 阶段 4 与 /memory review approve 都会写记忆存储，必须互斥
         self._op_lock = asyncio.Lock()
+        # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
+        self._last_review_unresolved: dict[str, int] = {}
 
     async def run_cycle(self) -> MaintenanceReport:
         """执行一次完整整理周期。"""
@@ -231,6 +233,7 @@ class MaintenanceRunner:
             executed = 0
             skipped = 0
             failed = 0
+            pending_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
             # 收集所有操作和对应的审核结果
             all_operations = []
@@ -239,18 +242,45 @@ class MaintenanceRunner:
             if report.analyst_manifest and report.analyst_manifest.parsed:
                 all_operations.extend(report.analyst_manifest.operations)
 
+            # 周期操作总数硬上限：防异常放大，超出部分下周期重新评估
+            max_ops = self._config.get("maintenance_max_ops_per_cycle", 100)
+            if len(all_operations) > max_ops:
+                logger.warning(
+                    f"[简单长期记忆] 本周期操作数 {len(all_operations)} 超过上限 "
+                    f"{max_ops}，超出部分本周期跳过（下周期会重新评估）"
+                )
+                all_operations = all_operations[:max_ops]
+
             reviewer_enabled = self._config.get("maintenance_reviewer_enabled", True)
-            # reviewer 启用时裁决数应与操作数一致，不一致说明 LLM 漏判/乱序，提前告警
+            # reviewer 启用时校验裁决完整性：
+            # 下标越界/重复 → 真正不一致（LLM 乱序/错号），告警；
+            # 仅数量不足 → 有意的部分评审（预算耗尽/输出无效），info 级给出原因分布
             if reviewer_enabled and all_operations:
-                verdict_indices = {v.get("index") for v in report.reviewer_verdicts}
-                missing = [
-                    i for i in range(len(all_operations)) if i not in verdict_indices
+                raw_indices = [v.get("index") for v in report.reviewer_verdicts]
+                n_ops = len(all_operations)
+                invalid = [
+                    i
+                    for i in raw_indices
+                    if not isinstance(i, int) or i < 0 or i >= n_ops
                 ]
-                if missing:
+                duplicated = len(raw_indices) - len(set(raw_indices))
+                if invalid or duplicated:
                     logger.warning(
-                        f"[简单长期记忆] 审核员启用但缺失 {len(missing)} 条裁决"
-                        f"（共 {len(all_operations)} 条操作），相关操作将 fail closed 转待审"
+                        f"[简单长期记忆] 审核员裁决与操作不一致"
+                        f"（越界下标 {invalid}，重复 {duplicated} 条，"
+                        f"共 {n_ops} 条操作），相关操作将 fail closed 转待审"
                     )
+                else:
+                    verdict_indices = set(raw_indices)
+                    missing = [i for i in range(n_ops) if i not in verdict_indices]
+                    if missing:
+                        unresolved = self._last_review_unresolved
+                        logger.info(
+                            f"[简单长期记忆] 审核员部分评审: {len(missing)}/{n_ops} 条未裁决"
+                            f"（预算耗尽 {unresolved.get('budget_exhausted', 0)}, "
+                            f"输出无效 {unresolved.get('invalid_output', 0)}），"
+                            f"fail closed 转待审"
+                        )
 
             # 按审核结果执行操作
             for i, op in enumerate(all_operations):
@@ -283,23 +313,14 @@ class MaintenanceRunner:
                         if not reviewer_enabled
                         else "reviewer 缺失裁决（LLM 漏判或输出异常）"
                     )
-                    await self._enqueue_pending_review(
-                        op,
-                        {"verdict": "pending", "reason": reason},
-                        report.session_id,
-                    )
+                    pending_items.append((op, {"verdict": "pending", "reason": reason}))
                     skipped += 1
-                    logger.info(
-                        f"[简单长期记忆] 操作 {i} 缺少审核裁决，转待审: {op.get('type')}"
-                    )
                     continue
 
                 if verdict.get("verdict") == "approve":
                     # global 记忆操作必须经管理员人工确认（不可配置）
                     if await self._op_touches_global(op):
-                        await self._enqueue_pending_review(
-                            op, verdict, report.session_id
-                        )
+                        pending_items.append((op, verdict))
                         skipped += 1
                         logger.info(
                             f"[简单长期记忆] 操作 {i} 涉及 global 记忆，转人工审批"
@@ -323,13 +344,13 @@ class MaintenanceRunner:
                     skipped += 1
                     if verdict.get("needs_human_review"):
                         # 争议项 → 写入 KV 待审队列
-                        await self._enqueue_pending_review(
-                            op, verdict, report.session_id
-                        )
+                        pending_items.append((op, verdict))
                         logger.info(
                             f"[简单长期记忆] 争议项待人工审核: {op.get('type')}, "
                             f"理由: {verdict.get('reason', '')}"
                         )
+
+            await self._flush_pending_review(pending_items, report.session_id)
 
             report.executed_ops = executed
             report.skipped_ops = skipped
@@ -466,34 +487,12 @@ class MaintenanceRunner:
             config=self._config,
         )
 
-        # 拉取操作涉及的源记录，供审核员对比
-        original_data: dict[str, Any] = {"memories": {}}
-        referenced_uris: set[str] = set()
-        for op in proposed_changes:
-            for key in ("uris", "uri", "source", "target", "old_uri", "new_uri"):
-                val = op.get(key)
-                if isinstance(val, list):
-                    referenced_uris.update(val)
-                elif isinstance(val, str) and val:
-                    referenced_uris.add(val)
-        for uri in list(referenced_uris)[:20]:
-            try:
-                mem = await self._memory_mgr._get_memory_by_uri(uri)
-                if mem:
-                    original_data["memories"][uri] = {
-                        "content": mem.get("content", ""),
-                        "metadata": mem.get("metadata", {}),
-                    }
-            except Exception:
-                pass
-
+        # 源记录由审核员按操作逐条拉取（见 ReviewerAgent._get_op_source_data）
         try:
-            verdicts = await reviewer.review(
-                proposed_changes, original_data=original_data
-            )
+            verdicts = await reviewer.review(proposed_changes)
+            self._last_review_unresolved = dict(reviewer.last_unresolved)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 审核员执行失败: {e}")
-
         return verdicts
 
     # ─── 数据拉取辅助（Phase 3/4 完善）────────────────────
@@ -544,31 +543,85 @@ class MaintenanceRunner:
                 pass
         return False
 
-    async def _enqueue_pending_review(
-        self, op: dict[str, Any], verdict: dict[str, Any], session_id: str
+    @staticmethod
+    def _op_signature(op: dict[str, Any]) -> str:
+        """操作签名（规范化 JSON 的短哈希），用于待审队列跨周期去重。"""
+        import hashlib
+        import json as _json
+
+        raw = _json.dumps(op, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    async def _flush_pending_review(
+        self,
+        items: list[tuple[dict[str, Any], dict[str, Any]]],
+        session_id: str,
     ) -> None:
-        """将争议操作写入 KV 待审队列。"""
-        if not self._kv_put or not self._kv_get:
+        """周期结束批量写入待审队列：单次 KV 读写 + 签名去重 + 终态清理 + pending 容量上限 + 单调 id。"""
+        if not items or not self._kv_put or not self._kv_get:
             return
         try:
-            queue = await self._kv_get("maintenance_pending_review", None) or []
             import time as _time
 
-            queue.append(
-                {
-                    "id": len(queue) + 1,
-                    "session_id": session_id,
-                    "op_type": op.get("type", ""),
-                    "op": op,
-                    "verdict_reason": verdict.get("reason", ""),
-                    "controversial": verdict.get("controversial", False),
-                    "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "pending",  # pending / approved / rejected
-                }
+            queue = await self._kv_get("maintenance_pending_review", None) or []
+
+            # 单调递增 id：从原始队列取最大 id 作为下限，清理终态后 id 不复用，
+            # 避免与管理员已见条目撞号
+            max_seen_id = max((it.get("id", 0) for it in queue), default=0)
+            seq = await self._kv_get("maintenance_pending_review_seq", None)
+            if not isinstance(seq, int) or seq < max_seen_id:
+                seq = max_seen_id
+
+            # 清理终态条目（approved/rejected/failed），只保留 pending
+            pruned = sum(1 for it in queue if it.get("status") != "pending")
+            if pruned:
+                queue = [it for it in queue if it.get("status") == "pending"]
+
+            existing_sigs = {
+                it.get("op_signature") or self._op_signature(it.get("op", {}))
+                for it in queue
+            }
+            queue_max = self._config.get("maintenance_pending_queue_max", 500)
+
+            added = 0
+            deduped = 0
+            dropped = 0
+            for op, verdict in items:
+                sig = self._op_signature(op)
+                if sig in existing_sigs:
+                    deduped += 1
+                    continue
+                # 容量只统计 pending（此处队列已清理终态，len 即 pending 数）
+                if len(queue) >= queue_max:
+                    dropped += 1
+                    continue
+                seq += 1
+                queue.append(
+                    {
+                        "id": seq,
+                        "session_id": session_id,
+                        "op_type": op.get("type", ""),
+                        "op": op,
+                        "op_signature": sig,
+                        "verdict_reason": verdict.get("reason", ""),
+                        "controversial": verdict.get("controversial", False),
+                        "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "pending",  # pending / approved / rejected
+                    }
+                )
+                existing_sigs.add(sig)
+                added += 1
+
+            if added or pruned:
+                await self._kv_put("maintenance_pending_review", queue)
+            if added:
+                await self._kv_put("maintenance_pending_review_seq", seq)
+            logger.info(
+                f"[简单长期记忆] 待审入队: 新增 {added}, 去重跳过 {deduped}, "
+                f"队列满丢弃 {dropped}, 清理终态 {pruned}, 当前待审 {len(queue)} 条"
             )
-            await self._kv_put("maintenance_pending_review", queue)
-            # 待审通知推送
-            if self._config.get("review_notify_enabled", True):
+            # 待审通知推送（每周期最多一次）
+            if added and self._config.get("review_notify_enabled", True):
                 await self._send_review_notification(len(queue))
         except Exception as e:
             logger.warning(f"[简单长期记忆] 写入待审队列失败: {e}")

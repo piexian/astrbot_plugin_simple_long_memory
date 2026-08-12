@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.1 (2026-08-13)
+
+### 修复
+- **矛盾检测失控**：`_detect_contradictions` 改为基于预筛候选对（同 scope 分组 + 余弦达标 + 未连边），不再全量 O(n²) 裸配对；新增 `maintenance_analyst_max_contradictions` 上限（默认 20）；排除已提议建边的对。修复单周期产出 2 万+ 矛盾操作的事故。
+- **审核员 prompt 溢出**：审核改为逐条单操作调用（不再全量操作塞一个 prompt 导致超模型上下文）；关联操作仅以"编号+类型+理由"提醒，模型置 `needs_context=true` 时才注入关联全文重审一次；审核裁决按操作哈希+模型磁盘缓存，同操作永不重判。
+- **待审入队 O(n²)**：改为周期内内存累积、结束单次 KV 读写；按操作签名跨周期去重；新增 `maintenance_pending_queue_max` 容量上限（默认 500）；日志聚合为一条汇总，通知每周期最多一次。
+- **周期操作数硬上限**：新增 `maintenance_max_ops_per_cycle`（默认 100），超出部分本周期跳过并告警。
+- **配置 schema**：`maintenance_reviewer_model_id` 补 `_special: select_provider`，由输入框改为模型选择器。
+- **审核员源记忆重复拉取**：单次 review() 内按 URI 共享缓存（含负缓存），同一记忆只拉取一次。
+- **裁决缺失告警误报**：区分"真正不一致"（下标越界/重复 → warning）与"有意部分评审"（预算耗尽/输出无效 → info 并给出原因分布，来源 `ReviewerAgent.last_unresolved`）。
+- **待审队列只增不减**：容量上限改为只统计 `status == "pending"` 条目；flush 时清理终态条目（approved/rejected/failed）；条目 id 改用 KV 单调计数器 `maintenance_pending_review_seq`，清理后不复用 id，避免与管理员已见条目撞号；终态清理后同操作可被重新提议。
+- **关联操作提醒不完整**：`_build_related_map` 跨 URI 分组改为并集合并，触及多个记忆的操作不再丢失关联提醒；同一操作内重复 URI 先去重，避免自关联覆盖已有列表。
+
 ## v0.4.0 (2026-08-11)
 
 ### 新增

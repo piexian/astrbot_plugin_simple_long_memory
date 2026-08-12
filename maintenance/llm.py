@@ -115,6 +115,15 @@ class MaintenanceLLM:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    def op_review_cache_key(self, op: dict[str, Any], model_id: str) -> str:
+        """单条操作审核的缓存 key（规范化操作 JSON + 模型）。"""
+        raw = json.dumps(
+            {"model": model_id, "task": "review_op", "op": op},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     def _cache_path(self, key: str) -> Path:
         return self._cache_dir / f"{key}.json"
 

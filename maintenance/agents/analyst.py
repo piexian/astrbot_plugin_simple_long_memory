@@ -36,6 +36,9 @@ class AnalystAgent:
         self._detect_contradiction = config.get(
             "maintenance_analyst_detect_contradiction", True
         )
+        self._max_contradictions = config.get(
+            "maintenance_analyst_max_contradictions", 20
+        )
 
     async def run(self, owner_filter: dict[str, Any] | None = None) -> dict[str, Any]:
         """运行分析师，返回 manifest。
@@ -99,13 +102,14 @@ class AnalystAgent:
                 )
                 links_created += 1
 
-        # 5. 矛盾检测（简化版：基于对话历史和记忆内容的时序分析）
+        # 5. 矛盾检测（基于预筛候选对，排除已提议建边的对，受数量上限约束）
         if self._detect_contradiction and conversation_history:
-            contradictions = await self._detect_contradictions(
-                memories, conversation_history
+            linked_pairs = {
+                (lnk["source"], lnk["target"]) for lnk in manifest["new_links"]
+            }
+            manifest["contradictions"] = self._detect_contradictions(
+                candidate_pairs, exclude_pairs=linked_pairs
             )
-            manifest["contradictions"] = contradictions
-
         return manifest
 
     async def _get_active_memories(
@@ -208,6 +212,25 @@ class AnalystAgent:
             logger.warning(f"[简单长期记忆] 拉取对话历史失败: {e}")
             return ""
 
+    @staticmethod
+    def _same_scope_group(mem_a: dict[str, Any], mem_b: dict[str, Any]) -> bool:
+        """两条记忆是否属于同一 scope 分组（link/矛盾配对共用的租户隔离规则）。"""
+        meta_a = mem_a.get("metadata", {})
+        meta_b = mem_b.get("metadata", {})
+        scope_a = meta_a.get("memory_scope", "")
+        if scope_a != meta_b.get("memory_scope", ""):
+            return False
+        if scope_a == "personal":
+            return meta_a.get("owner_user_id", "") == meta_b.get("owner_user_id", "")
+        if scope_a == "group":
+            return meta_a.get("owner_session_id", "") == meta_b.get(
+                "owner_session_id", ""
+            )
+        if scope_a == "conversation":
+            return meta_a.get("umo", "") == meta_b.get("umo", "")
+        # global：无 per-user 限制
+        return True
+
     async def _screen_link_candidates(
         self, memories: list[dict[str, Any]]
     ) -> list[tuple[dict[str, Any], dict[str, Any], float]]:
@@ -254,31 +277,9 @@ class AnalystAgent:
                     # 按 scope 实际边界分组，避免跨租户配对
                     mem_a = valid_memories[i]
                     mem_b = valid_memories[j]
-                    scope_a = mem_a.get("metadata", {}).get("memory_scope", "")
-                    scope_b = mem_b.get("metadata", {}).get("memory_scope", "")
-                    if scope_a != scope_b:
+                    # 按 scope 实际边界分组，避免跨租户配对
+                    if not self._same_scope_group(mem_a, mem_b):
                         continue
-                    if scope_a == "personal":
-                        owner_a = mem_a.get("metadata", {}).get("owner_user_id", "")
-                        owner_b = mem_b.get("metadata", {}).get("owner_user_id", "")
-                        if owner_a != owner_b:
-                            continue
-                    elif scope_a == "group":
-                        session_a = mem_a.get("metadata", {}).get(
-                            "owner_session_id", ""
-                        )
-                        session_b = mem_b.get("metadata", {}).get(
-                            "owner_session_id", ""
-                        )
-                        if session_a != session_b:
-                            continue
-                    elif scope_a == "conversation":
-                        umo_a = mem_a.get("metadata", {}).get("umo", "")
-                        umo_b = mem_b.get("metadata", {}).get("umo", "")
-                        if umo_a != umo_b:
-                            continue
-                    # global：无 per-user 限制
-
                     cosine = float(sims[i, j])
                     if cosine >= self._link_cosine_threshold:
                         candidates.append((mem_a, mem_b, cosine))
@@ -321,48 +322,49 @@ class AnalystAgent:
 
         return candidates
 
-    async def _detect_contradictions(
-        self, memories: list[dict[str, Any]], conversation_history: str
+    def _detect_contradictions(
+        self,
+        candidate_pairs: list[tuple[dict[str, Any], dict[str, Any], float]],
+        exclude_pairs: set[tuple[str, str]] | None = None,
     ) -> list[dict[str, Any]]:
-        """检测矛盾记忆对。
+        """从预筛候选对中检测矛盾记忆对。
 
-        简化版：基于时间戳和内容相似度，找出可能矛盾的记忆。
+        输入已是同 scope 分组、余弦达标、未连边的候选对，不再做 O(n²) 裸配对。
+        简化版启发式：内容关键词高度重叠但创建时间不同 → 可能是新记忆取代旧记忆。
+        数量受 maintenance_analyst_max_contradictions 上限约束。
         Phase 5 完善：结合对话历史做更精确的时序分析。
         """
+        exclude_pairs = exclude_pairs or set()
         contradictions: list[dict[str, Any]] = []
 
-        # 简化实现：找出内容高度相似但时间戳差异较大的记忆对
-        # 这些可能是"新记忆取代旧记忆"的矛盾对
-        for i, mem_a in enumerate(memories):
-            for mem_b in memories[i + 1 :]:
-                # 检查内容是否涉及同一主题（简化版：检查关键词重叠）
-                content_a = mem_a.get("content", "").lower()
-                content_b = mem_b.get("content", "").lower()
+        for mem_a, mem_b, _cosine in candidate_pairs:
+            if len(contradictions) >= self._max_contradictions:
+                break
+            pair = (mem_a["uri"], mem_b["uri"])
+            if pair in exclude_pairs or (pair[1], pair[0]) in exclude_pairs:
+                continue
 
-                # 如果两条记忆内容高度相似，但创建时间差距大，可能是矛盾
-                time_a = mem_a.get("metadata", {}).get("created_at", "")
-                time_b = mem_b.get("metadata", {}).get("created_at", "")
+            time_a = mem_a.get("metadata", {}).get("created_at", "")
+            time_b = mem_b.get("metadata", {}).get("created_at", "")
+            if not time_a or not time_b or time_a == time_b:
+                continue
 
-                if time_a and time_b and time_a != time_b:
-                    # 简化版：如果内容有 50% 以上的关键词重叠，标记为潜在矛盾
-                    words_a = set(content_a.split())
-                    words_b = set(content_b.split())
-                    if words_a and words_b:
-                        overlap = len(words_a & words_b) / max(
-                            len(words_a), len(words_b)
-                        )
-                        if overlap > 0.5:
-                            contradictions.append(
-                                {
-                                    "old_uri": mem_a["uri"]
-                                    if time_a < time_b
-                                    else mem_b["uri"],
-                                    "new_uri": mem_b["uri"]
-                                    if time_a < time_b
-                                    else mem_a["uri"],
-                                    "reason": f"内容高度相似（重叠度 {overlap:.2f}）但时间不同",
-                                    "confidence": overlap,
-                                }
-                            )
+            # 内容关键词重叠超过一半 → 疑似同一事实的新旧两个版本
+            words_a = set(mem_a.get("content", "").lower().split())
+            words_b = set(mem_b.get("content", "").lower().split())
+            if not words_a or not words_b:
+                continue
+            overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+            if overlap <= 0.5:
+                continue
+
+            contradictions.append(
+                {
+                    "old_uri": mem_a["uri"] if time_a < time_b else mem_b["uri"],
+                    "new_uri": mem_b["uri"] if time_a < time_b else mem_a["uri"],
+                    "reason": f"内容高度相似（重叠度 {overlap:.2f}）但时间不同",
+                    "confidence": overlap,
+                }
+            )
 
         return contradictions
