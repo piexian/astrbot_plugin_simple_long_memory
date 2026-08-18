@@ -1,12 +1,17 @@
 """后台整理调度器。
 
-使用 AstrBot 的 cron_manager 注册定时任务，
-管理整理团队的生命周期（注册/注销/执行）。
+插件自管 asyncio 后台定时任务，不写 AstrBot cron_manager 的 DB，
+避免重启后产生重复 job 堆积且无法触发的问题。
 """
 
 from __future__ import annotations
 
+import asyncio
+import re
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+from apscheduler.triggers.cron import CronTrigger
 
 from astrbot.api import logger
 
@@ -17,6 +22,43 @@ if TYPE_CHECKING:
     from astrbot.core.star.context import Context
 
     from ..memory_manager import MemoryManager
+
+# AstrBot cron_manager 使用的星期格式为 sun=0/7，此处保持一致
+_WEEKDAY_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+_WEEKDAY_RE = re.compile(r"^(?:(\*)|(\d+)(?:-(\d+))?)(?:/(\d+))?$")
+
+
+def _normalize_dow(day_of_week: str) -> str:
+    """将数字星期转为 APScheduler 友好的命名格式。"""
+    parts: list[str] = []
+    for raw in day_of_week.split(","):
+        p = raw.strip().lower()
+        m = _WEEKDAY_RE.fullmatch(p)
+        if not m:
+            parts.append(p)
+            continue
+        wildcard, start_t, end_t, step_t = m.groups()
+        step = int(step_t or "1")
+        if wildcard:
+            parts.append("*" if step == 1 else f"*/{step}")
+            continue
+        start = int(start_t)
+        end = int(end_t) if end_t else None
+        if end is None:
+            end = 7 if step_t else start
+        names = [_WEEKDAY_NAMES[v if v != 7 else 0] for v in range(start, end + 1, step)]
+        parts.append(",".join(dict.fromkeys(names)))
+    return ",".join(parts)
+
+
+def _next_run(cron_expression: str, after: datetime | None = None) -> datetime:
+    """根据 cron 表达式计算下次执行时间（UTC）。"""
+    minute, hour, day, month, dow = cron_expression.split()
+    trigger = CronTrigger.from_crontab(
+        " ".join([minute, hour, day, month, _normalize_dow(dow)])
+    )
+    base = after or datetime.now(timezone.utc)
+    return trigger.get_next_fire_time(None, base)
 
 
 class MaintenanceScheduler:
@@ -35,8 +77,8 @@ class MaintenanceScheduler:
         self._config = config
         self._kv_put = kv_put
         self._kv_get = kv_get
-        self._job_ids: list[str] = []
         self._running_tasks: set[str] = set()  # single-flight 防并发
+        self._loop_tasks: set[asyncio.Task] = set()
 
         # 初始化 LLM 客户端和执行管线
         maintenance_model_id = config.get("maintenance_model_id", "")
@@ -61,71 +103,82 @@ class MaintenanceScheduler:
         return self._runner
 
     async def start(self) -> None:
-        """注册所有定时任务到 cron_manager。"""
+        """启动 asyncio 后台定时循环。"""
         if not self._config.get("maintenance_enabled", False):
             logger.debug("[简单长期记忆] 后台整理未启用")
-            return
-
-        cron_mgr = self._context.cron_manager
-        if not cron_mgr:
-            logger.warning("[简单长期记忆] cron_manager 不可用，后台整理无法启动")
             return
 
         # 自动清理（purge）
         if self._config.get("auto_purge_enabled", True):
             purge_days = self._config.get("auto_purge_after_days", 7)
-            # 默认每天 05:00 执行
             purge_cron = self._config.get("auto_purge_cron", "0 5 * * *")
-            try:
-                job = await cron_mgr.add_basic_job(
+            task = asyncio.create_task(
+                self._loop(
                     name="memory_purge",
                     cron_expression=purge_cron,
                     handler=self._run_purge,
-                    description="物理清理废弃超期记忆",
-                    persistent=False,
-                    enabled=True,
                     payload={"after_days": purge_days},
                 )
-                self._job_ids.append(job.job_id)
-                logger.info(
-                    f"[简单长期记忆] 自动清理已注册: cron={purge_cron}, "
-                    f"超期={purge_days}天"
-                )
-            except Exception as e:
-                logger.warning(f"[简单长期记忆] 注册自动清理任务失败: {e}")
+            )
+            self._loop_tasks.add(task)
+            task.add_done_callback(self._loop_tasks.discard)
+            logger.info(
+                f"[简单长期记忆] 自动清理已启动: cron={purge_cron}, 超期={purge_days}天"
+            )
 
         # 整理周期（完整管线：purge → organizer → analyst → reviewer）
         if self._config.get("maintenance_enabled", False):
             maintenance_cron = self._config.get("maintenance_cron", "0 3 * * *")
-            try:
-                job = await cron_mgr.add_basic_job(
+            task = asyncio.create_task(
+                self._loop(
                     name="memory_maintenance_cycle",
                     cron_expression=maintenance_cron,
                     handler=self._run_maintenance_cycle,
-                    description="完整记忆整理周期（purge + 整理师 + 分析师 + 审核员）",
-                    persistent=False,
-                    enabled=True,
                 )
-                self._job_ids.append(job.job_id)
-                logger.info(f"[简单长期记忆] 整理周期已注册: cron={maintenance_cron}")
-            except Exception as e:
-                logger.warning(f"[简单长期记忆] 注册整理周期任务失败: {e}")
+            )
+            self._loop_tasks.add(task)
+            task.add_done_callback(self._loop_tasks.discard)
+            logger.info(f"[简单长期记忆] 整理周期已启动: cron={maintenance_cron}")
 
     async def stop(self) -> None:
-        """注销所有定时任务。"""
-        cron_mgr = self._context.cron_manager
-        if not cron_mgr:
-            return
-        remaining: list[str] = []
-        for job_id in self._job_ids:
+        """取消所有后台定时循环。"""
+        for task in self._loop_tasks:
+            task.cancel()
+        # 等待取消完成
+        for task in list(self._loop_tasks):
             try:
-                await cron_mgr.delete_job(job_id)
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._loop_tasks.clear()
+        logger.info("[简单长期记忆] 后台整理调度器已停止")
+
+    async def _loop(
+        self,
+        *,
+        name: str,
+        cron_expression: str,
+        handler: Any,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """按 cron 表达式定时执行 handler 的后台循环。"""
+        while True:
+            try:
+                next_run = _next_run(cron_expression)
+                now = datetime.now(timezone.utc)
+                delay = (next_run - now).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                # 二次校验，防止 sleep 期间配置变更
+                result = handler(**payload) if payload else handler()
+                if asyncio.iscoroutine(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.warning(f"[简单长期记忆] 注销任务失败: {job_id}, {e}")
-                remaining.append(job_id)
-        self._job_ids = remaining
-        if not remaining:
-            logger.info("[简单长期记忆] 后台整理调度器已停止")
+                logger.warning(f"[简单长期记忆] {name} 执行失败: {e}")
+                # 出错后短暂等待避免密集重试
+                await asyncio.sleep(60)
 
     async def _run_purge(self, **kwargs: Any) -> None:
         """执行物理清理（single-flight）。"""
@@ -147,12 +200,11 @@ class MaintenanceScheduler:
                     f"{result['purged']} 条记忆, "
                     f"{result['links_cleaned']} 条关联"
                 )
-            # 存在任何失败时抛出异常，让 cron manager 记录为失败
             if result.get("errors"):
                 raise RuntimeError(f"purge 部分失败: {result['errors']}")
         except Exception as e:
             logger.warning(f"[简单长期记忆] 定时清理失败: {e}")
-            raise  # 传播到 cron manager，记录为失败而非 completed
+            raise
         finally:
             self._running_tasks.discard("purge")
 
