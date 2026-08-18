@@ -10,6 +10,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
 from astrbot.api import logger
@@ -39,7 +40,12 @@ def _normalize_dow(day_of_week: str) -> str:
         wildcard, start_t, end_t, step_t = m.groups()
         step = int(step_t or "1")
         if wildcard:
-            parts.append("*" if step == 1 else f"*/{step}")
+            if step == 1:
+                parts.append("*")
+            else:
+                # 展开 */N 为 sun=0..sat=6 序列，避免 APScheduler 按 mon=0 解释
+                names = [_WEEKDAY_NAMES[v] for v in range(0, 7, step)]
+                parts.append(",".join(dict.fromkeys(names)))
             continue
         start = int(start_t)
         end = int(end_t) if end_t else None
@@ -52,20 +58,35 @@ def _normalize_dow(day_of_week: str) -> str:
     return ",".join(parts)
 
 
-def _next_run(cron_expression: str, after: datetime | None = None) -> datetime:
-    """根据 cron 表达式计算下次执行时间（UTC）。"""
+def _next_run(
+    cron_expression: str,
+    after: datetime | None = None,
+    tz_str: str | None = None,
+) -> datetime:
+    """根据 cron 表达式计算下次执行时间。"""
     parts = cron_expression.split()
     if len(parts) != 5:
         raise ValueError(
-            f"cron 表达式需为 5 段格式(min hour day month dow)， got: {cron_expression!r}"
+            f"cron 表达式需为 5 段格式(min hour day month dow)，got: {cron_expression!r}"
         )
     minute, hour, day, month, dow = parts
+    tzinfo = None
+    if tz_str:
+        try:
+            tzinfo = ZoneInfo(tz_str)
+        except ZoneInfoNotFoundError:
+            logger.warning("[简单长期记忆] 未知时区 %s，回退到系统本地时区", tz_str)
     trigger = CronTrigger.from_crontab(
         " ".join([minute, hour, day, month, _normalize_dow(dow)]),
-        timezone="UTC",
+        timezone=tzinfo,
     )
     base = after or datetime.now(timezone.utc)
-    return trigger.get_next_fire_time(None, base)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    next_time = trigger.get_next_fire_time(None, base)
+    if next_time is None:
+        raise ValueError(f"cron 表达式永不匹配: {cron_expression!r}")
+    return next_time
 
 
 class MaintenanceScheduler:
@@ -86,6 +107,12 @@ class MaintenanceScheduler:
         self._kv_get = kv_get
         self._running_tasks: set[str] = set()  # single-flight 防并发
         self._loop_tasks: set[asyncio.Task] = set()
+        # 读取 AstrBot 主配置的时区，与旧 cron_manager 行为一致
+        self._tz_str: str | None = None
+        try:
+            self._tz_str = context.astrbot_config.get("timezone") or None
+        except Exception:
+            pass
 
         # 初始化 LLM 客户端和执行管线
         maintenance_model_id = config.get("maintenance_model_id", "")
@@ -119,6 +146,8 @@ class MaintenanceScheduler:
         if self._config.get("auto_purge_enabled", True):
             purge_days = self._config.get("auto_purge_after_days", 7)
             purge_cron = self._config.get("auto_purge_cron", "0 5 * * *")
+            if not self._validate_cron(purge_cron, "memory_purge"):
+                return
             task = asyncio.create_task(
                 self._loop(
                     name="memory_purge",
@@ -136,6 +165,8 @@ class MaintenanceScheduler:
         # 整理周期（完整管线：purge → organizer → analyst → reviewer）
         if self._config.get("maintenance_enabled", False):
             maintenance_cron = self._config.get("maintenance_cron", "0 3 * * *")
+            if not self._validate_cron(maintenance_cron, "memory_maintenance_cycle"):
+                return
             task = asyncio.create_task(
                 self._loop(
                     name="memory_maintenance_cycle",
@@ -160,6 +191,17 @@ class MaintenanceScheduler:
         self._loop_tasks.clear()
         logger.info("[简单长期记忆] 后台整理调度器已停止")
 
+    def _validate_cron(self, cron_expression: str, name: str) -> bool:
+        """启动时预校验 cron 表达式，失败返回 False。"""
+        try:
+            _next_run(cron_expression, tz_str=self._tz_str)
+            return True
+        except Exception as e:
+            logger.error(
+                f"[简单长期记忆] {name} cron 表达式无效: {cron_expression!r}, {e}，该任务不启动"
+            )
+            return False
+
     async def _loop(
         self,
         *,
@@ -169,14 +211,17 @@ class MaintenanceScheduler:
         payload: dict[str, Any] | None = None,
     ) -> None:
         """按 cron 表达式定时执行 handler 的后台循环。"""
+        prev_run: datetime | None = None
         while True:
             try:
-                next_run = _next_run(cron_expression)
+                next_run = _next_run(
+                    cron_expression, after=prev_run, tz_str=self._tz_str
+                )
                 now = datetime.now(timezone.utc)
                 delay = (next_run - now).total_seconds()
                 if delay > 0:
                     await asyncio.sleep(delay)
-                # 二次校验，防止 sleep 期间配置变更
+                prev_run = next_run
                 result = handler(**payload) if payload else handler()
                 if asyncio.iscoroutine(result):
                     await result
@@ -184,7 +229,6 @@ class MaintenanceScheduler:
                 raise
             except Exception as e:
                 logger.warning(f"[简单长期记忆] {name} 执行失败: {e}")
-                # 出错后短暂等待避免密集重试
                 await asyncio.sleep(60)
 
     async def _run_purge(self, **kwargs: Any) -> None:
