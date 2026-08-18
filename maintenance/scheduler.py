@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.triggers.cron import CronTrigger
-
 from astrbot.api import logger
 
 from .llm import MaintenanceLLM
@@ -46,16 +45,24 @@ def _normalize_dow(day_of_week: str) -> str:
         end = int(end_t) if end_t else None
         if end is None:
             end = 7 if step_t else start
-        names = [_WEEKDAY_NAMES[v if v != 7 else 0] for v in range(start, end + 1, step)]
+        names = [
+            _WEEKDAY_NAMES[v if v != 7 else 0] for v in range(start, end + 1, step)
+        ]
         parts.append(",".join(dict.fromkeys(names)))
     return ",".join(parts)
 
 
 def _next_run(cron_expression: str, after: datetime | None = None) -> datetime:
     """根据 cron 表达式计算下次执行时间（UTC）。"""
-    minute, hour, day, month, dow = cron_expression.split()
+    parts = cron_expression.split()
+    if len(parts) != 5:
+        raise ValueError(
+            f"cron 表达式需为 5 段格式(min hour day month dow)， got: {cron_expression!r}"
+        )
+    minute, hour, day, month, dow = parts
     trigger = CronTrigger.from_crontab(
-        " ".join([minute, hour, day, month, _normalize_dow(dow)])
+        " ".join([minute, hour, day, month, _normalize_dow(dow)]),
+        timezone="UTC",
     )
     base = after or datetime.now(timezone.utc)
     return trigger.get_next_fire_time(None, base)
@@ -142,10 +149,10 @@ class MaintenanceScheduler:
 
     async def stop(self) -> None:
         """取消所有后台定时循环。"""
-        for task in self._loop_tasks:
+        tasks = list(self._loop_tasks)
+        for task in tasks:
             task.cancel()
-        # 等待取消完成
-        for task in list(self._loop_tasks):
+        for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
