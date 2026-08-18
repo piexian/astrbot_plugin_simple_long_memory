@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.2 (2026-08-18)
+
+### 修复
+- **定时任务堆积且无法触发**：后台整理的 `memory_purge` / `memory_maintenance_cycle` 改为插件自管的 asyncio 后台循环，不再通过 `cron_manager.add_basic_job` 写入 `cron_jobs` 数据库表。旧实现每次插件初始化都新建 DB 条目（UUID 各异），且 `persistent=False` 的 basic job 在 AstrBot 重启后被 `sync_from_db` 跳过、handler 丢失无法触发，导致 DB 堆积 24+ 条无效 job 而实际从未执行。新实现：内存任务随插件生命周期管理，重启后 `initialize` 自动恢复；旧版本残留的 DB 条目需手动清理（见 README）。
+
 ## v0.4.1 (2026-08-13)
 
 ### 修复
