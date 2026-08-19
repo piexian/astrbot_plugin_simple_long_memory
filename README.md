@@ -45,7 +45,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | enable_admin_global_memory_tool | 启用管理员全局记忆工具 | `false` |
 | maintenance_enabled | 后台记忆整理总开关 | `false` |
 | maintenance_model_id | 整理模型（建议廉价模型） | 留空 |
-| maintenance_cron | 整理周期 cron 表达式 | `0 2 * * *` |
+| maintenance_cron | 整理周期 cron 表达式 | `0 3 * * *` |
 | maintenance_max_llm_calls | 每周期 LLM 调用上限 | `50` |
 | auto_purge_enabled | 自动清理废弃记忆 | `true` |
 | auto_purge_after_days | 清理超期天数 | `7` |
@@ -54,6 +54,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | maintenance_reviewer_enabled | 启用审核员（复核操作） | `true` |
 | maintenance_reviewer_model_id | 审核模型（留空用全局模型） | 留空 |
 | maintenance_analyst_max_contradictions | 分析师每次最多报告矛盾数 | `20` |
+| maintenance_window | 整理执行时间窗口；cron 命中窗口外时跳过并记 DEBUG | `02:00-06:00` |
 | maintenance_max_ops_per_cycle | 每周期操作数硬上限 | `100` |
 | maintenance_pending_queue_max | 待审队列容量上限 | `500` |
 | context_max_rounds | 最大拉取对话轮数 | `50` |
@@ -66,20 +67,57 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 ### 用户命令
 
 ```
-/memory list [--all] [页码]            - 列出记忆（支持翻页）
-/memory search [--all] <关键词>        - 搜索记忆
-/memory stats [--all]                  - 查看记忆统计
-/memory test                           - 测试记忆读写功能（管理员）
-/memory forget <uri> [--user <用户ID>] - 删除指定记忆
-/memory clear [--all] [--user <用户ID>] [--confirm <确认码>] - 清空记忆（管理员，需确认码）
-/memory rebuild [--to <知识库名>] [--confirm <确认码>] - 重建或迁移记忆（管理员，需确认码）
-/memory rebuild --clear-cache [--confirm <确认码>] - 清理重建缓存（管理员，需确认码）
+/memory list [--all] [页码]                                  - 列出记忆（默认第 1 页）
+/memory search [--all] <关键词>                            - 搜索记忆
+/memory stats [--all]                                      - 查看记忆统计
+/memory test [purge|organizer|analyst|reviewer|cycle]     - 管理员测试（后台项固定 dry-run）
+/memory forget <URI> [--user <用户ID>]                    - 删除指定记忆
+/memory clear [--all|--user <用户ID>] [--confirm <确认码>]  - 清空记忆（管理员）
+/memory rebuild [--to <知识库名>] [--confirm <确认码>]     - 重建或迁移记忆（管理员）
+/memory rebuild --clear-cache [--confirm <确认码>]        - 清理重建缓存（管理员）
+/memory review [list|approve <ID>|reject <ID>|clear]       - 处理后台待审队列（管理员）
 ```
 
-- `test`、`clear`、`rebuild` 需要管理员权限
-- `forget`：普通用户可删除自己的记忆，管理员可删除任意记忆
-- `--all`：管理员可查看/搜索/统计/清空所有用户的记忆
-- `--user <用户ID>`：管理员可删除/清空指定用户的记忆（`--all` 与 `--user` 不可同时使用）
+- 所有命令前缀跟随 AstrBot 的 `wake_prefix` 配置，下面以 `/` 为例。参数中的 `<...>` 表示必填值，`[...]` 表示可选值。
+- 未知参数、缺少参数值、禁止的位置参数都会直接报错；参数值含空格时请使用引号。
+- `test`、`clear`、`rebuild`、`review` 需要管理员权限；`list`、`search`、`stats` 默认只操作当前用户可见范围。
+- `--all` 仅管理员可用；`--all` 与 `--user` 不能同时使用。
+- 后台测试项 `purge`、`organizer`、`analyst`、`reviewer`、`cycle` 会调用真实分析链路，但固定为 dry-run，不写入记忆、向量、关联或待审队列。
+
+#### 命令参数
+| 命令 | 参数说明 | 默认行为与限制 |
+|------|----------|----------------|
+| `list` | `[--all]`、`[页码]` | 页码必须是正整数，默认 `1`，每页 `10` 条；`--all` 查看全部用户，管理员专用。 |
+| `search` | `[--all]`、`<关键词>` | 关键词必填；多个词会作为一个搜索短语；`--all` 查看全部用户，管理员专用。 |
+| `stats` | `[--all]` | 无参数时统计当前用户；`--all` 统计全部用户，管理员专用；不接受位置参数。 |
+| `test` | `[purge\|organizer\|analyst\|reviewer\|cycle]` | 无子参数执行记忆写入、召回、删除测试；指定后台阶段时固定 dry-run；管理员专用。 |
+| `forget` | `<URI>`、`[--user <用户ID>]` | URI 必填；普通用户只能删除自己的 URI；管理员不带 `--user` 按 URI 删除全部匹配记录，带 `--user` 只删除指定用户记录。 |
+| `clear` | `[--all\|--user <用户ID>]`、`[--confirm <确认码>]` | 默认清空当前用户；`--all` 清空全部用户；`--user` 清空指定用户；两者互斥。首次执行不带确认码只显示影响数量和确认命令。 |
+| `rebuild` | `[--to <知识库名>]`、`[--confirm <确认码>]` | 不带 `--to` 原地重建当前知识库；带 `--to` 迁移到目标知识库；首次执行不带确认码只预览，不会执行。 |
+| `rebuild --clear-cache` | `[--confirm <确认码>]` | 清理中断重建的 KV 缓存；不能与 `--to` 同时使用；重建进行中禁止清理。 |
+| `review` | `[list\|approve <ID>\|reject <ID>\|clear]` | 不带参数等同 `list`；`approve` 执行对应操作后标记已批准；`reject` 标记废案；`clear` 清空待审队列；管理员专用。 |
+
+#### 命令示例
+```text
+/memory list
+/memory list 2
+/memory list --all 3
+/memory search "咖啡 偏好"
+/memory stats --all
+/memory test organizer
+/memory forget facts://abcd1234
+/memory forget facts://abcd1234 --user user_123
+/memory clear --user user_123
+/memory rebuild --to 新知识库
+/memory review
+/memory review approve 12
+/memory review reject 12
+/memory review clear
+```
+
+#### 确认码
+`clear`、`rebuild` 和 `rebuild --clear-cache` 的确认码不是固定文本。先执行不带 `--confirm` 的命令，插件会根据当前操作目标生成确认命令；只有复制该次预览中的确认码，且预览状态未变化时才会执行。
+
 
 ### 群聊场景
 
@@ -180,7 +218,11 @@ AI 可以通过以下工具主动操作记忆：
 - `maintenance_max_llm_calls`：根据记忆数量调整，默认 50 次/周期
 
 ## 注意事项
+### DEBUG 诊断日志
 
+将 AstrBot 日志级别设为 DEBUG 后，可按 `trace_id` 串联一次召回：过滤器、dense/sparse/disclosure 通道、权限过滤、去重、重排、反馈更新、关联补充及最终结果。自动注入额外记录实际注入目标、格式化长度和每条记忆摘要。
+
+每条召回或注入记忆摘要包含 `uri`、scope、是否关联、`content_len`、内容 SHA-256 短指纹及压缩后的前 80 个字符 `preview`。写入、替换和删除记录其存储阶段和统计；自动提取记录快照、解析、LLM 耗时与写入统计。日志不记录完整记忆正文、原始对话或 LLM prompt。
 - 请确保先创建知识库并配置嵌入模型
 - 记忆数据存储在知识库中，删除知识库将丢失所有记忆
 - **请勿将记忆知识库挂载到 AstrBot 全局知识库配置中**。本插件通过 `user_id` 实现用户级记忆隔离，而 AstrBot 原生知识库检索不支持用户隔离，挂载后会导致所有用户共享彼此的记忆。仅个人独占使用时可忽略此限制
