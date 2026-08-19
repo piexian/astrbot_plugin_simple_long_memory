@@ -14,12 +14,13 @@ PROJECT_PARENT = Path(__file__).resolve().parents[2]
 if str(PROJECT_PARENT) not in sys.path:
     sys.path.insert(0, str(PROJECT_PARENT))
 
+from astrbot_plugin_simple_long_memory.memory_manager import MemoryManager  # noqa: E402
+
 from maintenance.scheduler import (  # noqa: E402
     _is_in_maintenance_window,
     _next_run,
     _parse_maintenance_window,
 )
-from astrbot_plugin_simple_long_memory.memory_manager import MemoryManager  # noqa: E402
 
 
 class SchedulerRegressionTests(unittest.TestCase):
