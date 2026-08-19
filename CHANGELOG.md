@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.4 (2026-08-19)
+
+### 变更
+- **注入时间使用 AstrBot 时区**：记忆仍以带时区的标准时间保存，注入标签统一按 AstrBot 配置的 `timezone` 展示，避免 UTC 与用户本地时间错位。无效时区回退到主机本地时区。
+- **注入内容增加时间与整理状态**：显示 `created`、`updated`、`updated_by`、版本号和合并整理的 `curated` 状态；历史记录缺少字段时不伪造更新信息。
+- **共享与关联记忆增加身份边界**：注入明确标注 `current user`、`associated users` 或 `current group`，并显示关联关系，避免把其他用户的记忆误归因给当前用户。
+- **整理更新保留来源**：用户替换和整理替换分别写入 `updated_by=user|organizer`；合并记录保留 `merged_from`、`curated_at` 和 `created_by`。
+- **管理员全 scope 记忆管理工具**：`enable_admin_global_memory_tool` 开启后，管理员可使用 `memory_search_admin` 搜索 global、personal、group 和 conversation 的活跃记忆（不计入召回反馈），并通过 `memory_remove_admin` 按 URI、scope 和归属预览确认删除。确认码绑定当前记录指纹，记录变更即失效；非 global 目标必须提供对应 `owner_user_id`、`owner_session_id` 或完整 `umo`，避免跨归属误删。
+
+
 ## v0.4.3 (2026-08-19)
 
 ### 新增

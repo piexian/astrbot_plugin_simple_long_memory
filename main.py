@@ -220,6 +220,54 @@ def _confirmation_code(action: str, target: str = "") -> str:
     return f"{action}-{digest}"
 
 
+ADMIN_MANAGED_SCOPES = {
+    MemoryScope.GLOBAL,
+    MemoryScope.PERSONAL,
+    MemoryScope.GROUP,
+    MemoryScope.CONVERSATION,
+}
+ADMIN_SCOPE_OWNER_FIELDS = {
+    MemoryScope.PERSONAL: "owner_user_id",
+    MemoryScope.GROUP: "owner_session_id",
+    MemoryScope.CONVERSATION: "umo",
+}
+
+
+def _format_admin_removal_preview(
+    uri: str,
+    scope: str,
+    owner_id: str,
+    preview: dict[str, Any],
+    confirmation_code: str,
+    owner_field: str = "",
+) -> str:
+    """渲染管理员记忆删除预览，不输出完整正文。"""
+    records = preview.get("records", [])
+    lines = [
+        "[Administrator memory removal confirmation]",
+        f"URI: {uri}",
+        f"Scope: {scope}",
+        f"Owner: {owner_id or 'global'}",
+        f"Matching active records: {preview.get('count', 0)}",
+    ]
+    for index, record in enumerate(records[:10], start=1):
+        lines.append(
+            f"{index}. len={record.get('content_len', 0)}, "
+            f"sha256={record.get('content_sha256', '')}, "
+            f"preview={record.get('preview', '')}"
+        )
+    if len(records) > 10:
+        lines.append(f"... {len(records) - 10} more matching records")
+    target_args = f"uri='{uri}', scope='{scope}'"
+    if owner_field:
+        target_args += f", owner_id='{owner_id}'"
+    lines.append(
+        "No deletion has occurred. To confirm the exact current records, call "
+        f"memory_remove_admin({target_args}, confirm='{confirmation_code}')."
+    )
+    return "\n".join(lines)
+
+
 def _render_cmd_prefix(prefix: str) -> str:
     return prefix or "/"
 
@@ -2134,6 +2182,168 @@ class MemoryPlugin(Star):
             subject="global",
         )
         return f"Global memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_search_admin")
+    async def tool_search_admin(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        domain: str = "",
+        scope: str = "",
+        top_k: int = 5,
+    ) -> str:
+        """Search active memories across scopes for an administrator.
+
+        Use only for an administrator's explicit memory-management request.
+
+        Args:
+            query(string): search keywords or question
+            domain(string): optional filter (user_profile/preferences/facts/events/context)
+            scope(string): optional exact scope (global/personal/group/conversation)
+            top_k(int): number of results, from 1 to 20
+        """
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Administrator memory management tool is disabled in plugin config"
+        if not event.is_admin():
+            return "Only administrators can search memories across scopes"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        query = _sanitize_memory_content(query)
+        if not query:
+            return "Error: query is required"
+        domain_filter: str | None = None
+        if domain:
+            domain_filter = domain.lower().strip()
+            if domain_filter not in VALID_TOOL_DOMAINS:
+                valid = ", ".join(sorted(VALID_TOOL_DOMAINS))
+                return f"Error: invalid domain '{domain}'. Valid domains: {valid}"
+        scope_filter: str | None = None
+        if scope:
+            scope_filter = scope.lower().strip()
+            if scope_filter not in ADMIN_MANAGED_SCOPES:
+                valid = ", ".join(sorted(ADMIN_MANAGED_SCOPES))
+                return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        if isinstance(top_k, bool):
+            return f"Error: top_k must be an integer between 1 and 20, got '{top_k}'"
+        try:
+            top_k_value = int(top_k)
+        except (TypeError, ValueError):
+            return f"Error: top_k must be an integer between 1 and 20, got '{top_k}'"
+        if not 1 <= top_k_value <= 20:
+            return f"Error: top_k must be between 1 and 20, got {top_k_value}"
+        memories = await self.memory_mgr.recall_memories(
+            event,
+            query,
+            domain=domain_filter,
+            top_k=top_k_value,
+            all_users=True,
+            memory_scope=scope_filter,
+            bump=False,
+            source="tool_search_admin",
+        )
+        if not memories:
+            return "No active memories found"
+        result = format_memory_for_injection(
+            memories,
+            timezone_name=self._get_display_timezone(),
+            viewer_user_id=self._get_viewer_user_id(event),
+        )
+        targets = []
+        for memory in memories:
+            metadata = memory.get("metadata")
+            if not isinstance(metadata, dict) or not metadata.get("uri"):
+                continue
+            memory_scope = str(metadata.get("memory_scope", ""))
+            owner_field = ADMIN_SCOPE_OWNER_FIELDS.get(memory_scope, "")
+            owner_id = str(metadata.get(owner_field, "")) if owner_field else ""
+            targets.append(
+                f"- uri={metadata['uri']}; scope={memory_scope}; "
+                f"owner_id={owner_id or 'global'}"
+            )
+        targets_section = "\n".join(dict.fromkeys(targets))
+        return (
+            "<administrator_memory_management_results>\n"
+            f"Exact management targets:\n{targets_section}\n"
+            f"{result}\n</administrator_memory_management_results>"
+        )
+
+    @filter.llm_tool(name="memory_remove_admin")
+    async def tool_remove_admin(
+        self,
+        event: AstrMessageEvent,
+        uri: str,
+        scope: str,
+        owner_id: str = "",
+        confirm: str = "",
+    ) -> str:
+        """Preview then remove one exact-scope memory target for an administrator.
+
+        Args:
+            uri(string): exact memory URI returned by memory_search_admin
+            scope(string): exact scope (global/personal/group/conversation)
+            owner_id(string): required owner_user_id, owner_session_id, or umo for non-global scopes
+            confirm(string): confirmation code from the removal preview
+        """
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Administrator memory management tool is disabled in plugin config"
+        if not event.is_admin():
+            return "Only administrators can remove memories across scopes"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        uri = (uri or "").strip()
+        if not uri:
+            return "Error: uri is required"
+        try:
+            MemoryURI.parse(uri)
+        except ValueError as exc:
+            return f"Error: invalid memory URI '{uri}': {exc}"
+        scope_value = (scope or "").lower().strip()
+        if scope_value not in ADMIN_MANAGED_SCOPES:
+            valid = ", ".join(sorted(ADMIN_MANAGED_SCOPES))
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        owner_field = ADMIN_SCOPE_OWNER_FIELDS.get(scope_value, "")
+        owner_value = (owner_id or "").strip()
+        if owner_field and not owner_value:
+            return (
+                f"Error: owner_id is required for scope '{scope_value}' ({owner_field})"
+            )
+        if not owner_field and owner_value:
+            return "Error: owner_id must be empty for scope 'global'"
+        preview = await self.memory_mgr.preview_admin_memory_removal(
+            uri, scope_value, owner_value
+        )
+        if preview["count"] == 0:
+            return "Error: active memory not found for the exact URI, scope, and owner"
+        confirmation_code = _confirmation_code("remove-admin", preview["fingerprint"])
+        if str(confirm or "").strip() != confirmation_code:
+            return _format_admin_removal_preview(
+                uri,
+                scope_value,
+                owner_value,
+                preview,
+                confirmation_code,
+                owner_field,
+            )
+        outcome = await self.memory_mgr.forget_admin_memory_by_target(
+            uri, scope_value, owner_value, preview["fingerprint"]
+        )
+        if outcome["status"] == "changed":
+            current = outcome["preview"]
+            current_code = _confirmation_code("remove-admin", current["fingerprint"])
+            return (
+                "Error: memory changed since preview; no deletion occurred.\n"
+                + _format_admin_removal_preview(
+                    uri,
+                    scope_value,
+                    owner_value,
+                    current,
+                    current_code,
+                    owner_field,
+                )
+            )
+        if outcome["status"] == "not_found":
+            return "Error: active memory not found for the exact URI, scope, and owner"
+        return f"Memory deleted: {uri} ({outcome['deleted']} record(s))"
 
     @filter.llm_tool(name="memory_forget")
     async def tool_forget(self, event: AstrMessageEvent, uri: str) -> str:

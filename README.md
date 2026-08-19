@@ -41,8 +41,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | use_reranker | 记忆召回时启用重排序（需知识库已配置重排序模型） | `true` |
 | optimize_recall_query | 启用检索优化（LLM 提炼关键词） | `false` |
 | optimize_recall_query_timeout | 检索优化超时（秒） | `10` |
-| enable_admin_global_memory_tool | 启用管理员全局记忆工具 | `false` |
-| enable_admin_global_memory_tool | 启用管理员全局记忆工具 | `false` |
+| enable_admin_global_memory_tool | 启用管理员全局记忆写入及全 scope 精确搜索、确认删除工具 | `false` |
 | maintenance_enabled | 后台记忆整理总开关 | `false` |
 | maintenance_model_id | 整理模型（建议廉价模型） | 留空 |
 | maintenance_cron | 整理周期 cron 表达式 | `0 3 * * *` |
@@ -168,8 +167,11 @@ AI 可以通过以下工具主动操作记忆：
 - `memory_recall(query)` — 搜索长期记忆
 - `memory_store(content, memory_type, disclosure)` — 存储记忆
 - `memory_store_global(content, memory_type, disclosure)` — 存储全局记忆（需开启 `enable_admin_global_memory_tool`，仅管理员可用）
-- `memory_forget(uri)` — 删除记忆
+- `memory_search_admin(query, domain, scope, top_k)` — 搜索所有活跃记忆并返回精确管理目标（需开启 `enable_admin_global_memory_tool`，仅管理员；`domain`、`scope` 可选，`top_k` 为 1-20）
+- `memory_remove_admin(uri, scope, owner_id, confirm)` — 预览后按 URI、scope 和归属确认删除（同一开关、仅管理员；global 不传 `owner_id`，personal 使用 `owner_user_id`，group 使用 `owner_session_id`，conversation 使用完整 `umo`）
+- `memory_forget(uri)` — 删除当前用户有权限的记忆
 
+`memory_remove_admin` 首次调用只返回 URI、scope、归属、计数、正文长度、SHA-256 短指纹、80 字符预览和确认码，不会删除。确认调用会再次核对当前记录指纹；管理员可管理 global、personal、group 和 conversation 记忆，但必须指定精确 scope，非 global 还必须指定对应归属。
 ### 记忆类型
 
 | memory_type | 说明 |
@@ -222,7 +224,7 @@ AI 可以通过以下工具主动操作记忆：
 
 将 AstrBot 日志级别设为 DEBUG 后，可按 `trace_id` 串联一次召回：过滤器、dense/sparse/disclosure 通道、权限过滤、去重、重排、反馈更新、关联补充及最终结果。自动注入额外记录实际注入目标、格式化长度和每条记忆摘要。
 
-每条召回或注入记忆摘要包含 `uri`、scope、是否关联、`content_len`、内容 SHA-256 短指纹及压缩后的前 80 个字符 `preview`。写入、替换和删除记录其存储阶段和统计；自动提取记录快照、解析、LLM 耗时与写入统计。日志不记录完整记忆正文、原始对话或 LLM prompt。
+每条召回或注入记忆摘要包含 `uri`、scope、是否关联、`content_len`、内容 SHA-256 短指纹及压缩后的前 80 个字符 `preview`；注入上下文还会显示 AstrBot 时区下的 `created`/`updated`/`curated` 状态，以及共享记忆的 `current user`、`associated users` 或 `current group` 身份标签。写入、替换和删除记录其存储阶段和统计；自动提取记录快照、解析、LLM 耗时与写入统计。日志不记录完整记忆正文、原始对话或 LLM prompt。
 - 请确保先创建知识库并配置嵌入模型
 - 记忆数据存储在知识库中，删除知识库将丢失所有记忆
 - **请勿将记忆知识库挂载到 AstrBot 全局知识库配置中**。本插件通过 `user_id` 实现用户级记忆隔离，而 AstrBot 原生知识库检索不支持用户隔离，挂载后会导致所有用户共享彼此的记忆。仅个人独占使用时可忽略此限制

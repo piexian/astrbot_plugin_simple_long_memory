@@ -63,7 +63,7 @@
     },
     "enable_admin_global_memory_tool": {
       "description": "启用管理员全局记忆工具",
-      "hint": "开启后提供 memory_store_global 工具，仅管理员可通过 AI 添加对所有会话生效的全局记忆"
+      "hint": "开启后提供管理员全局记忆写入，以及跨 global/personal/group/conversation 的精确搜索和确认删除工具"
     },
     "recall_sparse_fusion": {
       "description": "启用稀疏检索融合",

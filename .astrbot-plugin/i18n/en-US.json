@@ -63,7 +63,7 @@
     },
     "enable_admin_global_memory_tool": {
       "description": "Enable Admin Global Memory Tool",
-      "hint": "When enabled, provides the memory_store_global tool so administrators can ask AI to add global memories that apply to all chats."
+      "hint": "When enabled, provides administrator-only global-memory storage plus exact search and confirmed removal across global, personal, group, and conversation scopes."
     },
     "recall_sparse_fusion": {
       "description": "Enable Sparse Retrieval Fusion",

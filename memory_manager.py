@@ -1335,6 +1335,8 @@ class MemoryManager:
             filters = {"is_memory_record": True, "deprecated": False}
             if domain:
                 filters["domain"] = domain
+            if memory_scope:
+                filters["memory_scope"] = memory_scope
             raw = await self._retrieve_with_filter(
                 query, fetch_k, filters, trace_id=trace_id
             )
@@ -1411,7 +1413,7 @@ class MemoryManager:
             await self._bump_recall_stats(recalled_uris, trace_id=trace_id)
 
         # 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
-        if self._link_manager:
+        if self._link_manager and not (all_users and memory_scope):
             linked_memories = await self._inject_linked_memories(
                 memories, event, all_users=all_users, trace_id=trace_id
             )
@@ -2050,6 +2052,119 @@ class MemoryManager:
             实际删除的记录数
         """
         return await self._delete_by_filters({"uri": uri}, uri)
+
+    async def preview_admin_memory_removal(
+        self, uri: str, memory_scope: str, owner_id: str
+    ) -> dict[str, Any]:
+        """返回管理员精确删除目标的预览及当前记录指纹。"""
+        filters: dict[str, Any] = {
+            "uri": uri,
+            "memory_scope": memory_scope,
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        owner_field = {
+            MemoryScope.PERSONAL: "owner_user_id",
+            MemoryScope.GROUP: "owner_session_id",
+            MemoryScope.CONVERSATION: "umo",
+        }.get(memory_scope, "")
+        if owner_field:
+            filters[owner_field] = owner_id
+        try:
+            page_size = int(self.config.get("memory_delete_scan_page_size", 1000))
+        except (TypeError, ValueError):
+            page_size = 1000
+        page_size = max(1, page_size)
+        offset = 0
+        records: list[dict[str, Any]] = []
+        fingerprint_items: list[dict[str, str]] = []
+        while True:
+            docs = await self.vec_db.document_storage.get_documents(
+                metadata_filters=filters, offset=offset, limit=page_size
+            )
+            if not docs:
+                break
+            offset += len(docs)
+            for doc in docs:
+                metadata = _safe_parse_metadata(doc.get("metadata", {}))
+                summary = _debug_memory_summary(
+                    {"text": doc.get("text", ""), "metadata": metadata}
+                )
+                records.append(summary)
+                fingerprint_items.append(
+                    {
+                        "doc_id": str(metadata.get("kb_doc_id") or doc.get("id", "")),
+                        "uri": str(metadata.get("uri", "")),
+                        "scope": str(metadata.get("memory_scope", "")),
+                        "owner": str(metadata.get(owner_field, "")),
+                        "content_sha256": str(summary["content_sha256"]),
+                    }
+                )
+            if len(docs) < page_size:
+                break
+        fingerprint_payload = json.dumps(
+            sorted(
+                fingerprint_items,
+                key=lambda item: (
+                    item["doc_id"],
+                    item["uri"],
+                    item["scope"],
+                    item["owner"],
+                    item["content_sha256"],
+                ),
+            ),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
+        logger.debug(
+            "[简单长期记忆] 管理员记忆删除预览: uri=%s, scope=%s, owner=%s, "
+            "records=%s, fingerprint=%s",
+            uri,
+            memory_scope,
+            owner_id or "global",
+            len(records),
+            fingerprint[:12],
+        )
+        return {
+            "count": len(records),
+            "records": records,
+            "fingerprint": fingerprint,
+        }
+
+    async def forget_admin_memory_by_target(
+        self, uri: str, memory_scope: str, owner_id: str, expected_fingerprint: str
+    ) -> dict[str, Any]:
+        """按 URI、scope 和归属精确删除管理员选定的记忆。"""
+        preview = await self.preview_admin_memory_removal(uri, memory_scope, owner_id)
+        if preview["count"] == 0:
+            return {"status": "not_found", "deleted": 0, "preview": preview}
+        if preview["fingerprint"] != expected_fingerprint:
+            logger.warning(
+                "[简单长期记忆] 管理员记忆删除确认失效: uri=%s, scope=%s, "
+                "owner=%s, expected=%s, actual=%s",
+                uri,
+                memory_scope,
+                owner_id or "global",
+                expected_fingerprint[:12],
+                preview["fingerprint"][:12],
+            )
+            return {"status": "changed", "deleted": 0, "preview": preview}
+        filters: dict[str, Any] = {
+            "uri": uri,
+            "memory_scope": memory_scope,
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        owner_field = {
+            MemoryScope.PERSONAL: "owner_user_id",
+            MemoryScope.GROUP: "owner_session_id",
+            MemoryScope.CONVERSATION: "umo",
+        }.get(memory_scope, "")
+        if owner_field:
+            filters[owner_field] = owner_id
+        deleted = await self._delete_by_filters(filters, uri)
+        return {"status": "deleted", "deleted": deleted, "preview": preview}
 
     async def _delete_by_filters(self, filters: dict[str, Any], uri: str) -> int:
         """按 filters 删除记忆并同步清理 KB 文档记录
