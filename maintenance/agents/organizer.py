@@ -57,10 +57,24 @@ class OrganizerAgent:
             "notes": "",
             "candidates_screened": 0,
             "llm_calls": 0,
+            "memory_count": 0,
+            "vector_count": 0,
+            "vector_missing": 0,
         }
 
         # 1. 拉取候选记忆（简化版：先拉取所有活跃记忆，Phase 4 完善按 owner 过滤）
         memories = await self._get_active_memories(owner_filter)
+        manifest["memory_count"] = len(memories)
+        manifest["vector_count"] = sum(
+            mem.get("vector") is not None for mem in memories
+        )
+        manifest["vector_missing"] = manifest["memory_count"] - manifest["vector_count"]
+        logger.debug(
+            "[简单长期记忆] 整理师记忆输入: memories=%s, vectors=%s, missing=%s",
+            manifest["memory_count"],
+            manifest["vector_count"],
+            manifest["vector_missing"],
+        )
         if len(memories) < 2:
             manifest["notes"] = "记忆数量不足，无需整理"
             return manifest
@@ -68,6 +82,11 @@ class OrganizerAgent:
         # 2. 两级预筛：向量余弦 ≥0.9 的候选对
         candidate_pairs = await self._screen_merge_candidates(memories)
         manifest["candidates_screened"] = len(candidate_pairs)
+        logger.debug(
+            "[简单长期记忆] 整理师预筛完成: threshold=%.2f, candidates=%s",
+            self._merge_cosine_threshold,
+            manifest["candidates_screened"],
+        )
 
         if not candidate_pairs:
             manifest["notes"] = "预筛后无 merge 候选对"
@@ -107,7 +126,12 @@ class OrganizerAgent:
 
         # 4. 批量质量检查（archive/update）——简化版，Phase 5 完善
         # 目前只处理 merge，archive/update 需要更复杂的 prompt，留 Phase 5
-
+        logger.debug(
+            "[简单长期记忆] 整理师完成: candidates=%s, merge=%s, llm_calls=%s",
+            manifest["candidates_screened"],
+            len(manifest["merge"]),
+            manifest["llm_calls"],
+        )
         return manifest
 
     async def _get_active_memories(

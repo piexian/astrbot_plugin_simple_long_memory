@@ -5,7 +5,7 @@ import unittest
 
 from maintenance.agents.analyst import AnalystAgent
 from maintenance.agents.reviewer import ReviewerAgent
-from maintenance.runner import MaintenanceRunner
+from maintenance.runner import AgentManifest, MaintenanceRunner
 
 
 def _mem(
@@ -28,6 +28,7 @@ class _FakeLLM:
     def __init__(self, max_calls: int = 50, responses: list | None = None):
         self.max_calls_per_cycle = max_calls
         self.calls = 0
+        self._cache_enabled = True
         self._responses = list(responses or [])
         self._cache: dict[str, dict] = {}
         self.prompts: list[str] = []
@@ -62,6 +63,12 @@ class _FakeLLM:
         if self._responses:
             return self._responses.pop(0)
         return json.dumps({"verdict": "approve", "reason": "ok", "confidence": 0.9})
+
+    def reset_cycle_stats(self) -> None:
+        self.calls = 0
+
+    def stats(self) -> dict[str, int]:
+        return {"calls": self.calls, "cache_hits": 0, "errors": 0}
 
 
 class _FakeMemoryMgr:
@@ -359,6 +366,111 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
             MaintenanceRunner._op_signature(op1),
             MaintenanceRunner._op_signature(op2),
         )
+
+
+class DryRunMaintenanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cycle_dry_run_calls_purge_preview_and_skips_host_execution(self):
+        memory_mgr = _FakeMemoryMgr()
+        purge_calls: list[bool] = []
+        executed = False
+
+        async def purge_deprecated(*, after_days: int, dry_run: bool):
+            purge_calls.append(dry_run)
+            return {
+                "candidates": 2,
+                "purged": 0,
+                "links_cleaned": 0,
+                "dry_run": dry_run,
+            }
+
+        async def organizer():
+            self.assertFalse(runner._llm._cache_enabled)
+            return AgentManifest(
+                agent_type="organizer", parsed=True, operations=[{"type": "archive"}]
+            )
+
+        async def analyst():
+            return AgentManifest(
+                agent_type="analyst", parsed=True, operations=[{"type": "new_link"}]
+            )
+
+        async def reviewer(organizer_manifest, analyst_manifest):
+            self.assertTrue(organizer_manifest.parsed)
+            self.assertTrue(analyst_manifest.parsed)
+            return [{"index": 0, "verdict": "approve"}]
+
+        async def execute_operations(report):
+            nonlocal executed
+            executed = True
+
+        memory_mgr.purge_deprecated = purge_deprecated
+        runner = MaintenanceRunner(None, memory_mgr, _FakeLLM(), {}, None, None)
+        runner._run_organizer = organizer
+        runner._run_analyst = analyst
+        runner._run_reviewer = reviewer
+        runner._execute_operations = execute_operations
+
+        report = await runner.run_cycle(dry_run=True)
+
+        self.assertTrue(report.dry_run)
+        self.assertEqual(purge_calls, [True])
+        self.assertEqual(report.purge_result["candidates"], 2)
+        self.assertFalse(executed)
+        self.assertEqual(report.executed_ops, 0)
+        self.assertTrue(runner._llm._cache_enabled)
+
+    async def test_agent_stages_disable_and_restore_llm_cache(self):
+        memory_mgr = _FakeMemoryMgr()
+        llm = _FakeLLM()
+        runner = MaintenanceRunner(None, memory_mgr, llm, {}, None, None)
+        cache_states: list[tuple[str, bool]] = []
+
+        async def organizer():
+            cache_states.append(("organizer", llm._cache_enabled))
+            return AgentManifest(agent_type="organizer", parsed=True)
+
+        async def analyst():
+            cache_states.append(("analyst", llm._cache_enabled))
+            return AgentManifest(agent_type="analyst", parsed=True)
+
+        async def reviewer(organizer_manifest, analyst_manifest):
+            self.assertTrue(organizer_manifest.parsed)
+            self.assertTrue(analyst_manifest.parsed)
+            cache_states.append(("reviewer", llm._cache_enabled))
+            return [{"index": 0, "verdict": "approve"}]
+
+        runner._run_organizer = organizer
+        runner._run_analyst = analyst
+        runner._run_reviewer = reviewer
+
+        for stage in ("organizer", "analyst", "reviewer"):
+            result = await runner.run_test_stage(stage)
+            self.assertTrue(result["dry_run"])
+            self.assertTrue(llm._cache_enabled)
+
+        self.assertTrue(cache_states)
+        self.assertTrue(all(not cache_enabled for _, cache_enabled in cache_states))
+
+    async def test_purge_stage_uses_dry_run_and_rejects_unknown_stage(self):
+        memory_mgr = _FakeMemoryMgr()
+        purge_calls: list[bool] = []
+
+        async def purge_deprecated(*, after_days: int, dry_run: bool):
+            purge_calls.append(dry_run)
+            self.assertFalse(runner._llm._cache_enabled)
+            return {"candidates": 3, "purged": 0, "dry_run": dry_run}
+
+        memory_mgr.purge_deprecated = purge_deprecated
+        runner = MaintenanceRunner(None, memory_mgr, _FakeLLM(), {}, None, None)
+
+        result = await runner.run_test_stage("purge")
+
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["purge"]["candidates"], 3)
+        self.assertEqual(purge_calls, [True])
+        self.assertTrue(runner._llm._cache_enabled)
+        with self.assertRaisesRegex(ValueError, "合法值"):
+            await runner.run_test_stage("unknown")
 
 
 if __name__ == "__main__":

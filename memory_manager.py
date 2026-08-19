@@ -150,6 +150,50 @@ def _clamp_importance(importance: int) -> int:
         return 3
 
 
+def _debug_content_summary(value: Any, preview_limit: int = 80) -> dict[str, Any]:
+    """返回用于 DEBUG 的脱敏内容摘要。"""
+    text = str(value or "").replace("\x00", " ")
+    compact = " ".join(text.split())
+    preview = compact[: max(0, preview_limit)]
+    if preview_limit > 0 and len(compact) > preview_limit:
+        preview += "..."
+    return {
+        "content_len": len(text),
+        "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+        "preview": preview,
+    }
+
+
+def _debug_filter_summary(filters: dict[str, Any]) -> dict[str, Any]:
+    """返回不含用户和会话标识的过滤条件摘要。"""
+    return {
+        "keys": sorted(filters),
+        "domain": filters.get("domain", ""),
+        "scope": filters.get("memory_scope", ""),
+        "visibility": filters.get("visibility", ""),
+        "has_owner_filter": bool(
+            filters.get("owner_user_id") or filters.get("owner_session_id")
+        ),
+        "deprecated": filters.get("deprecated"),
+    }
+
+
+def _debug_memory_summary(memory: dict[str, Any]) -> dict[str, Any]:
+    """返回实际召回或注入记忆的 URI 与正文预览。"""
+    metadata = _safe_parse_metadata(memory.get("metadata", {}))
+    body = (
+        metadata.get("memory_content")
+        or memory.get("text")
+        or memory.get("content", "")
+    )
+    return {
+        "uri": metadata.get("uri", ""),
+        "scope": metadata.get("memory_scope", ""),
+        "linked": bool(metadata.get("_is_linked", False)),
+        **_debug_content_summary(body),
+    }
+
+
 class MemoryManager:
     """记忆管理器 - 封装单知识库操作，通过 metadata 实现用户隔离"""
 
@@ -173,6 +217,7 @@ class MemoryManager:
         self._kv_delete = kv_delete
         # 关联表管理器（connect_kb 后初始化）
         self._link_manager: MemoryLinkManager | None = None
+        self._last_active_memory_stats: dict[str, Any] = {}
 
     # ---------- public state accessors ----------
     @property
@@ -195,10 +240,22 @@ class MemoryManager:
         """关联表管理器（KB 连接后可用）"""
         return self._link_manager
 
-    async def purge_deprecated(self, after_days: int = 7) -> dict[str, int]:
-        """物理清理废弃超期记忆（含关联边级联清理）。"""
+    @property
+    def last_active_memory_stats(self) -> dict[str, Any]:
+        """返回最近一次活跃记忆分页的向量加载统计。"""
+        return dict(self._last_active_memory_stats)
+
+    async def purge_deprecated(
+        self, after_days: int = 7, *, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """物理清理废弃记忆，或返回不写入的候选统计。"""
         if not self._kb_helper:
-            return {"purged": 0, "links_cleaned": 0}
+            return {
+                "purged": 0,
+                "links_cleaned": 0,
+                "candidates": 0,
+                "dry_run": dry_run,
+            }
         from .maintenance.purge import purge_deprecated_memories
 
         return await purge_deprecated_memories(
@@ -206,6 +263,7 @@ class MemoryManager:
             kb_helper=self._kb_helper,
             link_manager=self._link_manager,
             after_days=after_days,
+            dry_run=dry_run,
         )
 
     def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
@@ -348,11 +406,11 @@ class MemoryManager:
             logger.warning(f"[简单长期记忆] metadata 原地更新失败（不影响检索）: {e}")
             return 0
 
-    async def _bump_recall_stats(self, uris: list[str]) -> None:
+    async def _bump_recall_stats(self, uris: list[str], trace_id: str = "") -> int:
         """递增给定 uri 记忆的 recall_count 并刷新 last_recalled_at（P0.1 召回反馈）。"""
         uris = [u for u in uris if u]
         if not uris:
-            return
+            return 0
         now = datetime.now(timezone.utc).isoformat()
         set_clause = (
             "json_set(metadata, '$.recall_count', "
@@ -366,7 +424,14 @@ class MemoryManager:
         )
         params: dict[str, Any] = {"now": now}
         params.update({f"u{i}": u for i, u in enumerate(uris)})
-        await self._exec_metadata_update(set_clause, where_clause, params)
+        updated = await self._exec_metadata_update(set_clause, where_clause, params)
+        logger.debug(
+            "[简单长期记忆] 召回反馈更新: trace_id=%s, requested=%s, updated=%s",
+            trace_id or "-",
+            len(uris),
+            updated,
+        )
+        return updated
 
     async def expire_stale_memories(self, ttl_days: int) -> int:
         """TTL 过期：把超过 ttl_days 且未废弃的记忆标记 deprecated=True（P1.1）。
@@ -906,6 +971,18 @@ class MemoryManager:
         if uri is None:
             uri = str(MemoryURI.generate(domain))
 
+        logger.debug(
+            "[简单长期记忆] 存储开始: uri=%s, domain=%s, memory_type=%s, "
+            "scope=%s, visibility=%s, importance=%s, content=%s",
+            uri,
+            domain,
+            memory_type,
+            memory_scope,
+            visibility,
+            importance,
+            _debug_content_summary(content),
+        )
+
         # 重建/迁移期间：暂存到本地缓冲区并持久化到 KV，完成后批量处理
         if self._rebuilding:
             umo = event.unified_msg_origin
@@ -992,14 +1069,35 @@ class MemoryManager:
             id=doc_id,
         )
 
+        logger.debug(
+            "[简单长期记忆] 存储向量完成: uri=%s, doc_id=%s, kb_id=%s, "
+            "formatted_content_len=%s",
+            uri,
+            doc_id,
+            metadata["kb_id"],
+            len(formatted_content),
+        )
+
         # 注册为 KB 文档（界面可见）
+        kb_registered = False
         try:
             await self._register_kb_document(doc_id, uri, len(formatted_content))
             await self._sync_kb_stats()
+            kb_registered = True
+            logger.debug(
+                "[简单长期记忆] 存储 KB 注册完成: uri=%s, doc_id=%s",
+                uri,
+                doc_id,
+            )
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档注册失败（不影响记忆功能）: {e}")
 
-        logger.debug(f"[简单长期记忆] 存储记忆: {uri}, 用户: {metadata['user_id']}")
+        logger.debug(
+            "[简单长期记忆] 存储完成: uri=%s, doc_id=%s, kb_registered=%s",
+            uri,
+            doc_id,
+            kb_registered,
+        )
         return uri
 
     async def replace_memory(
@@ -1030,6 +1128,16 @@ class MemoryManager:
         new_uri = str(MemoryURI.generate(old_domain))
         new_doc_id = str(uuid.uuid4())
 
+        logger.debug(
+            "[简单长期记忆] 替换开始: old_uri=%s, old_doc_id=%s, new_uri=%s, "
+            "new_doc_id=%s, content=%s, disclosure_changed=%s",
+            old_uri,
+            old_metadata.get("kb_doc_id", ""),
+            new_uri,
+            new_doc_id,
+            _debug_content_summary(new_content),
+            new_disclosure is not None,
+        )
         # 构建新 metadata：复制全部旧字段，只更新内容相关字段
         new_metadata = {**old_metadata}
         new_metadata["uri"] = new_uri
@@ -1051,6 +1159,11 @@ class MemoryManager:
             metadata=new_metadata,
             id=new_doc_id,
         )
+        logger.debug(
+            "[简单长期记忆] 替换新向量写入完成: new_uri=%s, new_doc_id=%s",
+            new_uri,
+            new_doc_id,
+        )
 
         # 注册 KB 文档
         try:
@@ -1058,6 +1171,11 @@ class MemoryManager:
                 new_doc_id, new_uri, len(formatted_content)
             )
             await self._sync_kb_stats()
+            logger.debug(
+                "[简单长期记忆] 替换新 KB 注册完成: new_uri=%s, new_doc_id=%s",
+                new_uri,
+                new_doc_id,
+            )
         except Exception as e:
             logger.warning(f"[简单长期记忆] replace KB 文档注册失败: {e}")
 
@@ -1071,6 +1189,11 @@ class MemoryManager:
                     metadata_filters={"kb_doc_id": old_doc_id}
                 )
                 vector_deleted = True
+                logger.debug(
+                    "[简单长期记忆] 替换旧向量删除完成: old_uri=%s, old_doc_id=%s",
+                    old_uri,
+                    old_doc_id,
+                )
             except Exception as e:
                 logger.error(f"[简单长期记忆] replace 删除旧向量失败，中止操作: {e}")
                 # 尝试回滚：删除刚写入的新记录（向量 + KB 文档）
@@ -1100,6 +1223,11 @@ class MemoryManager:
                 try:
                     await self._unregister_kb_documents([old_doc_id])
                     await self._sync_kb_stats()
+                    logger.debug(
+                        "[简单长期记忆] 替换旧 KB 注销完成: old_uri=%s, old_doc_id=%s",
+                        old_uri,
+                        old_doc_id,
+                    )
                 except Exception as e:
                     logger.warning(f"[简单长期记忆] replace 删除旧 KB 文档失败: {e}")
         # 迁移关联边
@@ -1130,10 +1258,25 @@ class MemoryManager:
                         created_by="replace",
                     )
                 await self._link_manager.delete_links_for_uris([old_uri])
+                logger.debug(
+                    "[简单长期记忆] 替换关联迁移完成: old_uri=%s, new_uri=%s, "
+                    "outbound=%s, inbound=%s",
+                    old_uri,
+                    new_uri,
+                    len(out_links),
+                    len(in_links),
+                )
             except Exception as e:
                 logger.warning(f"[简单长期记忆] replace 关联迁移失败: {e}")
 
-        logger.debug(f"[简单长期记忆] 替换记忆: {old_uri} -> {new_uri}")
+        logger.debug(
+            "[简单长期记忆] 替换完成: old_uri=%s, old_doc_id=%s, new_uri=%s, "
+            "new_doc_id=%s",
+            old_uri,
+            old_metadata.get("kb_doc_id", ""),
+            new_uri,
+            new_doc_id,
+        )
         return new_uri
 
     async def recall_memories(
@@ -1145,6 +1288,7 @@ class MemoryManager:
         all_users: bool = False,
         memory_scope: str | None = None,
         bump: bool = False,
+        source: str = "unspecified",
     ) -> list[dict[str, Any]]:
         """召回相关记忆（自动按用户隔离）
 
@@ -1158,6 +1302,20 @@ class MemoryManager:
         Returns:
             记忆列表，每项包含 'text' 和 'metadata'
         """
+        trace_id = uuid.uuid4().hex[:8]
+        started_at = time.monotonic()
+        logger.debug(
+            "[简单长期记忆] 召回开始: trace_id=%s, source=%s, query=%s, "
+            "domain=%s, requested_top_k=%s, all_users=%s, scope=%s, bump=%s",
+            trace_id,
+            source,
+            _debug_content_summary(query, preview_limit=0),
+            domain or "",
+            top_k,
+            all_users,
+            memory_scope or "",
+            bump,
+        )
         if top_k is None:
             top_k = self.config.get("max_memories_per_inject", 5)
         fetch_k = max(top_k, min(top_k * 3, 20))
@@ -1166,8 +1324,20 @@ class MemoryManager:
             filters = {"is_memory_record": True, "deprecated": False}
             if domain:
                 filters["domain"] = domain
-            raw = await self._retrieve_with_filter(query, fetch_k, filters)
-            memories = self._dedupe_memories(raw)[:top_k]
+            raw = await self._retrieve_with_filter(
+                query, fetch_k, filters, trace_id=trace_id
+            )
+            deduped = self._dedupe_memories(raw)
+            memories = deduped[:top_k]
+            logger.debug(
+                "[简单长期记忆] 召回全局过滤完成: trace_id=%s, filter=%s, "
+                "raw=%s, deduped=%s, selected=%s",
+                trace_id,
+                _debug_filter_summary(filters),
+                len(raw),
+                len(deduped),
+                len(memories),
+            )
         else:
             global_memory = self.config.get("global_memory", True)
             filters_list = self._build_recall_filters(
@@ -1177,17 +1347,49 @@ class MemoryManager:
                 memory_scope=memory_scope,
             )
 
+            logger.debug(
+                "[简单长期记忆] 召回过滤器已构建: trace_id=%s, count=%s, filters=%s",
+                trace_id,
+                len(filters_list),
+                [_debug_filter_summary(filters) for filters in filters_list],
+            )
+
             tasks = [
-                self._retrieve_with_filter(query, fetch_k, filters)
+                self._retrieve_with_filter(query, fetch_k, filters, trace_id=trace_id)
                 for filters in filters_list
             ]
             results_list = await asyncio.gather(*tasks)
-            results = [item for sublist in results_list for item in sublist]
-            results = self._filter_visible_shared_personal(event, results)
-            memories = self._dedupe_memories(results)[:top_k]
+            channel_counts = [len(items) for items in results_list]
+            combined = [item for sublist in results_list for item in sublist]
+            visible = self._filter_visible_shared_personal(event, combined)
+            deduped = self._dedupe_memories(visible)
+            memories = deduped[:top_k]
+            logger.debug(
+                "[简单长期记忆] 召回过滤完成: trace_id=%s, per_filter=%s, "
+                "combined=%s, visible=%s, visibility_dropped=%s, deduped=%s, selected=%s",
+                trace_id,
+                channel_counts,
+                len(combined),
+                len(visible),
+                len(combined) - len(visible),
+                len(deduped),
+                len(memories),
+            )
 
         # P0.2 信号加权重排（importance / recall_count / recency / disclosure 匹配）
+        before_rerank = [
+            memory.get("metadata", {}).get("uri", "") for memory in memories
+        ]
         memories = self._rerank_by_signal(memories, query=query)
+        after_rerank = [
+            memory.get("metadata", {}).get("uri", "") for memory in memories
+        ]
+        logger.debug(
+            "[简单长期记忆] 召回信号重排完成: trace_id=%s, count=%s, order_changed=%s",
+            trace_id,
+            len(memories),
+            before_rerank != after_rerank,
+        )
         # P0.1 召回反馈：仅注入路径递增 recall_count（避免 search/selftest/工具调用污染频次信号）
         if bump:
             recalled_uris = [
@@ -1195,19 +1397,27 @@ class MemoryManager:
                 for m in memories
                 if m.get("metadata", {}).get("uri")
             ]
-            await self._bump_recall_stats(recalled_uris)
+            await self._bump_recall_stats(recalled_uris, trace_id=trace_id)
 
         # 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
         if self._link_manager:
             linked_memories = await self._inject_linked_memories(
-                memories, event, all_users=all_users
+                memories, event, all_users=all_users, trace_id=trace_id
             )
             if linked_memories:
                 memories.extend(linked_memories)
                 # 关联注入后截断到 top_k，避免超出调用方预期
                 if top_k and len(memories) > top_k:
                     memories = memories[:top_k]
-        logger.debug(f"[简单长期记忆] 召回 {len(memories)} 条记忆")
+        logger.debug(
+            "[简单长期记忆] 召回完成: trace_id=%s, source=%s, count=%s, "
+            "elapsed_ms=%s, memories=%s",
+            trace_id,
+            source,
+            len(memories),
+            round((time.monotonic() - started_at) * 1000),
+            [_debug_memory_summary(memory) for memory in memories],
+        )
         return memories
 
     async def _inject_linked_memories(
@@ -1215,6 +1425,7 @@ class MemoryManager:
         memories: list[dict[str, Any]],
         event: AstrMessageEvent | None = None,
         all_users: bool = False,
+        trace_id: str = "",
     ) -> list[dict[str, Any]]:
         """注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）。
 
@@ -1265,6 +1476,11 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(f"[简单长期记忆] 查询关联失败: {uri}, {e}")
         if not linked_uris:
+            logger.debug(
+                "[简单长期记忆] 关联注入无候选: trace_id=%s, primary_count=%s",
+                trace_id or "-",
+                len(main_uris),
+            )
             return []
 
         # 拉取关联记忆内容（限制数量）
@@ -1289,6 +1505,15 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(f"[简单长期记忆] 拉取关联记忆失败: {uri}, {e}")
 
+        logger.debug(
+            "[简单长期记忆] 关联注入完成: trace_id=%s, primary_count=%s, "
+            "candidate_count=%s, injected=%s, memories=%s",
+            trace_id or "-",
+            len(main_uris),
+            len(linked_uris),
+            len(linked_memories),
+            [_debug_memory_summary(memory) for memory in linked_memories],
+        )
         return linked_memories
 
     async def _get_memory_by_uri(self, uri: str) -> dict[str, Any] | None:
@@ -1421,7 +1646,15 @@ class MemoryManager:
         query: str,
         top_k: int,
         filters: dict[str, Any],
+        trace_id: str = "",
     ) -> list[dict[str, Any]]:
+        started_at = time.monotonic()
+        logger.debug(
+            "[简单长期记忆] 检索通道开始: trace_id=%s, top_k=%s, filter=%s",
+            trace_id or "-",
+            top_k,
+            _debug_filter_summary(filters),
+        )
         use_rerank = self.config.get("use_reranker", True)
         # 稠密检索（本阶段不 rerank，融合后再统一 rerank）
         dense_results = await self.vec_db.retrieve(
@@ -1444,10 +1677,14 @@ class MemoryManager:
         # P0.3 稀疏检索（FTS5）
         sparse_memories: list[dict[str, Any]] = []
         if self.config.get("recall_sparse_fusion", True):
-            sparse_memories = await self._sparse_retrieve(query, top_k, filters)
+            sparse_memories = await self._sparse_retrieve(
+                query, top_k, filters, trace_id=trace_id
+            )
 
         # Disclosure 精确匹配通道
-        disclosure_memories = await self._disclosure_retrieve(query, top_k, filters)
+        disclosure_memories = await self._disclosure_retrieve(
+            query, top_k, filters, trace_id=trace_id
+        )
 
         # RRF 多通道融合（空列表自动跳过）
         channels = [dense_memories]
@@ -1461,6 +1698,7 @@ class MemoryManager:
             else dense_memories
         )
         # 融合后统一 rerank（复用知识库配置的 rerank provider）
+        rerank_applied = False
         if use_rerank and memories:
             rerank_provider = getattr(self.vec_db, "rerank_provider", None)
             if rerank_provider:
@@ -1475,16 +1713,37 @@ class MemoryManager:
                         for r in reranked
                         if 0 <= r.index < len(memories)
                     ]
+                    rerank_applied = True
                 except Exception as e:
                     logger.debug(f"[简单长期记忆] rerank 失败，使用融合结果: {e}")
+        logger.debug(
+            "[简单长期记忆] 检索通道完成: trace_id=%s, dense=%s, sparse=%s, "
+            "disclosure=%s, fused=%s, rerank_applied=%s, output=%s, elapsed_ms=%s",
+            trace_id or "-",
+            len(dense_memories),
+            len(sparse_memories),
+            len(disclosure_memories),
+            len(memories),
+            rerank_applied,
+            len(memories),
+            round((time.monotonic() - started_at) * 1000),
+        )
         return memories
 
     async def _sparse_retrieve(
-        self, query: str, top_k: int, filters: dict[str, Any]
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any],
+        trace_id: str = "",
     ) -> list[dict[str, Any]]:
         """FTS5 稀疏检索（P0.3）。不可用或失败时返回空列表，调用方回退纯稠密。"""
         tokens = self._tokenize_query(query)
         if not tokens:
+            logger.debug(
+                "[简单长期记忆] 稀疏检索跳过: trace_id=%s, reason=no_tokens",
+                trace_id or "-",
+            )
             return []
         try:
             docs = await self.vec_db.document_storage.search_sparse(
@@ -1507,6 +1766,15 @@ class MemoryManager:
                     "similarity": -float(doc.get("score", 0) or 0),
                 }
             )
+        logger.debug(
+            "[简单长期记忆] 稀疏检索完成: trace_id=%s, tokens=%s, scanned=%s, "
+            "filtered_out=%s, matched=%s",
+            trace_id or "-",
+            len(tokens),
+            len(docs),
+            len(docs) - len(out),
+            len(out),
+        )
         return out
 
     def _tokenize_query(self, query: str) -> list[str]:
@@ -1573,7 +1841,11 @@ class MemoryManager:
         return " AND ".join(clauses) if clauses else "1=1", params
 
     async def _disclosure_retrieve(
-        self, query: str, top_k: int, filters: dict[str, Any]
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any],
+        trace_id: str = "",
     ) -> list[dict[str, Any]]:
         """Disclosure 精确匹配检索通道。
 
@@ -1653,8 +1925,16 @@ class MemoryManager:
             logger.debug(f"[简单长期记忆] disclosure 检索失败: {e}")
             return []
 
-        if matched:
-            logger.debug(f"[简单长期记忆] disclosure 匹配 {len(matched)} 条记忆")
+        logger.debug(
+            "[简单长期记忆] disclosure 检索完成: trace_id=%s, tokens=%s, "
+            "scanned=%s, scan_limit=%s, target=%s, matched=%s",
+            trace_id or "-",
+            len(query_tokens),
+            offset,
+            scan_limit,
+            target_matches,
+            len(matched),
+        )
         return matched
 
     def _rrf_fuse(
@@ -1761,9 +2041,22 @@ class MemoryManager:
         uris: list[str] = []
         deleted = 0
         collection_ok = False
+        logger.debug(
+            "[简单长期记忆] 删除开始: uri=%s, filters=%s",
+            uri,
+            _debug_filter_summary(filters),
+        )
         try:
             doc_ids, uris, deleted = await self._collect_kb_doc_ids_for_filters(filters)
             collection_ok = True
+            logger.debug(
+                "[简单长期记忆] 删除候选收集完成: uri=%s, records=%s, "
+                "kb_doc_ids=%s, uris=%s",
+                uri,
+                deleted,
+                len(doc_ids),
+                len(uris),
+            )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 查询待删除文档失败: {e}")
 
@@ -1773,17 +2066,31 @@ class MemoryManager:
             return 0
 
         await self.vec_db.delete_documents(metadata_filters=filters)
-
+        logger.debug(
+            "[简单长期记忆] 删除向量完成: uri=%s, records=%s",
+            uri,
+            deleted,
+        )
         # 同步删除 KB 文档记录
         try:
             await self._unregister_kb_documents(doc_ids)
             await self._sync_kb_stats()
+            logger.debug(
+                "[简单长期记忆] 删除 KB 注销完成: uri=%s, kb_doc_ids=%s",
+                uri,
+                len(doc_ids),
+            )
         except Exception as e:
             logger.warning(f"[简单长期记忆] KB 文档删除失败: {e}")
 
         # 级联清理关联边
         if self._link_manager and uris:
             await self._link_manager.delete_links_for_uris(uris)
+            logger.debug(
+                "[简单长期记忆] 删除关联清理完成: uri=%s, affected_uris=%s",
+                uri,
+                len(uris),
+            )
         logger.info(f"[简单长期记忆] 删除记忆: {uri}, 实际删除 {deleted} 条")
         return deleted
 
@@ -2162,6 +2469,81 @@ class MemoryManager:
             "compressed": compressed,
         }
 
+    @staticmethod
+    def _prepare_faiss_index(faiss_index: Any) -> dict[str, Any]:
+        """准备 FAISS 索引及外部 doc ID 到内部 position 的映射。"""
+        if faiss_index is None:
+            return {"mode": "index_unavailable", "error": "index is None"}
+        try:
+            import faiss
+        except Exception as exc:
+            return {
+                "mode": "faiss_unavailable",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        index_type = type(faiss_index).__name__
+        common = {
+            "faiss": faiss,
+            "index_type": index_type,
+            "ntotal": int(getattr(faiss_index, "ntotal", 0) or 0),
+        }
+        if not (hasattr(faiss_index, "id_map") and hasattr(faiss_index, "index")):
+            return {**common, "mode": "direct"}
+
+        try:
+            external_ids = faiss.vector_to_array(faiss_index.id_map)
+            positions: dict[int, int] = {}
+            duplicate_ids = 0
+            for position, external_id in enumerate(external_ids.tolist()):
+                key = int(external_id)
+                if key in positions:
+                    duplicate_ids += 1
+                    continue
+                positions[key] = position
+            return {
+                **common,
+                "mode": "id_map",
+                "positions": positions,
+                "duplicate_ids": duplicate_ids,
+            }
+        except Exception as exc:
+            return {
+                **common,
+                "mode": "index_unavailable",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    @staticmethod
+    def _reconstruct_faiss_vector(
+        faiss_index: Any,
+        doc_int_id: int,
+        prepared: dict[str, Any],
+    ) -> tuple[list[float] | None, str, str]:
+        """按 FAISS 索引类型重建单条向量并返回诊断状态。"""
+        mode = prepared.get("mode")
+        if mode in {"index_unavailable", "faiss_unavailable"}:
+            return None, mode, str(prepared.get("error", ""))
+        try:
+            if mode == "id_map":
+                position = prepared.get("positions", {}).get(int(doc_int_id))
+                if position is None:
+                    return None, "id_not_found", f"doc_id={doc_int_id}"
+                base_index = prepared["faiss"].downcast_index(faiss_index.index)
+                vector = base_index.reconstruct(int(position))
+            else:
+                vector = faiss_index.reconstruct(int(doc_int_id))
+            import numpy as np
+
+            values = np.asarray(vector, dtype=np.float32).reshape(-1)
+            if values.size == 0:
+                return None, "invalid_vector", "empty vector"
+            if not np.all(np.isfinite(values)):
+                return None, "invalid_vector", "non-finite value"
+            return values.tolist(), "ok", ""
+        except Exception as exc:
+            return None, "reconstruct_error", f"{type(exc).__name__}: {exc}"
+
     async def get_all_active_memories(
         self,
         owner_filter: dict[str, Any] | None = None,
@@ -2185,28 +2567,60 @@ class MemoryManager:
         if owner_filter:
             filters.update(owner_filter)
 
+        stats: dict[str, Any] = {
+            "offset": offset,
+            "limit": limit,
+            "documents": 0,
+            "vectors_loaded": 0,
+            "vectors_missing": 0,
+            "missing_by_reason": {},
+        }
         try:
             docs = await self.vec_db.document_storage.get_documents(
                 metadata_filters=filters,
                 limit=limit,
                 offset=offset,
             )
-            # 从 FAISS 索引加载向量（document_storage 不返回 vector 字段）
-            faiss_index = None
+            stats["documents"] = len(docs)
             embedding_storage = getattr(self.vec_db, "embedding_storage", None)
-            if embedding_storage is not None:
-                faiss_index = getattr(embedding_storage, "index", None)
+            faiss_index = (
+                getattr(embedding_storage, "index", None)
+                if embedding_storage is not None
+                else None
+            )
+            prepared = self._prepare_faiss_index(faiss_index)
+            stats.update(
+                {
+                    "index_type": prepared.get("index_type", ""),
+                    "index_mode": prepared.get("mode", "index_unavailable"),
+                    "index_ntotal": prepared.get("ntotal", 0),
+                    "index_duplicate_ids": prepared.get("duplicate_ids", 0),
+                }
+            )
 
             memories = []
             for doc in docs:
                 metadata = _safe_parse_metadata(doc.get("metadata", {}))
                 vector = None
                 doc_int_id = doc.get("id")
-                if faiss_index is not None and doc_int_id is not None:
-                    try:
-                        vector = faiss_index.reconstruct(int(doc_int_id)).tolist()
-                    except Exception:
-                        pass  # 向量不存在时跳过，organizer/analyst 会过滤
+                if doc_int_id is None:
+                    status, detail = "document_id_missing", "document id is None"
+                else:
+                    vector, status, detail = self._reconstruct_faiss_vector(
+                        faiss_index, int(doc_int_id), prepared
+                    )
+                if vector is None:
+                    stats["vectors_missing"] += 1
+                    missing = stats["missing_by_reason"]
+                    missing[status] = missing.get(status, 0) + 1
+                    logger.debug(
+                        "[简单长期记忆] 活跃记忆向量不可用: doc_id=%s, status=%s, detail=%s",
+                        doc_int_id,
+                        status,
+                        detail,
+                    )
+                else:
+                    stats["vectors_loaded"] += 1
                 memories.append(
                     {
                         "uri": metadata.get("uri", ""),
@@ -2215,9 +2629,21 @@ class MemoryManager:
                         "vector": vector,
                     }
                 )
+            self._last_active_memory_stats = stats
+            logger.debug(
+                "[简单长期记忆] 活跃记忆分页完成: filters=%s, stats=%s",
+                filters,
+                stats,
+            )
             return memories
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] 拉取活跃记忆失败: {e}")
+        except Exception as exc:
+            stats["error"] = f"{type(exc).__name__}: {exc}"
+            self._last_active_memory_stats = stats
+            logger.exception(
+                "[简单长期记忆] 拉取活跃记忆失败: filters=%s, stats=%s",
+                filters,
+                stats,
+            )
             return []
 
     async def deprecate_memory(self, uri: str, reason: str = "") -> bool:
@@ -2600,6 +3026,13 @@ class MemoryManager:
         Returns:
             {"success": int, "failed": int, "remaining_records": list}
         """
+        logger.debug(
+            "[简单长期记忆] 重建恢复开始: records=%s, context_present=%s, "
+            "current_kb=%s",
+            len(memory_records),
+            bool(rebuild_context),
+            self._kb_name or "(unknown)",
+        )
         if not memory_records:
             return {
                 "success": 0,
@@ -2636,17 +3069,28 @@ class MemoryManager:
                 "error": f"目标知识库 ID 不匹配: {target_kb.kb.kb_name}",
             }
 
+        logger.debug(
+            "[简单长期记忆] 重建恢复目标已确定: target_kb=%s, target_kb_id=%s, "
+            "records=%s",
+            target_kb.kb.kb_name,
+            target_kb.kb.kb_id,
+            len(memory_records),
+        )
         success = 0
         failed = 0
         remaining_records: list[dict[str, Any]] = []
 
-        for record in memory_records:
+        for index, record in enumerate(memory_records, start=1):
             text = record.get("text", "")
             metadata = record.get("metadata", {})
             uri = metadata.get("uri", "")
 
             if not text:
-                logger.warning("[简单长期记忆] 快照恢复跳过空内容记录")
+                logger.warning(
+                    "[简单长期记忆] 快照恢复跳过空内容记录: index=%s/%s",
+                    index,
+                    len(memory_records),
+                )
                 failed += 1
                 continue
 
@@ -2663,6 +3107,14 @@ class MemoryManager:
                             remaining_records.append(record)
                             continue
                         success += 1
+                        logger.debug(
+                            "[简单长期记忆] 快照恢复复用已有记录: index=%s/%s, "
+                            "success=%s, failed=%s",
+                            index,
+                            len(memory_records),
+                            success,
+                            failed,
+                        )
                         continue
 
                 new_doc_id = str(uuid.uuid4())
@@ -2688,8 +3140,22 @@ class MemoryManager:
                     kb_helper=target_kb,
                 )
                 success += 1
+                logger.debug(
+                    "[简单长期记忆] 快照恢复写入成功: index=%s/%s, success=%s, failed=%s",
+                    index,
+                    len(memory_records),
+                    success,
+                    failed,
+                )
             except Exception as e:
-                logger.warning(f"[简单长期记忆] 快照恢复写入失败 (URI: {uri}): {e}")
+                logger.warning(
+                    "[简单长期记忆] 快照恢复写入失败: index=%s/%s, "
+                    "error_type=%s, error=%s",
+                    index,
+                    len(memory_records),
+                    type(e).__name__,
+                    e,
+                )
                 failed += 1
                 remaining_records.append(record)
 
@@ -2700,6 +3166,14 @@ class MemoryManager:
                 logger.warning(f"[简单长期记忆] 快照恢复后统计同步失败: {e}")
 
         logger.info(f"[简单长期记忆] 快照恢复完成: 成功 {success}, 失败 {failed}")
+        logger.debug(
+            "[简单长期记忆] 重建恢复结束: total=%s, success=%s, failed=%s, "
+            "remaining=%s",
+            len(memory_records),
+            success,
+            failed,
+            len(remaining_records),
+        )
         return {
             "success": success,
             "failed": failed,
@@ -2780,6 +3254,17 @@ class MemoryManager:
         # 立即加锁，防止并发竞态；finally 会兜底释放，避免异常路径遗留锁
         self._rebuilding = True
 
+        logger.debug(
+            "[简单长期记忆] 重建开始: target_kb=%s, source_kb=%s, mode=%s, "
+            "source_connected=%s, pending_before=%s",
+            target_kb_name or "(current)",
+            self._kb_name or "(unknown)",
+            "migration"
+            if target_kb_name and target_kb_name != self._kb_name
+            else "rebuild",
+            self.is_kb_connected,
+            len(self._pending_writes),
+        )
         try:
             if self._kv_delete:
                 for key in (
@@ -2797,6 +3282,14 @@ class MemoryManager:
             is_migration = (
                 target_kb_name is not None and target_kb_name != source_kb_name
             )
+            logger.debug(
+                "[简单长期记忆] 重建目标解析: source_kb=%s, source_kb_id=%s, "
+                "target_kb=%s, mode=%s",
+                source_kb_name or "(unknown)",
+                getattr(getattr(source_kb, "kb", None), "kb_id", "(unknown)"),
+                target_kb_name or "(current)",
+                "migration" if is_migration else "rebuild",
+            )
 
             # 解析目标 KB
             if is_migration:
@@ -2804,6 +3297,11 @@ class MemoryManager:
                 if not target_kb:
                     all_kbs = await self._list_all_kb_names()
                     available = ", ".join(all_kbs) if all_kbs else "(无)"
+                    logger.debug(
+                        "[简单长期记忆] 重建目标不存在: target_kb=%s, available_count=%s",
+                        target_kb_name,
+                        len(all_kbs),
+                    )
                     raise ValueError(
                         f"目标知识库 '{target_kb_name}' 不存在。"
                         f"当前可用知识库: {available}"
@@ -2813,6 +3311,13 @@ class MemoryManager:
                         "is_memory_record": True,
                         "kb_id": target_kb.kb.kb_id,
                     }
+                )
+                logger.debug(
+                    "[简单长期记忆] 迁移目标检查: target_kb=%s, target_kb_id=%s, "
+                    "existing_records=%s",
+                    target_kb_name,
+                    target_kb.kb.kb_id,
+                    target_existing,
                 )
                 if target_existing > 0:
                     return await self._finalize_rebuild(
@@ -2830,6 +3335,12 @@ class MemoryManager:
                 target_kb = source_kb
                 target_kb_name = source_kb_name
 
+            logger.debug(
+                "[简单长期记忆] 重建目标已确定: target_kb=%s, target_kb_id=%s, mode=%s",
+                target_kb_name or "(unknown)",
+                getattr(getattr(target_kb, "kb", None), "kb_id", "(unknown)"),
+                "migration" if is_migration else "rebuild",
+            )
             if self._kv_put:
                 await self._kv_put(
                     "rebuild_context",
@@ -2860,6 +3371,15 @@ class MemoryManager:
                     if not page_docs:
                         break
                     offset += len(page_docs)
+                    logger.debug(
+                        "[简单长期记忆] 重建收集分页: filters=%s, page_count=%s, "
+                        "offset=%s, unique_records=%s, unique_doc_ids=%s",
+                        metadata_filters,
+                        len(page_docs),
+                        offset,
+                        len(memory_records),
+                        len(source_doc_ids),
+                    )
                     for doc in page_docs:
                         metadata = _safe_parse_metadata(doc.get("metadata", {}))
                         if not metadata.get("uri"):
@@ -2902,6 +3422,14 @@ class MemoryManager:
                 f"[简单长期记忆] 已拉取 {total} 条记忆到本地, "
                 f"模式: {'迁移' if is_migration else '重建'}"
             )
+            logger.debug(
+                "[简单长期记忆] 重建收集完成: total=%s, source_doc_ids=%s, "
+                "deduplicated=%s, source_kb_id=%s",
+                total,
+                len(source_doc_ids),
+                len(seen_records) - total,
+                source_kb_id,
+            )
 
             # 安全检查：拉取 0 条但源 KB 有记忆记录时中止，防止误删
             if total == 0:
@@ -2926,9 +3454,23 @@ class MemoryManager:
             if self._kv_put:
                 await self._kv_put("rebuild_memory_records", memory_records)
                 await self._kv_put("rebuild_status", "in_progress")
+                logger.debug(
+                    "[简单长期记忆] 重建快照已持久化: records=%s, status=%s, "
+                    "context=%s",
+                    total,
+                    "in_progress",
+                    bool(self._kv_put),
+                )
 
             # ── 阶段 2: 清空源 KB（原地重建时）或 留待后续清理（迁移时） ──
             if not is_migration:
+                logger.debug(
+                    "[简单长期记忆] 重建阶段 2 开始: source_kb=%s, records=%s, "
+                    "source_doc_ids=%s",
+                    source_kb_name,
+                    total,
+                    len(source_doc_ids),
+                )
                 try:
                     await self._delete_rebuild_source_records(source_kb, memory_records)
                     if source_doc_ids:
@@ -2936,6 +3478,12 @@ class MemoryManager:
                             source_doc_ids, kb_helper=source_kb
                         )
                     logger.info("[简单长期记忆] 已清空当前知识库旧记忆")
+                    logger.debug(
+                        "[简单长期记忆] 重建阶段 2 完成: deleted_memory_records=%s, "
+                        "unregistered_doc_ids=%s",
+                        total,
+                        len(source_doc_ids),
+                    )
                 except Exception as e:
                     logger.error(f"[简单长期记忆] 清空当前知识库失败: {e}")
                     return await self._finalize_rebuild(
@@ -2950,8 +3498,15 @@ class MemoryManager:
             # ── 阶段 3: 从本地缓存写入目标 KB ──
             success = 0
             failed = 0
+            logger.debug(
+                "[简单长期记忆] 重建阶段 3 开始: target_kb=%s, target_kb_id=%s, "
+                "records=%s",
+                target_kb_name,
+                target_kb.kb.kb_id,
+                total,
+            )
 
-            for record in memory_records:
+            for index, record in enumerate(memory_records, start=1):
                 text = record["text"]
                 metadata = record["metadata"]
                 uri = metadata.get("uri", "")
@@ -2981,14 +3536,49 @@ class MemoryManager:
                     )
 
                     success += 1
+                    logger.debug(
+                        "[简单长期记忆] 重建写入成功: index=%s/%s, success=%s, failed=%s",
+                        index,
+                        total,
+                        success,
+                        failed,
+                    )
                 except Exception as e:
-                    logger.warning(f"[简单长期记忆] 写入记忆失败 (URI: {uri}): {e}")
+                    logger.warning(
+                        "[简单长期记忆] 写入记忆失败: index=%s/%s, error_type=%s, error=%s",
+                        index,
+                        total,
+                        type(e).__name__,
+                        e,
+                    )
                     failed += 1
+                    logger.debug(
+                        "[简单长期记忆] 重建写入失败统计: index=%s/%s, success=%s, failed=%s",
+                        index,
+                        total,
+                        success,
+                        failed,
+                    )
 
+            logger.debug(
+                "[简单长期记忆] 重建阶段 3 完成: total=%s, success=%s, failed=%s",
+                total,
+                success,
+                failed,
+            )
             # ── 阶段 4: 迁移模式 — 仅当全部成功时清空源 KB 并切换 ──
             migration_committed = False
             migration_commit_error = ""
             if is_migration:
+                logger.debug(
+                    "[简单长期记忆] 重建阶段 4 开始: source_kb=%s, target_kb=%s, "
+                    "success=%s, failed=%s, source_doc_ids=%s",
+                    source_kb_name,
+                    target_kb_name,
+                    success,
+                    failed,
+                    len(source_doc_ids),
+                )
                 if failed == 0:
                     try:
                         # 先导出源关联表（在删除源记录之前）
@@ -2996,6 +3586,12 @@ class MemoryManager:
                         if self._link_manager:
                             exported_links = await self._link_manager.export_all()
 
+                        logger.debug(
+                            "[简单长期记忆] 迁移提交准备: exported_links=%s, "
+                            "source_doc_ids=%s",
+                            len(exported_links),
+                            len(source_doc_ids),
+                        )
                         await self._delete_rebuild_source_records(
                             source_kb, memory_records
                         )
@@ -3021,6 +3617,12 @@ class MemoryManager:
                                 logger.info(f"[简单长期记忆] 迁移关联表: {imported} 条")
                         migration_committed = True
                         logger.info(f"[简单长期记忆] 已迁移到知识库: {target_kb_name}")
+                        logger.debug(
+                            "[简单长期记忆] 重建阶段 4 完成: committed=%s, "
+                            "imported_links=%s",
+                            migration_committed,
+                            len(exported_links),
+                        )
                     except Exception as e:
                         migration_commit_error = f"清理源知识库失败: {e}"
                         logger.error(f"[简单长期记忆] {migration_commit_error}")
@@ -3029,14 +3631,34 @@ class MemoryManager:
                         f"[简单长期记忆] 存在 {failed} 条写入失败，"
                         "跳过源知识库清理以防止数据丢失"
                     )
+                    logger.debug(
+                        "[简单长期记忆] 重建阶段 4 跳过源清理: failed=%s, "
+                        "reason=target_write_failures",
+                        failed,
+                    )
 
             # ── 阶段 5: 同步统计 ──
+            logger.debug(
+                "[简单长期记忆] 重建阶段 5 开始: source_sync=%s, target_sync=%s",
+                is_migration,
+                True,
+            )
             try:
                 if is_migration:
                     await self._sync_kb_stats(kb_helper=source_kb)
                 await self._sync_kb_stats(kb_helper=target_kb)
+                logger.debug(
+                    "[简单长期记忆] 重建阶段 5 完成: source_sync=%s, target_sync=%s",
+                    is_migration,
+                    True,
+                )
             except Exception as e:
                 logger.warning(f"[简单长期记忆] 同步统计数据失败: {e}")
+                logger.debug(
+                    "[简单长期记忆] 重建阶段 5 异常: error_type=%s, error=%s",
+                    type(e).__name__,
+                    e,
+                )
 
             # ── 阶段 6: 解锁 + 处理缓冲写入 ──
             self._rebuilding = False
@@ -3045,6 +3667,15 @@ class MemoryManager:
                 source_kb if is_migration and not migration_committed else None
             )
             pending_flushed = await self._flush_pending_writes(target_kb=flush_target)
+            logger.debug(
+                "[简单长期记忆] 重建阶段 6 完成: flush_target=%s, pending_flushed=%s, "
+                "pending_remaining=%s",
+                getattr(getattr(flush_target, "kb", None), "kb_name", None)
+                if flush_target
+                else "current",
+                pending_flushed,
+                len(self._pending_writes),
+            )
 
             final_status = "completed" if failed == 0 else "partial"
             if migration_commit_error:
@@ -3056,10 +3687,25 @@ class MemoryManager:
             verification_expected = success
             if not is_migration or migration_committed:
                 verification_expected += pending_flushed
+            logger.debug(
+                "[简单长期记忆] 重建阶段 7 开始: expected_success=%s, "
+                "expected_pending=%s, expected_total=%s",
+                success,
+                pending_flushed,
+                verification_expected,
+            )
             verification = await self._verify_rebuild_integrity(
                 target_kb,
                 total,
                 verification_expected,
+            )
+            logger.debug(
+                "[简单长期记忆] 重建阶段 7 完成: expected=%s, actual=%s, diff=%s, "
+                "passed=%s",
+                verification.get("expected"),
+                verification.get("actual"),
+                verification.get("diff"),
+                verification.get("passed"),
             )
 
             logger.info(
@@ -3100,12 +3746,25 @@ class MemoryManager:
         Returns:
             {"passed": bool, "expected": int, "actual": int, "diff": int}
         """
+        logger.debug(
+            "[简单长期记忆] 完整性校验开始: target_kb=%s, target_kb_id=%s, "
+            "source_total=%s, expected_count=%s",
+            getattr(target_kb.kb, "kb_name", "(unknown)"),
+            target_kb.kb.kb_id,
+            expected_total,
+            expected_count,
+        )
         try:
             actual = await target_kb.vec_db.count_documents(
                 metadata_filter={"is_memory_record": True, "kb_id": target_kb.kb.kb_id}
             )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 完整性校验失败: {e}")
+            logger.debug(
+                "[简单长期记忆] 完整性校验异常: error_type=%s, error=%s",
+                type(e).__name__,
+                e,
+            )
             return {
                 "passed": False,
                 "expected": expected_count,
@@ -3115,6 +3774,13 @@ class MemoryManager:
             }
 
         passed = actual == expected_count
+        logger.debug(
+            "[简单长期记忆] 完整性校验结果: expected=%s, actual=%s, diff=%s, passed=%s",
+            expected_count,
+            actual,
+            actual - expected_count,
+            passed,
+        )
         return {
             "passed": passed,
             "expected": expected_count,
@@ -3138,6 +3804,16 @@ class MemoryManager:
         Returns:
             包含 "status": "interrupted" 的结果字典
         """
+        logger.debug(
+            "[简单长期记忆] 重建异常收尾开始: total=%s, success=%s, failed=%s, "
+            "target_kb=%s, mode=%s, error_type=%s",
+            total,
+            success,
+            failed,
+            target_kb_name,
+            "migration" if is_migration else "rebuild",
+            type(error).__name__ if error else "unknown",
+        )
         self._rebuilding = False
         pending_flushed = await self._flush_pending_writes()
 
@@ -3147,6 +3823,12 @@ class MemoryManager:
         logger.warning(
             f"[简单长期记忆] 重建异常终止: 总计 {total}, 成功 {success}, "
             f"失败 {failed}, 已 flush 缓冲 {pending_flushed} 条"
+        )
+        logger.debug(
+            "[简单长期记忆] 重建异常收尾完成: status=interrupted, "
+            "pending_flushed=%s, cache_retained=%s",
+            pending_flushed,
+            True,
         )
 
         return {
@@ -3170,11 +3852,19 @@ class MemoryManager:
         Returns:
             成功写入的缓冲条数
         """
+        logger.debug(
+            "[简单长期记忆] 缓冲写入开始: pending=%s, target_kb=%s, target_kb_id=%s",
+            len(self._pending_writes),
+            getattr(getattr(target_kb or self._kb_helper, "kb", None), "kb_name", None),
+            getattr(getattr(target_kb or self._kb_helper, "kb", None), "kb_id", None),
+        )
         if not self._pending_writes:
+            logger.debug("[简单长期记忆] 缓冲写入结束: pending=0, flushed=0")
             return 0
 
         write_kb = target_kb or self._kb_helper
         if not write_kb:
+            logger.warning("[简单长期记忆] 缓冲写入结束: 当前没有可写入的知识库")
             return 0
 
         pending = list(self._pending_writes)
@@ -3311,6 +4001,14 @@ class MemoryManager:
             f"共 {len(pending)} 条, 写入 {flushed} 条, "
             f"待重试 {len(retry_pending)} 条"
         )
+        logger.debug(
+            "[简单长期记忆] 缓冲写入结束: pending=%s, flushed=%s, retry=%s, "
+            "kv_pending_persisted=%s",
+            len(pending),
+            flushed,
+            len(retry_pending),
+            bool(retry_pending and self._kv_put),
+        )
         return flushed
 
     async def _list_all_kb_names(self) -> list[str]:
@@ -3336,6 +4034,11 @@ class MemoryManager:
             "rebuild_status",
             "rebuild_context",
         ]
+        logger.debug(
+            "[简单长期记忆] 重建缓存清理开始: keys=%s, kv_delete_available=%s",
+            keys,
+            bool(self._kv_delete),
+        )
         for key in keys:
             try:
                 if self._kv_delete:
@@ -3344,6 +4047,12 @@ class MemoryManager:
             except Exception:
                 result[key] = False
         logger.info(f"[简单长期记忆] 已清理重建缓存: {result}")
+        logger.debug(
+            "[简单长期记忆] 重建缓存清理结束: succeeded=%s, failed=%s, result=%s",
+            sum(1 for ok in result.values() if ok),
+            sum(1 for ok in result.values() if not ok),
+            result,
+        )
         return result
 
     def _hash_rebuild_cache_parts(self, *parts: Any) -> str:

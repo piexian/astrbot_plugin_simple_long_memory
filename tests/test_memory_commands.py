@@ -172,6 +172,61 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("清理: 已删除测试记忆", result)
         self.assertIn("结论: 召回异常，请检查 embedding 配置", result)
 
+    async def test_memory_test_dispatches_maintenance_stage_as_dry_run(self):
+        class Runner:
+            def __init__(self):
+                self.stages = []
+
+            async def run_test_stage(self, stage):
+                self.stages.append(stage)
+                return {
+                    "stage": stage,
+                    "dry_run": True,
+                    "organizer": {
+                        "parsed": True,
+                        "operations": 2,
+                        "metrics": {
+                            "memory_count": 4,
+                            "vector_count": 3,
+                            "vector_missing": 1,
+                            "candidates_screened": 2,
+                        },
+                    },
+                    "llm_stats": {"calls": 2, "cache_hits": 1, "errors": 0},
+                }
+
+        runner = Runner()
+        plugin = SimpleNamespace(
+            memory_mgr=object(),
+            _scheduler=SimpleNamespace(runner=runner),
+        )
+        plugin._run_maintenance_test = lambda stage: (
+            plugin_main.MemoryPlugin._run_maintenance_test(plugin, stage)
+        )
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_test,
+            plugin,
+            _Event("memory test organizer", admin=True),
+        )
+
+        self.assertEqual(runner.stages, ["organizer"])
+        self.assertIn("模式: dry-run", result[0])
+        self.assertIn("organizer: 解析 成功，操作 2", result[0])
+        self.assertIn("LLM: 调用 2", result[0])
+
+    async def test_memory_test_rejects_unknown_maintenance_stage(self):
+        plugin = SimpleNamespace(memory_mgr=object())
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_test,
+            plugin,
+            _Event("memory test unknown", admin=True),
+        )
+
+        self.assertEqual(
+            result,
+            ["未知测试项。合法值: purge, organizer, analyst, reviewer, cycle"],
+        )
+
     async def test_stats_label_marks_compressed_count_as_history(self):
         class Manager:
             async def get_memory_stats(self, *args, **kwargs):
@@ -320,6 +375,35 @@ class MemoryManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["verification"]["passed"])
         self.assertIs(manager._kb_helper, target)
         self.assertEqual(manager.current_kb_name, "target")
+
+
+class DebugObservabilityTests(unittest.TestCase):
+    def test_content_summary_hashes_and_truncates_without_full_content(self):
+        content = "  alpha\n beta\t" + "x" * 100
+        summary = memory_manager_module._debug_content_summary(content)
+
+        self.assertEqual(summary["content_len"], len(content))
+        self.assertEqual(len(summary["content_sha256"]), 12)
+        self.assertEqual(summary["preview"], "alpha beta " + "x" * 69 + "...")
+        self.assertNotIn("\n", summary["preview"])
+
+    def test_memory_summary_keeps_uri_and_injection_metadata(self):
+        memory = {
+            "text": "用于诊断的记忆正文",
+            "metadata": {
+                "uri": "facts://trace-test",
+                "memory_scope": "personal",
+                "_is_linked": True,
+            },
+        }
+
+        summary = memory_manager_module._debug_memory_summary(memory)
+
+        self.assertEqual(summary["uri"], "facts://trace-test")
+        self.assertEqual(summary["scope"], "personal")
+        self.assertTrue(summary["linked"])
+        self.assertEqual(summary["content_len"], len(memory["text"]))
+        self.assertEqual(summary["preview"], memory["text"])
 
 
 if __name__ == "__main__":

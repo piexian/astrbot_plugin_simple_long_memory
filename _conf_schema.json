@@ -186,7 +186,7 @@
     "description": "整理时间窗口",
     "type": "string",
     "default": "02:00-06:00",
-    "hint": "单时间点如 03:00，或范围如 02:00-06:00（范围内空闲时执行）"
+    "hint": "单时间点如 03:00，或范围如 02:00-06:00；整理 cron 命中窗口外时仅记 DEBUG 日志并跳过"
   },
   "maintenance_cron": {
     "description": "整理周期定时表达式",
