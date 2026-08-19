@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.4.4 (2026-08-19)
+
+### 变更
+- **注入时间使用 AstrBot 时区**：记忆仍以带时区的标准时间保存，注入标签统一按 AstrBot 配置的 `timezone` 展示，避免 UTC 与用户本地时间错位。无效时区回退到主机本地时区。
+- **注入内容增加时间与整理状态**：显示 `created`、`updated`、`updated_by`、版本号和合并整理的 `curated` 状态；历史记录缺少字段时不伪造更新信息。
+- **共享与关联记忆增加身份边界**：注入明确标注 `current user`、`associated users` 或 `current group`，并显示关联关系，避免把其他用户的记忆误归因给当前用户。
+- **整理更新保留来源**：用户替换和整理替换分别写入 `updated_by=user|organizer`；合并记录保留 `merged_from`、`curated_at` 和 `created_by`。
+- **管理员全 scope 记忆管理工具**：`enable_admin_global_memory_tool` 开启后，管理员可使用 `memory_search_admin` 搜索 global、personal、group 和 conversation 的活跃记忆（不计入召回反馈），并通过 `memory_remove_admin` 按 URI、scope 和归属预览确认删除。确认码绑定当前记录指纹，记录变更即失效；非 global 目标必须提供对应 `owner_user_id`、`owner_session_id` 或完整 `umo`，避免跨归属误删。
+
+
+## v0.4.3 (2026-08-19)
+
+### 新增
+- **维护后台 dry-run 测试**：管理员可使用 `/memory test purge|organizer|analyst|reviewer|cycle` 直接演练对应后台链路。测试使用真实知识库、向量检索和已配置模型，但禁止记忆、向量、关联、待审队列及 LLM 磁盘缓存写入。
+- **全链路 DEBUG 追踪**：写入、替换、删除、自动提取、三路召回（dense/sparse/disclosure）、可见性过滤、RRF/信号重排、召回反馈、关联补充和自动注入均记录阶段统计。召回以 `trace_id` 串联；实际召回/注入项记录 URI、scope、关联标记、正文长度、12 位 SHA-256 指纹和压缩后的前 80 字符预览。
+- **重建阶段诊断**：`/memory rebuild` 记录快照、分页、删除、重嵌入、KB 注册、缓冲写入、迁移提交、完整性校验和异常恢复的阶段统计。
+
+### 修复
+- **cron 精确边界无限重跑**：维护调度器在 cron 精确命中时严格推进到下一次 fire time，修复整理与清理任务每秒重复执行的问题；维护窗口按 AstrBot 配置时区判断。
+- **FAISS `IndexIDMap` 向量不可读**：通过外部文档 ID 映射到内部位置并从底层索引重建向量，修复维护整理将全部向量判为缺失、候选为零且不调用 LLM 的问题；同时记录可用、缺失与重建失败统计。
+- **dry-run 缓存持久化旁路**：维护测试期间临时禁用 LLM 磁盘缓存，并在成功或异常后恢复原配置。
+- **后台 purge dry-run 参数不兼容**：`MemoryManager.purge_deprecated()` 支持 `dry_run`，使已部署的 `/memory test purge` 不再因接口签名不匹配失败。
+
+### 变更
+- README 补齐所有 `/memory` 子命令、参数、权限、确认码和 dry-run 说明，并增加 DEBUG 诊断日志字段与内容边界说明。
+
 ## v0.4.2 (2026-08-18)
 
 ### 修复

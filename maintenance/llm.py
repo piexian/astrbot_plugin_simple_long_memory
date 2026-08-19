@@ -216,6 +216,15 @@ class MaintenanceLLM:
 
         # 在调用前计数，确保失败也计入限额
         self._calls += 1
+        logger.debug(
+            "[简单长期记忆] LLM 调用开始: provider=%s, call=%s/%s, "
+            "system_chars=%s, prompt_chars=%s",
+            provider_id,
+            self._calls,
+            self._max_calls_per_cycle,
+            len(system_prompt),
+            len(user_prompt),
+        )
         try:
             import asyncio
 

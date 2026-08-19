@@ -61,20 +61,44 @@ class AnalystAgent:
             "notes": "",
             "candidates_screened": 0,
             "llm_calls": 0,
+            "memory_count": 0,
+            "vector_count": 0,
+            "vector_missing": 0,
+            "conversation_chars": 0,
         }
 
         # 1. 拉取活跃记忆
         memories = await self._get_active_memories(owner_filter)
+        manifest["memory_count"] = len(memories)
+        manifest["vector_count"] = sum(
+            mem.get("vector") is not None for mem in memories
+        )
+        manifest["vector_missing"] = manifest["memory_count"] - manifest["vector_count"]
+        logger.debug(
+            "[简单长期记忆] 分析师记忆输入: memories=%s, vectors=%s, missing=%s",
+            manifest["memory_count"],
+            manifest["vector_count"],
+            manifest["vector_missing"],
+        )
         if len(memories) < 2:
             manifest["notes"] = "记忆数量不足，无需分析"
             return manifest
 
         # 2. 拉取对话历史（Phase 4 核心新增）
         conversation_history = await self._get_conversation_history(owner_filter)
-
+        manifest["conversation_chars"] = len(conversation_history)
+        logger.debug(
+            "[简单长期记忆] 分析师对话输入: chars=%s",
+            manifest["conversation_chars"],
+        )
         # 3. 两级预筛：余弦 ≥0.7 且排除已连边
         candidate_pairs = await self._screen_link_candidates(memories)
         manifest["candidates_screened"] = len(candidate_pairs)
+        logger.debug(
+            "[简单长期记忆] 分析师预筛完成: threshold=%.2f, candidates=%s",
+            self._link_cosine_threshold,
+            manifest["candidates_screened"],
+        )
 
         # 4. 逐对调 LLM 裁决（受调用上限约束）
         links_created = 0
@@ -110,6 +134,14 @@ class AnalystAgent:
             manifest["contradictions"] = self._detect_contradictions(
                 candidate_pairs, exclude_pairs=linked_pairs
             )
+        logger.debug(
+            "[简单长期记忆] 分析师完成: candidates=%s, links=%s, contradictions=%s, "
+            "llm_calls=%s",
+            manifest["candidates_screened"],
+            len(manifest["new_links"]),
+            len(manifest["contradictions"]),
+            manifest["llm_calls"],
+        )
         return manifest
 
     async def _get_active_memories(

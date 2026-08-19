@@ -32,6 +32,7 @@ class AgentManifest:
     raw_response: str = ""
     parsed: bool = False
     error: str = ""
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -46,7 +47,8 @@ class MaintenanceReport:
     duration_ms: float = 0.0
 
     # 各阶段统计
-    purge_result: dict[str, int] = field(default_factory=dict)
+    purge_result: dict[str, Any] = field(default_factory=dict)
+    dry_run: bool = False
     organizer_manifest: AgentManifest | None = None
     analyst_manifest: AgentManifest | None = None
     reviewer_verdicts: list[dict[str, Any]] = field(default_factory=list)
@@ -66,6 +68,7 @@ class MaintenanceReport:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_ms": self.duration_ms,
+            "dry_run": self.dry_run,
             "purge_result": self.purge_result,
             "organizer": {
                 "ops_count": len(self.organizer_manifest.operations)
@@ -77,6 +80,9 @@ class MaintenanceReport:
                 "error": self.organizer_manifest.error
                 if self.organizer_manifest
                 else "",
+                "metrics": self.organizer_manifest.metrics
+                if self.organizer_manifest
+                else {},
             },
             "analyst": {
                 "ops_count": len(self.analyst_manifest.operations)
@@ -86,6 +92,9 @@ class MaintenanceReport:
                 if self.analyst_manifest
                 else False,
                 "error": self.analyst_manifest.error if self.analyst_manifest else "",
+                "metrics": self.analyst_manifest.metrics
+                if self.analyst_manifest
+                else {},
             },
             "reviewer_verdicts_count": len(self.reviewer_verdicts),
             "llm_stats": self.llm_stats,
@@ -121,29 +130,42 @@ class MaintenanceRunner:
         # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
         self._last_review_unresolved: dict[str, int] = {}
 
-    async def run_cycle(self) -> MaintenanceReport:
-        """执行一次完整整理周期。"""
+    async def run_cycle(self, *, dry_run: bool = False) -> MaintenanceReport:
+        """执行一次完整整理周期；dry_run 时不执行阶段 4 写入。"""
         if self._running:
             logger.warning("[简单长期记忆] 整理周期已在运行，跳过")
             raise RuntimeError("maintenance cycle already running")
 
         self._running = True
         session_id = f"maint-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        report = MaintenanceReport(session_id=session_id)
+        report = MaintenanceReport(session_id=session_id, dry_run=dry_run)
         started = datetime.now(timezone.utc)
+        previous_cache_enabled = getattr(self._llm, "_cache_enabled", None)
+        if dry_run and previous_cache_enabled is not None:
+            self._llm._cache_enabled = False
+            logger.debug("[简单长期记忆] dry-run 已禁用 LLM 磁盘缓存")
 
         try:
             logger.info(f"[简单长期记忆] 开始整理周期: {session_id}")
 
             # 重置 LLM 统计
             self._llm.reset_cycle_stats()
-
+            logger.debug(
+                "[简单长期记忆] 整理周期配置: session=%s, organizer=%s, "
+                "analyst=%s, reviewer=%s, max_llm=%s, max_ops=%s",
+                session_id,
+                self._config.get("maintenance_organizer_enabled", True),
+                self._config.get("maintenance_analyst_enabled", True),
+                self._config.get("maintenance_reviewer_enabled", True),
+                self._config.get("maintenance_max_llm_calls", 50),
+                self._config.get("maintenance_max_ops_per_cycle", 100),
+            )
             # ── 阶段 0: purge（纯逻辑，无 LLM）──
             if self._config.get("auto_purge_enabled", True):
                 purge_days = self._config.get("auto_purge_after_days", 7)
                 try:
                     purge_result = await self._memory_mgr.purge_deprecated(
-                        after_days=purge_days
+                        after_days=purge_days, dry_run=dry_run
                     )
                     report.purge_result = purge_result
                     logger.info(
@@ -204,7 +226,13 @@ class MaintenanceRunner:
                     item["needs_human_review"] = True
 
             # ── 阶段 4: Host 执行（根据审核结果执行操作）──
-            await self._execute_operations(report)
+            if dry_run:
+                logger.info(
+                    "[简单长期记忆] 整理 dry-run 完成，跳过阶段 4 的所有写操作: session=%s",
+                    session_id,
+                )
+            else:
+                await self._execute_operations(report)
 
         except Exception as e:
             report.errors.append(f"cycle: {e}")
@@ -214,6 +242,14 @@ class MaintenanceRunner:
             report.finished_at = finished.isoformat()
             report.duration_ms = (finished - started).total_seconds() * 1000
             self._running = False
+            report.llm_stats = self._llm.stats()
+            if dry_run and previous_cache_enabled is not None:
+                self._llm._cache_enabled = previous_cache_enabled
+            logger.debug(
+                "[简单长期记忆] 整理周期收尾: session=%s, report=%s",
+                session_id,
+                report.to_dict(),
+            )
 
             # 落 KV（Phase 2 先日志输出，Phase 3 接 KV）
             logger.info(
@@ -223,6 +259,79 @@ class MaintenanceRunner:
             )
 
         return report
+
+    @staticmethod
+    def _test_manifest_summary(manifest: AgentManifest) -> dict[str, Any]:
+        """压缩测试输出，避免命令回显记忆正文或模型理由。"""
+        return {
+            "parsed": manifest.parsed,
+            "operations": len(manifest.operations),
+            "metrics": manifest.metrics,
+            "error": manifest.error,
+        }
+
+    async def run_test_stage(self, stage: str) -> dict[str, Any]:
+        """直接运行一项后台能力测试，不执行任何持久化写操作。"""
+        normalized = stage.strip().lower()
+        if normalized == "cycle":
+            return (await self.run_cycle(dry_run=True)).to_dict()
+        if normalized not in {"purge", "organizer", "analyst", "reviewer"}:
+            raise ValueError(
+                "未知后台测试项，合法值: purge, organizer, analyst, reviewer, cycle"
+            )
+        if self._running:
+            raise RuntimeError("maintenance cycle already running")
+
+        self._running = True
+        started = datetime.now(timezone.utc)
+        result: dict[str, Any] = {"stage": normalized, "dry_run": True}
+        self._llm.reset_cycle_stats()
+        previous_cache_enabled = getattr(self._llm, "_cache_enabled", None)
+        if previous_cache_enabled is not None:
+            self._llm._cache_enabled = False
+            logger.debug("[简单长期记忆] 后台测试已禁用 LLM 磁盘缓存")
+        try:
+            if normalized == "purge":
+                result["purge"] = await self._memory_mgr.purge_deprecated(
+                    after_days=self._config.get("auto_purge_after_days", 7),
+                    dry_run=True,
+                )
+            elif normalized == "organizer":
+                result["organizer"] = self._test_manifest_summary(
+                    await self._run_organizer()
+                )
+            elif normalized == "analyst":
+                result["analyst"] = self._test_manifest_summary(
+                    await self._run_analyst()
+                )
+            else:
+                organizer = await self._run_organizer()
+                analyst = await self._run_analyst()
+                verdicts = await self._run_reviewer(organizer, analyst)
+                result["organizer"] = self._test_manifest_summary(organizer)
+                result["analyst"] = self._test_manifest_summary(analyst)
+                result["reviewer"] = {
+                    "verdicts": len(verdicts),
+                    "approved": sum(v.get("verdict") == "approve" for v in verdicts),
+                    "rejected": sum(v.get("verdict") == "reject" for v in verdicts),
+                    "unresolved": dict(self._last_review_unresolved),
+                }
+        finally:
+            result["duration_ms"] = (
+                datetime.now(timezone.utc) - started
+            ).total_seconds() * 1000
+            result["llm_stats"] = self._llm.stats()
+            if previous_cache_enabled is not None:
+                self._llm._cache_enabled = previous_cache_enabled
+            self._running = False
+
+        logger.info(
+            "[简单长期记忆] 后台测试完成: stage=%s, dry_run=True, duration_ms=%.0f, llm_calls=%s",
+            normalized,
+            result["duration_ms"],
+            result["llm_stats"].get("calls", 0),
+        )
+        return result
 
     async def _execute_operations(self, report: MaintenanceReport) -> None:
         """阶段 4：按审核结果执行操作。
@@ -252,6 +361,14 @@ class MaintenanceRunner:
                 all_operations = all_operations[:max_ops]
 
             reviewer_enabled = self._config.get("maintenance_reviewer_enabled", True)
+            logger.debug(
+                "[简单长期记忆] 执行阶段输入: operations=%s, reviewer_enabled=%s, "
+                "verdicts=%s, max_ops=%s",
+                len(all_operations),
+                reviewer_enabled,
+                len(report.reviewer_verdicts),
+                max_ops,
+            )
             # reviewer 启用时校验裁决完整性：
             # 下标越界/重复 → 真正不一致（LLM 乱序/错号），告警；
             # 仅数量不足 → 有意的部分评审（预算耗尽/输出无效），info 级给出原因分布
@@ -357,6 +474,15 @@ class MaintenanceRunner:
             report.failed_ops = failed
             # LLM 统计
             report.llm_stats = self._llm.stats()
+            logger.debug(
+                "[简单长期记忆] 执行阶段完成: executed=%s, skipped=%s, failed=%s, "
+                "pending=%s, llm=%s",
+                executed,
+                skipped,
+                failed,
+                len(pending_items),
+                report.llm_stats,
+            )
 
     async def execute_approved(self, op: dict[str, Any]) -> bool:
         """公开入口：执行一条经管理员批准的操作。
@@ -381,6 +507,16 @@ class MaintenanceRunner:
 
         try:
             result = await organizer.run()
+            manifest.metrics = {
+                key: result.get(key)
+                for key in (
+                    "memory_count",
+                    "vector_count",
+                    "vector_missing",
+                    "candidates_screened",
+                    "llm_calls",
+                )
+            }
             manifest.parsed = True
             # 将 organizer 的输出转换为 operations 格式
             for merge_op in result.get("merge", []):
@@ -431,6 +567,17 @@ class MaintenanceRunner:
 
         try:
             result = await analyst.run()
+            manifest.metrics = {
+                key: result.get(key)
+                for key in (
+                    "memory_count",
+                    "vector_count",
+                    "vector_missing",
+                    "conversation_chars",
+                    "candidates_screened",
+                    "llm_calls",
+                )
+            }
             manifest.parsed = True
             # 将 analyst 的输出转换为 operations 格式
             for link_op in result.get("new_links", []):
@@ -729,6 +876,7 @@ class MaintenanceRunner:
             new_uri = await self._memory_mgr.replace_memory(
                 old_metadata=old_metadata,
                 new_content=new_content,
+                updated_by="organizer",
             )
             return bool(new_uri)
         except Exception as e:

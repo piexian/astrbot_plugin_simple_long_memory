@@ -14,6 +14,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass
@@ -188,6 +189,10 @@ class MemoryMetadata:
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    updated_at: str = ""
+    updated_by: str = ""
+    curated_at: str = ""
+    curated_by: str = ""
     last_recalled_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -207,6 +212,9 @@ class MemoryMetadata:
     impression: str | None = None
     migrated_from: str | None = None
     migrated_to: str | None = None
+    merged_from: list[str] = field(default_factory=list)
+    merged_reason: str = ""
+    created_by: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """转换为字典格式"""
@@ -298,9 +306,102 @@ def format_memory_content(
     return "\n".join(lines)
 
 
+def _format_timestamp_for_display(value: Any, timezone_name: str | None) -> str:
+    """把带时区时间转换为 AstrBot 配置时区的短展示。"""
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)[:32]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    label = timezone_name or "local"
+    if timezone_name:
+        try:
+            target_tz = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            target_tz = datetime.now().astimezone().tzinfo
+            label = "local"
+    else:
+        target_tz = datetime.now().astimezone().tzinfo
+    converted = parsed.astimezone(target_tz)
+    return f"{converted:%Y-%m-%d %H:%M} {label}"
+
+
+def _memory_identity_label(
+    raw_metadata: dict[str, Any],
+    viewer_user_id: str | None,
+) -> str:
+    """标注共享或关联记忆的归属，避免把他人信息归给当前用户。"""
+    scope = raw_metadata.get("memory_scope", "")
+    linked = bool(raw_metadata.get("_is_linked"))
+    owner_ids = raw_metadata.get("owner_user_ids", [])
+    if not isinstance(owner_ids, list):
+        owner_ids = []
+    owner_ids = [str(value) for value in owner_ids if value]
+    owner = raw_metadata.get("owner_user_id") or (owner_ids[0] if owner_ids else "")
+    if owner and owner not in owner_ids:
+        owner_ids.insert(0, str(owner))
+    if scope == MemoryScope.GROUP:
+        session = raw_metadata.get("owner_session_id") or "unknown"
+        return f"owner: current group ({session})"
+    if not linked and raw_metadata.get("visibility") != MemoryVisibility.GROUP:
+        return ""
+    if viewer_user_id and viewer_user_id in owner_ids:
+        associated = [value for value in owner_ids if value != viewer_user_id]
+        if associated:
+            return "owner: current user; associated users: " + ", ".join(associated)
+        return "owner: current user"
+    if owner_ids:
+        return "owner: associated users: " + ", ".join(owner_ids)
+    return "owner: associated user (identity unavailable)"
+
+
+def _memory_status_label(
+    raw_metadata: dict[str, Any],
+    meta: MemoryMetadata,
+    timezone_name: str | None,
+    viewer_user_id: str | None,
+) -> str:
+    """生成注入项的时间、整理状态和归属标签。"""
+    labels = [meta.domain]
+    identity = _memory_identity_label(raw_metadata, viewer_user_id)
+    if identity:
+        labels.append(identity)
+    created = _format_timestamp_for_display(
+        raw_metadata.get("created_at"), timezone_name
+    )
+    if created:
+        labels.append(f"created: {created}")
+    updated = _format_timestamp_for_display(
+        raw_metadata.get("updated_at"), timezone_name
+    )
+    if updated:
+        updated_by = raw_metadata.get("updated_by") or "unknown"
+        labels.append(f"updated: {updated} by {updated_by}")
+    merged_from = raw_metadata.get("merged_from")
+    if isinstance(merged_from, list) and merged_from:
+        curated = _format_timestamp_for_display(
+            raw_metadata.get("curated_at") or raw_metadata.get("created_at"),
+            timezone_name,
+        )
+        curated_label = f"curated: merged {len(merged_from)} records"
+        if curated:
+            curated_label += f" on {curated}"
+        labels.append(curated_label)
+    elif raw_metadata.get("version", meta.version) > 1:
+        labels.append(f"version: {raw_metadata['version']}")
+    if raw_metadata.get("_is_linked") and raw_metadata.get("_linked_relation_types"):
+        labels.append("relation: " + ", ".join(raw_metadata["_linked_relation_types"]))
+    return " | ".join(labels)
+
+
 def format_memory_for_injection(
     memories: list[dict[str, Any]],
     max_length: int = 2000,
+    timezone_name: str | None = None,
+    viewer_user_id: str | None = None,
 ) -> str:
     """格式化记忆用于 LLM 注入，返回带安全标注的完整上下文字符串。
 
@@ -341,8 +442,14 @@ def format_memory_for_injection(
 
         for mem in scoped:
             meta = MemoryMetadata.from_dict(mem.get("metadata", {}))
+            raw_metadata = mem.get("metadata", {})
+            if not isinstance(raw_metadata, dict):
+                raw_metadata = {}
             content = _memory_display_text(mem, meta)
-            memory_entry = f"\n- [{meta.domain}] {content}"
+            status = _memory_status_label(
+                raw_metadata, meta, timezone_name, viewer_user_id
+            )
+            memory_entry = f"\n- [{status}] {content}"
 
             if total_length + len(memory_entry) > max_length:
                 break
