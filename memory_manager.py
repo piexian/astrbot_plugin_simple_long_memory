@@ -190,6 +190,14 @@ def _debug_memory_summary(memory: dict[str, Any]) -> dict[str, Any]:
         "uri": metadata.get("uri", ""),
         "scope": metadata.get("memory_scope", ""),
         "linked": bool(metadata.get("_is_linked", False)),
+        "created_at": metadata.get("created_at", ""),
+        "updated_at": metadata.get("updated_at", ""),
+        "curated_at": metadata.get("curated_at", ""),
+        "merged_from_count": len(metadata.get("merged_from", []))
+        if isinstance(metadata.get("merged_from"), list)
+        else 0,
+        "owner_user_ids": metadata.get("owner_user_ids", []),
+        "relation_types": metadata.get("_linked_relation_types", []),
         **_debug_content_summary(body),
     }
 
@@ -1105,6 +1113,7 @@ class MemoryManager:
         old_metadata: dict[str, Any],
         new_content: str,
         new_disclosure: str | None = None,
+        updated_by: str = "user",
     ) -> str:
         """替换记忆内容，完整保留原始租户/作用域/归属元数据。
 
@@ -1144,6 +1153,8 @@ class MemoryManager:
         new_metadata["kb_doc_id"] = new_doc_id
         new_metadata["memory_content"] = new_content
         new_metadata["version"] = old_metadata.get("version", 1) + 1
+        new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+        new_metadata["updated_by"] = updated_by
         new_metadata["deprecated"] = False
         if new_disclosure is not None:
             new_metadata["disclosure"] = new_disclosure
@@ -1449,6 +1460,7 @@ class MemoryManager:
 
         # 查询每条主记忆的关联（单跳，出边 + 入边，只取可注入类型）
         linked_uris: set[str] = set()
+        linked_relations: dict[str, set[str]] = {}
         for uri in main_uris[:5]:  # 限制查询数量，避免过多 DB 查询
             try:
                 # 出边：uri → target
@@ -1462,6 +1474,9 @@ class MemoryManager:
                     target_uri = link.get("target_uri", "")
                     if target_uri and target_uri not in main_uris:
                         linked_uris.add(target_uri)
+                        linked_relations.setdefault(target_uri, set()).add(
+                            link.get("relation_type", "related")
+                        )
                 # 入边：source → uri（对称关系反向查询）
                 in_links = await self._link_manager.get_links_to_uri(
                     uri=uri,
@@ -1472,6 +1487,9 @@ class MemoryManager:
                 for link in in_links:
                     source_uri = link.get("source_uri", "")
                     if source_uri and source_uri not in main_uris:
+                        linked_relations.setdefault(source_uri, set()).add(
+                            link.get("relation_type", "related")
+                        )
                         linked_uris.add(source_uri)
             except Exception as e:
                 logger.debug(f"[简单长期记忆] 查询关联失败: {uri}, {e}")
@@ -1500,7 +1518,13 @@ class MemoryManager:
                         logger.debug(f"[简单长期记忆] 关联记忆不可见，跳过: {uri}")
                         continue
                     # 标记为关联记忆
-                    mem["metadata"]["_is_linked"] = True
+                    # 标记关联来源和关系，供注入格式明确区分身份
+                    linked_meta = mem.setdefault("metadata", {})
+                    linked_meta["_is_linked"] = True
+                    linked_meta["_linked_relation_types"] = sorted(
+                        linked_relations.get(uri, {"related"})
+                    )
+                    linked_meta["_linked_from_uris"] = main_uris[:5]
                     linked_memories.append(mem)
             except Exception as e:
                 logger.debug(f"[简单长期记忆] 拉取关联记忆失败: {uri}, {e}")
@@ -2772,6 +2796,9 @@ class MemoryManager:
                 "uri": new_uri,
                 "memory_content": merged_content,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "curated_at": datetime.now(timezone.utc).isoformat(),
+                "curated_by": created_by,
+                "created_by": created_by,
                 "deprecated": False,
                 "merged_from": source_uris,
                 "merged_reason": reason,

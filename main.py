@@ -537,6 +537,22 @@ class MemoryPlugin(Star):
         )
         await self._scheduler.start()
 
+    def _get_display_timezone(self) -> str | None:
+        """读取 AstrBot 全局时区，用于注入内容的时间展示。"""
+        try:
+            return self.context.astrbot_config.get("timezone") or None
+        except Exception:
+            return None
+
+    def _get_viewer_user_id(self, event: AstrMessageEvent) -> str | None:
+        """获取当前会话用户 ID，用于标注共享记忆归属。"""
+        if not self.memory_mgr:
+            return None
+        try:
+            return self.memory_mgr._current_owner_user_id(event)
+        except Exception:
+            return None
+
     def _get_cmd_prefix(self) -> str:
         """从 AstrBot 配置读取命令前缀，默认 /"""
         try:
@@ -968,7 +984,11 @@ class MemoryPlugin(Star):
 
             if memories:
                 # format_memory_for_injection 已返回含 <user_context_reference> 包装的完整字符串
-                safe_memory_context = format_memory_for_injection(memories)
+                safe_memory_context = format_memory_for_injection(
+                    memories,
+                    timezone_name=self._get_display_timezone(),
+                    viewer_user_id=self._get_viewer_user_id(event),
+                )
                 if safe_memory_context:
                     inject_target = _inject_memory_context(request, safe_memory_context)
                     logger.debug(
@@ -1929,7 +1949,11 @@ class MemoryPlugin(Star):
         if not memories:
             return "No relevant memories found"
 
-        result = format_memory_for_injection(memories)
+        result = format_memory_for_injection(
+            memories,
+            timezone_name=self._get_display_timezone(),
+            viewer_user_id=self._get_viewer_user_id(event),
+        )
         return f"<user_history_info>\n{result}\n</user_history_info>"
 
     @filter.llm_tool(name="memory_store")
@@ -2050,6 +2074,7 @@ class MemoryPlugin(Star):
                 old_metadata=old_meta,
                 new_content=content,
                 new_disclosure=new_disclosure,
+                updated_by="user",
             )
         except Exception as e:
             return f"Error: failed to update memory: {e}"

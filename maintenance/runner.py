@@ -876,6 +876,7 @@ class MaintenanceRunner:
             new_uri = await self._memory_mgr.replace_memory(
                 old_metadata=old_metadata,
                 new_content=new_content,
+                updated_by="organizer",
             )
             return bool(new_uri)
         except Exception as e:
