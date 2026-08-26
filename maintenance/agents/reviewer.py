@@ -74,8 +74,14 @@ class ReviewerAgent:
             ]
         """
         if not proposed_changes:
+            logger.debug("[简单长期记忆] 审核员跳过: proposed_changes=0")
             return []
 
+        logger.debug(
+            "[简单长期记忆] 审核员开始: proposed_changes=%s, remaining_llm=%s",
+            len(proposed_changes),
+            self._llm.remaining_calls,
+        )
         related_map = self._build_related_map(proposed_changes)
         persona_summary = await self._get_persona_summary()
         admin_guides = ""  # Phase 5 完善：从 KV 拉取管理员历史指引
@@ -111,6 +117,12 @@ class ReviewerAgent:
                 verdicts.append(verdict)
             else:
                 self.last_unresolved["invalid_output"] += 1
+        logger.debug(
+            "[简单长期记忆] 审核员完成: verdicts=%s, unresolved=%s, remaining_llm=%s",
+            len(verdicts),
+            self.last_unresolved,
+            self._llm.remaining_calls,
+        )
         return verdicts
 
     async def _review_one(

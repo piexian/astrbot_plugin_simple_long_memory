@@ -24,7 +24,12 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .maintenance.scheduler import MaintenanceScheduler
-from .memory_manager import MemoryManager, normalize_domain
+from .memory_manager import (
+    MemoryManager,
+    _debug_content_summary,
+    _debug_memory_summary,
+    normalize_domain,
+)
 from .memory_protocol import (
     MemoryScope,
     MemoryType,
@@ -213,6 +218,54 @@ def _confirmation_code(action: str, target: str = "") -> str:
     seed = f"{action}:{target}".encode()
     digest = hashlib.sha256(seed).hexdigest()[:8]
     return f"{action}-{digest}"
+
+
+ADMIN_MANAGED_SCOPES = {
+    MemoryScope.GLOBAL,
+    MemoryScope.PERSONAL,
+    MemoryScope.GROUP,
+    MemoryScope.CONVERSATION,
+}
+ADMIN_SCOPE_OWNER_FIELDS = {
+    MemoryScope.PERSONAL: "owner_user_id",
+    MemoryScope.GROUP: "owner_session_id",
+    MemoryScope.CONVERSATION: "umo",
+}
+
+
+def _format_admin_removal_preview(
+    uri: str,
+    scope: str,
+    owner_id: str,
+    preview: dict[str, Any],
+    confirmation_code: str,
+    owner_field: str = "",
+) -> str:
+    """渲染管理员记忆删除预览，不输出完整正文。"""
+    records = preview.get("records", [])
+    lines = [
+        "[Administrator memory removal confirmation]",
+        f"URI: {uri}",
+        f"Scope: {scope}",
+        f"Owner: {owner_id or 'global'}",
+        f"Matching active records: {preview.get('count', 0)}",
+    ]
+    for index, record in enumerate(records[:10], start=1):
+        lines.append(
+            f"{index}. len={record.get('content_len', 0)}, "
+            f"sha256={record.get('content_sha256', '')}, "
+            f"preview={record.get('preview', '')}"
+        )
+    if len(records) > 10:
+        lines.append(f"... {len(records) - 10} more matching records")
+    target_args = f"uri='{uri}', scope='{scope}'"
+    if owner_field:
+        target_args += f", owner_id='{owner_id}'"
+    lines.append(
+        "No deletion has occurred. To confirm the exact current records, call "
+        f"memory_remove_admin({target_args}, confirm='{confirmation_code}')."
+    )
+    return "\n".join(lines)
 
 
 def _render_cmd_prefix(prefix: str) -> str:
@@ -531,6 +584,22 @@ class MemoryPlugin(Star):
             kv_get=self.get_kv_data,
         )
         await self._scheduler.start()
+
+    def _get_display_timezone(self) -> str | None:
+        """读取 AstrBot 全局时区，用于注入内容的时间展示。"""
+        try:
+            return self.context.astrbot_config.get("timezone") or None
+        except Exception:
+            return None
+
+    def _get_viewer_user_id(self, event: AstrMessageEvent) -> str | None:
+        """获取当前会话用户 ID，用于标注共享记忆归属。"""
+        if not self.memory_mgr:
+            return None
+        try:
+            return self.memory_mgr._current_owner_user_id(event)
+        except Exception:
+            return None
 
     def _get_cmd_prefix(self) -> str:
         """从 AstrBot 配置读取命令前缀，默认 /"""
@@ -942,6 +1011,12 @@ class MemoryPlugin(Star):
             contexts = _normalize_contexts(request.contexts)
             query = _build_recall_query(request.prompt or "", contexts)
 
+            logger.debug(
+                "[简单长期记忆] 自动注入查询已构建: contexts=%s, query=%s",
+                len(contexts),
+                _debug_content_summary(query, preview_limit=0),
+            )
+
             # 检索优化：调用 LLM 提炼关键词
             if self.config.get("optimize_recall_query", False):
                 query = await self._optimize_recall_query(event, query)
@@ -952,15 +1027,25 @@ class MemoryPlugin(Star):
                 query=query,
                 top_k=self.config.get("max_memories_per_inject", 5),
                 bump=True,
+                source="auto_inject",
             )
 
             if memories:
                 # format_memory_for_injection 已返回含 <user_context_reference> 包装的完整字符串
-                safe_memory_context = format_memory_for_injection(memories)
+                safe_memory_context = format_memory_for_injection(
+                    memories,
+                    timezone_name=self._get_display_timezone(),
+                    viewer_user_id=self._get_viewer_user_id(event),
+                )
                 if safe_memory_context:
                     inject_target = _inject_memory_context(request, safe_memory_context)
                     logger.debug(
-                        f"[简单长期记忆] 注入 {len(memories)} 条记忆到 {inject_target}"
+                        "[简单长期记忆] 自动注入完成: target=%s, memory_count=%s, "
+                        "context_len=%s, memories=%s",
+                        inject_target,
+                        len(memories),
+                        len(safe_memory_context),
+                        [_debug_memory_summary(memory) for memory in memories],
                     )
 
         except Exception as e:
@@ -1026,6 +1111,16 @@ class MemoryPlugin(Star):
 
             parsed_umo = UMOInfo.parse(event.unified_msg_origin)
 
+            logger.debug(
+                "[简单长期记忆] 自动提取开始: snapshots=%s, conversation=%s, "
+                "interval=%s, counter=%s, provider_configured=%s",
+                len(snapshots),
+                _debug_content_summary(conversation, preview_limit=0),
+                extraction_interval,
+                current_count,
+                bool(provider_id),
+            )
+            extraction_started_at = time.monotonic()
             # 调用 LLM 提取记忆
             prompt = MEMORY_EXTRACTION_PROMPT.substitute(
                 platform_id=parsed_umo.platform_id,
@@ -1040,6 +1135,13 @@ class MemoryPlugin(Star):
                     prompt=prompt,
                 )
                 extraction_result = getattr(llm_response, "completion_text", "") or ""
+
+                logger.debug(
+                    "[简单长期记忆] 自动提取 LLM 完成: elapsed_ms=%s, result=%s",
+                    round((time.monotonic() - extraction_started_at) * 1000),
+                    _debug_content_summary(extraction_result, preview_limit=0),
+                )
+
             except Exception as e:
                 logger.warning(f"[简单长期记忆] LLM 提取调用失败: {e}")
                 return
@@ -1048,10 +1150,17 @@ class MemoryPlugin(Star):
             memories = self._parse_extracted_memories(
                 extraction_result, parsed_umo.session_type
             )
+            logger.debug(
+                "[简单长期记忆] 自动提取解析完成: parsed=%s",
+                len(memories),
+            )
             if not memories:
                 return
 
             # 存储提取的记忆
+            stored_count = 0
+            skipped_empty_count = 0
+            store_failures = 0
             for mem in memories:
                 memory_domain = mem.get("type", "fact")
                 scope = mem.get("scope", MemoryScope.PERSONAL)
@@ -1069,25 +1178,56 @@ class MemoryPlugin(Star):
                 owner_sender_ids = subjects if scope == MemoryScope.PERSONAL else []
 
                 if not content:
+                    skipped_empty_count += 1
                     continue
 
                 domain = normalize_domain(memory_domain)
 
-                uri = await self.memory_mgr.store_memory(
-                    event=event,
-                    content=content,
-                    domain=domain,
-                    memory_type=MemoryType.NORMAL,
-                    disclosure=disclosure,
-                    importance=importance,
-                    memory_scope=scope,
-                    subject=subject,
-                    entities=entities,
-                    topics=topics,
-                    owner_sender_ids=owner_sender_ids,
-                )
-                logger.debug(f"[简单长期记忆] 提取并存储记忆: {uri}")
+                try:
+                    uri = await self.memory_mgr.store_memory(
+                        event=event,
+                        content=content,
+                        domain=domain,
+                        memory_type=MemoryType.NORMAL,
+                        disclosure=disclosure,
+                        importance=importance,
+                        memory_scope=scope,
+                        subject=subject,
+                        entities=entities,
+                        topics=topics,
+                        owner_sender_ids=owner_sender_ids,
+                    )
+                    stored_count += 1
+                    logger.debug(
+                        "[简单长期记忆] 自动提取写入完成: uri=%s, domain=%s, "
+                        "scope=%s, content=%s",
+                        uri,
+                        domain,
+                        scope,
+                        _debug_content_summary(content),
+                    )
+                except Exception as e:
+                    store_failures += 1
+                    logger.warning(
+                        "[简单长期记忆] 自动提取写入失败: domain=%s, scope=%s, "
+                        "content=%s, error_type=%s, error=%s",
+                        domain,
+                        scope,
+                        _debug_content_summary(content),
+                        type(e).__name__,
+                        e,
+                    )
 
+            logger.debug(
+                "[简单长期记忆] 自动提取完成: snapshots=%s, parsed=%s, "
+                "stored=%s, skipped_empty=%s, store_failures=%s, elapsed_ms=%s",
+                len(snapshots),
+                len(memories),
+                stored_count,
+                skipped_empty_count,
+                store_failures,
+                round((time.monotonic() - extraction_started_at) * 1000),
+            )
             logger.info(
                 f"[简单长期记忆] 已从 {len(snapshots)} 轮对话中提取 {len(memories)} 条记忆"
             )
@@ -1160,7 +1300,7 @@ class MemoryPlugin(Star):
             yield event.plain_result("请提供搜索关键词")
             return
         memories = await self.memory_mgr.recall_memories(
-            event, query, all_users=all_users
+            event, query, all_users=all_users, source="command_search"
         )
         scope = "全局" if all_users else "个人"
         result = format_memory_for_user(
@@ -1197,18 +1337,41 @@ class MemoryPlugin(Star):
 
     @memory_group.command("test")
     async def cmd_test(self, event: AstrMessageEvent):
-        """测试记忆读写（管理员）/memory test"""
+        """测试读写或后台整理阶段（管理员）。"""
         if err := _ensure_initialized(self.memory_mgr):
             yield event.plain_result(err)
-            return
-        args_text = _parse_command_args(event, "memory test")
-        if args_text:
-            yield event.plain_result(f"未知参数: {args_text}")
             return
         if not event.is_admin():
             yield event.plain_result("该操作需要管理员权限")
             return
-        yield event.plain_result(await self._run_memory_test(event))
+
+        args_text = _parse_command_args(event, "memory test")
+        try:
+            args = shlex.split(args_text)
+        except ValueError as e:
+            yield event.plain_result(f"参数解析失败: {e}")
+            return
+        if len(args) > 1:
+            yield event.plain_result(
+                "用法: /memory test [purge|organizer|analyst|reviewer|cycle]"
+            )
+            return
+        stage = args[0].lower() if args else "storage"
+        if stage in {"help", "--help", "-h"}:
+            yield event.plain_result(
+                "用法: /memory test [purge|organizer|analyst|reviewer|cycle]\n"
+                "不带参数测试记忆读写；后台阶段固定 dry-run，不写入记忆或待审队列。"
+            )
+            return
+        if stage in {"storage", "memory"}:
+            yield event.plain_result(await self._run_memory_test(event))
+            return
+        if stage not in {"purge", "organizer", "analyst", "reviewer", "cycle"}:
+            yield event.plain_result(
+                "未知测试项。合法值: purge, organizer, analyst, reviewer, cycle"
+            )
+            return
+        yield event.plain_result(await self._run_maintenance_test(stage))
 
     @memory_group.command("forget")
     async def cmd_forget(self, event: AstrMessageEvent):
@@ -1389,6 +1552,14 @@ class MemoryPlugin(Star):
             return
 
         target_kb_name = args["to"] or None
+        logger.debug(
+            "[简单长期记忆] rebuild 命令开始: target_kb=%s, clear_cache=%s, "
+            "confirm_provided=%s, current_kb=%s",
+            target_kb_name or "(current)",
+            args["clear_cache"],
+            bool(args["confirm"]),
+            self.memory_mgr.current_kb_name,
+        )
 
         # --to 与当前 KB 同名时视为原地重建
         if target_kb_name and self.memory_mgr.current_kb_name == target_kb_name:
@@ -1436,6 +1607,15 @@ class MemoryPlugin(Star):
                 + (f" --to {shlex.quote(target_kb_name)}" if target_kb_name else "")
             )
             yield event.plain_result(report)
+            logger.debug(
+                "[简单长期记忆] rebuild 确认预览: mode=%s, source_count=%s, "
+                "target_count=%s, target_missing=%s, confirm_code_generated=%s",
+                mode,
+                source_count,
+                target_count,
+                target_missing,
+                True,
+            )
             return
         if not source_kb_id:
             yield event.plain_result("当前知识库不存在，请检查配置")
@@ -1451,9 +1631,28 @@ class MemoryPlugin(Star):
         else:
             yield event.plain_result("正在当前知识库重建所有记忆，请稍候...")
 
+        logger.debug(
+            "[简单长期记忆] rebuild 执行确认: mode=%s, source_kb=%s, target_kb=%s, "
+            "source_id=%s, target_id=%s",
+            "migration" if target_kb_name else "rebuild",
+            self.memory_mgr.current_kb_name,
+            target_kb_name or self.memory_mgr.current_kb_name,
+            source_kb_id,
+            target_kb_id,
+        )
         try:
             result = await self.memory_mgr.rebuild_memories(
                 target_kb_name=target_kb_name,
+            )
+            logger.debug(
+                "[简单长期记忆] rebuild 执行返回: status=%s, total=%s, success=%s, "
+                "failed=%s, pending_flushed=%s, verification=%s",
+                result.get("status"),
+                result.get("total"),
+                result.get("success"),
+                result.get("failed"),
+                result.get("pending_flushed"),
+                result.get("verification", {}).get("passed"),
             )
             status = result.get("status", "completed")
             is_interrupted = status == "interrupted"
@@ -1537,8 +1736,13 @@ class MemoryPlugin(Star):
 
             yield event.plain_result(report)
         except ValueError as e:
+            logger.debug(
+                "[简单长期记忆] rebuild 命令 ValueError: error=%s",
+                e,
+            )
             yield event.plain_result(str(e))
         except Exception as e:
+            logger.exception("[简单长期记忆] rebuild 命令异常")
             yield event.plain_result(f"重建失败: {e}")
 
     @memory_group.command("review")
@@ -1647,7 +1851,10 @@ class MemoryPlugin(Star):
         hit = False
         try:
             results = await self.memory_mgr.recall_memories(
-                event=event, query=test_content, top_k=3
+                event=event,
+                query=test_content,
+                top_k=3,
+                source="command_test",
             )
             hit = any("memory_test_probe" in r.get("text", "") for r in results)
             report.append(
@@ -1668,6 +1875,79 @@ class MemoryPlugin(Star):
         report.append(
             "  结论: " + ("全部通过" if hit else "召回异常，请检查 embedding 配置")
         )
+        return "\n".join(report)
+
+    async def _run_maintenance_test(self, stage: str) -> str:
+        """运行后台阶段 dry-run，并只返回计数摘要。"""
+        scheduler = self._scheduler
+        if scheduler is None:
+            scheduler = MaintenanceScheduler(
+                context=self.context,
+                memory_mgr=self.memory_mgr,
+                config=self.config,
+                kv_put=self.put_kv_data,
+                kv_get=self.get_kv_data,
+            )
+        try:
+            result = await scheduler.runner.run_test_stage(stage)
+        except Exception as e:
+            logger.exception("[简单长期记忆] 后台测试失败: stage=%s", stage)
+            return f"[后台整理测试: {stage}]\n  结果: 失败 ({e})\n  模式: dry-run，无持久化写入"
+
+        report = [f"[后台整理测试: {stage}]", "  模式: dry-run（不执行持久化写入）"]
+        purge = result.get("purge")
+        if isinstance(purge, dict):
+            report.append(
+                "  purge: 候选 {candidates}，实际清理 {purged}，失败 {failed}".format(
+                    candidates=purge.get("candidates", 0),
+                    purged=purge.get("purged", 0),
+                    failed=purge.get("failed", 0),
+                )
+            )
+        for name in ("organizer", "analyst"):
+            manifest = result.get(name)
+            if isinstance(manifest, dict):
+                metrics = manifest.get("metrics") or {}
+                report.append(
+                    "  {name}: 解析 {parsed}，操作 {operations}，记忆 {memories}，"
+                    "向量 {vectors}，缺失 {missing}，候选 {candidates}".format(
+                        name=name,
+                        parsed="成功" if manifest.get("parsed") else "失败",
+                        operations=manifest.get(
+                            "operations", manifest.get("ops_count", 0)
+                        ),
+                        memories=metrics.get("memory_count", 0),
+                        vectors=metrics.get("vector_count", 0),
+                        missing=metrics.get("vector_missing", 0),
+                        candidates=metrics.get("candidates_screened", 0),
+                    )
+                )
+        reviewer = result.get("reviewer")
+        if isinstance(reviewer, dict):
+            report.append(
+                "  reviewer: 裁决 {verdicts}，通过 {approved}，拒绝 {rejected}".format(
+                    verdicts=reviewer.get(
+                        "verdicts", result.get("reviewer_verdicts_count", 0)
+                    ),
+                    approved=reviewer.get("approved", 0),
+                    rejected=reviewer.get("rejected", 0),
+                )
+            )
+        elif "reviewer_verdicts_count" in result:
+            report.append(f"  reviewer: 裁决 {result['reviewer_verdicts_count']}")
+        llm_stats = result.get("llm_stats") or {}
+        report.append(
+            "  LLM: 调用 {calls}，缓存命中 {cache_hits}，错误 {errors}".format(
+                calls=llm_stats.get("calls", 0),
+                cache_hits=llm_stats.get("cache_hits", 0),
+                errors=llm_stats.get("errors", 0),
+            )
+        )
+        errors = result.get("errors") or []
+        conclusion = (
+            "完成（无阶段错误）" if not errors else f"完成（{len(errors)} 项阶段错误）"
+        )
+        report.append(f"  结论: {conclusion}")
         return "\n".join(report)
 
     # ==================== LLM 工具 ====================
@@ -1708,12 +1988,20 @@ class MemoryPlugin(Star):
             scope_filter = scope_lower
 
         memories = await self.memory_mgr.recall_memories(
-            event, query, domain=domain_filter, memory_scope=scope_filter
+            event,
+            query,
+            domain=domain_filter,
+            memory_scope=scope_filter,
+            source="tool_recall",
         )
         if not memories:
             return "No relevant memories found"
 
-        result = format_memory_for_injection(memories)
+        result = format_memory_for_injection(
+            memories,
+            timezone_name=self._get_display_timezone(),
+            viewer_user_id=self._get_viewer_user_id(event),
+        )
         return f"<user_history_info>\n{result}\n</user_history_info>"
 
     @filter.llm_tool(name="memory_store")
@@ -1834,6 +2122,7 @@ class MemoryPlugin(Star):
                 old_metadata=old_meta,
                 new_content=content,
                 new_disclosure=new_disclosure,
+                updated_by="user",
             )
         except Exception as e:
             return f"Error: failed to update memory: {e}"
@@ -1893,6 +2182,168 @@ class MemoryPlugin(Star):
             subject="global",
         )
         return f"Global memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_search_admin")
+    async def tool_search_admin(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        domain: str = "",
+        scope: str = "",
+        top_k: int = 5,
+    ) -> str:
+        """Search active memories across scopes for an administrator.
+
+        Use only for an administrator's explicit memory-management request.
+
+        Args:
+            query(string): search keywords or question
+            domain(string): optional filter (user_profile/preferences/facts/events/context)
+            scope(string): optional exact scope (global/personal/group/conversation)
+            top_k(int): number of results, from 1 to 20
+        """
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Administrator memory management tool is disabled in plugin config"
+        if not event.is_admin():
+            return "Only administrators can search memories across scopes"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        query = _sanitize_memory_content(query)
+        if not query:
+            return "Error: query is required"
+        domain_filter: str | None = None
+        if domain:
+            domain_filter = domain.lower().strip()
+            if domain_filter not in VALID_TOOL_DOMAINS:
+                valid = ", ".join(sorted(VALID_TOOL_DOMAINS))
+                return f"Error: invalid domain '{domain}'. Valid domains: {valid}"
+        scope_filter: str | None = None
+        if scope:
+            scope_filter = scope.lower().strip()
+            if scope_filter not in ADMIN_MANAGED_SCOPES:
+                valid = ", ".join(sorted(ADMIN_MANAGED_SCOPES))
+                return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        if isinstance(top_k, bool):
+            return f"Error: top_k must be an integer between 1 and 20, got '{top_k}'"
+        try:
+            top_k_value = int(top_k)
+        except (TypeError, ValueError):
+            return f"Error: top_k must be an integer between 1 and 20, got '{top_k}'"
+        if not 1 <= top_k_value <= 20:
+            return f"Error: top_k must be between 1 and 20, got {top_k_value}"
+        memories = await self.memory_mgr.recall_memories(
+            event,
+            query,
+            domain=domain_filter,
+            top_k=top_k_value,
+            all_users=True,
+            memory_scope=scope_filter,
+            bump=False,
+            source="tool_search_admin",
+        )
+        if not memories:
+            return "No active memories found"
+        result = format_memory_for_injection(
+            memories,
+            timezone_name=self._get_display_timezone(),
+            viewer_user_id=self._get_viewer_user_id(event),
+        )
+        targets = []
+        for memory in memories:
+            metadata = memory.get("metadata")
+            if not isinstance(metadata, dict) or not metadata.get("uri"):
+                continue
+            memory_scope = str(metadata.get("memory_scope", ""))
+            owner_field = ADMIN_SCOPE_OWNER_FIELDS.get(memory_scope, "")
+            owner_id = str(metadata.get(owner_field, "")) if owner_field else ""
+            targets.append(
+                f"- uri={metadata['uri']}; scope={memory_scope}; "
+                f"owner_id={owner_id or 'global'}"
+            )
+        targets_section = "\n".join(dict.fromkeys(targets))
+        return (
+            "<administrator_memory_management_results>\n"
+            f"Exact management targets:\n{targets_section}\n"
+            f"{result}\n</administrator_memory_management_results>"
+        )
+
+    @filter.llm_tool(name="memory_remove_admin")
+    async def tool_remove_admin(
+        self,
+        event: AstrMessageEvent,
+        uri: str,
+        scope: str,
+        owner_id: str = "",
+        confirm: str = "",
+    ) -> str:
+        """Preview then remove one exact-scope memory target for an administrator.
+
+        Args:
+            uri(string): exact memory URI returned by memory_search_admin
+            scope(string): exact scope (global/personal/group/conversation)
+            owner_id(string): required owner_user_id, owner_session_id, or umo for non-global scopes
+            confirm(string): confirmation code from the removal preview
+        """
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Administrator memory management tool is disabled in plugin config"
+        if not event.is_admin():
+            return "Only administrators can remove memories across scopes"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        uri = (uri or "").strip()
+        if not uri:
+            return "Error: uri is required"
+        try:
+            MemoryURI.parse(uri)
+        except ValueError as exc:
+            return f"Error: invalid memory URI '{uri}': {exc}"
+        scope_value = (scope or "").lower().strip()
+        if scope_value not in ADMIN_MANAGED_SCOPES:
+            valid = ", ".join(sorted(ADMIN_MANAGED_SCOPES))
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        owner_field = ADMIN_SCOPE_OWNER_FIELDS.get(scope_value, "")
+        owner_value = (owner_id or "").strip()
+        if owner_field and not owner_value:
+            return (
+                f"Error: owner_id is required for scope '{scope_value}' ({owner_field})"
+            )
+        if not owner_field and owner_value:
+            return "Error: owner_id must be empty for scope 'global'"
+        preview = await self.memory_mgr.preview_admin_memory_removal(
+            uri, scope_value, owner_value
+        )
+        if preview["count"] == 0:
+            return "Error: active memory not found for the exact URI, scope, and owner"
+        confirmation_code = _confirmation_code("remove-admin", preview["fingerprint"])
+        if str(confirm or "").strip() != confirmation_code:
+            return _format_admin_removal_preview(
+                uri,
+                scope_value,
+                owner_value,
+                preview,
+                confirmation_code,
+                owner_field,
+            )
+        outcome = await self.memory_mgr.forget_admin_memory_by_target(
+            uri, scope_value, owner_value, preview["fingerprint"]
+        )
+        if outcome["status"] == "changed":
+            current = outcome["preview"]
+            current_code = _confirmation_code("remove-admin", current["fingerprint"])
+            return (
+                "Error: memory changed since preview; no deletion occurred.\n"
+                + _format_admin_removal_preview(
+                    uri,
+                    scope_value,
+                    owner_value,
+                    current,
+                    current_code,
+                    owner_field,
+                )
+            )
+        if outcome["status"] == "not_found":
+            return "Error: active memory not found for the exact URI, scope, and owner"
+        return f"Memory deleted: {uri} ({outcome['deleted']} record(s))"
 
     @filter.llm_tool(name="memory_forget")
     async def tool_forget(self, event: AstrMessageEvent, uri: str) -> str:

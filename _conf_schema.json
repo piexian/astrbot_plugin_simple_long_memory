@@ -113,7 +113,7 @@
     "description": "启用管理员全局记忆工具",
     "type": "bool",
     "default": false,
-    "hint": "开启后提供 memory_store_global 工具，仅管理员可通过 AI 添加对所有会话生效的全局记忆"
+    "hint": "开启后提供管理员全局记忆写入，以及跨 global/personal/group/conversation 的精确搜索和确认删除工具"
   },
   "recall_sparse_fusion": {
     "description": "启用稀疏检索融合",
@@ -186,7 +186,7 @@
     "description": "整理时间窗口",
     "type": "string",
     "default": "02:00-06:00",
-    "hint": "单时间点如 03:00，或范围如 02:00-06:00（范围内空闲时执行）"
+    "hint": "单时间点如 03:00，或范围如 02:00-06:00；整理 cron 命中窗口外时仅记 DEBUG 日志并跳过"
   },
   "maintenance_cron": {
     "description": "整理周期定时表达式",

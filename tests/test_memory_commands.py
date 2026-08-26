@@ -172,6 +172,61 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("清理: 已删除测试记忆", result)
         self.assertIn("结论: 召回异常，请检查 embedding 配置", result)
 
+    async def test_memory_test_dispatches_maintenance_stage_as_dry_run(self):
+        class Runner:
+            def __init__(self):
+                self.stages = []
+
+            async def run_test_stage(self, stage):
+                self.stages.append(stage)
+                return {
+                    "stage": stage,
+                    "dry_run": True,
+                    "organizer": {
+                        "parsed": True,
+                        "operations": 2,
+                        "metrics": {
+                            "memory_count": 4,
+                            "vector_count": 3,
+                            "vector_missing": 1,
+                            "candidates_screened": 2,
+                        },
+                    },
+                    "llm_stats": {"calls": 2, "cache_hits": 1, "errors": 0},
+                }
+
+        runner = Runner()
+        plugin = SimpleNamespace(
+            memory_mgr=object(),
+            _scheduler=SimpleNamespace(runner=runner),
+        )
+        plugin._run_maintenance_test = lambda stage: (
+            plugin_main.MemoryPlugin._run_maintenance_test(plugin, stage)
+        )
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_test,
+            plugin,
+            _Event("memory test organizer", admin=True),
+        )
+
+        self.assertEqual(runner.stages, ["organizer"])
+        self.assertIn("模式: dry-run", result[0])
+        self.assertIn("organizer: 解析 成功，操作 2", result[0])
+        self.assertIn("LLM: 调用 2", result[0])
+
+    async def test_memory_test_rejects_unknown_maintenance_stage(self):
+        plugin = SimpleNamespace(memory_mgr=object())
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_test,
+            plugin,
+            _Event("memory test unknown", admin=True),
+        )
+
+        self.assertEqual(
+            result,
+            ["未知测试项。合法值: purge, organizer, analyst, reviewer, cycle"],
+        )
+
     async def test_stats_label_marks_compressed_count_as_history(self):
         class Manager:
             async def get_memory_stats(self, *args, **kwargs):
@@ -229,6 +284,289 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIn("!memory rebuild --clear-cache", result[-1])
                 self.assertNotIn("/memory rebuild --clear-cache", result[-1])
+
+
+class AdministratorMemoryToolTests(unittest.IsolatedAsyncioTestCase):
+    def _plugin(self, manager, enabled: bool = True):
+        return SimpleNamespace(
+            config={"enable_admin_global_memory_tool": enabled},
+            memory_mgr=manager,
+            _get_display_timezone=lambda: "Asia/Shanghai",
+            _get_viewer_user_id=lambda event: "test_42",
+        )
+
+    async def test_admin_search_requires_enabled_admin_and_searches_all_scopes(self):
+        class Manager:
+            def __init__(self):
+                self.calls = []
+
+            async def recall_memories(self, *args, **kwargs):
+                self.calls.append(kwargs)
+                return [
+                    {
+                        "text": "memory: personal rule",
+                        "metadata": {
+                            "uri": "facts://personal-rule",
+                            "memory_scope": "personal",
+                            "owner_user_id": "telegram_alice",
+                            "created_at": "2026-08-19T00:00:00+00:00",
+                        },
+                    }
+                ]
+
+        manager = Manager()
+        disabled = self._plugin(manager, enabled=False)
+        result = await plugin_main.MemoryPlugin.tool_search_admin(
+            disabled, _Event("", admin=True), "rule"
+        )
+        self.assertEqual(
+            result, "Administrator memory management tool is disabled in plugin config"
+        )
+        self.assertEqual(manager.calls, [])
+
+        plugin = self._plugin(manager)
+        result = await plugin_main.MemoryPlugin.tool_search_admin(
+            plugin, _Event("", admin=False), "rule"
+        )
+        self.assertEqual(
+            result, "Only administrators can search memories across scopes"
+        )
+        self.assertEqual(manager.calls, [])
+
+        result = await plugin_main.MemoryPlugin.tool_search_admin(
+            plugin, _Event("", admin=True), "rule", top_k=3
+        )
+        self.assertIn("facts://personal-rule", result)
+        self.assertIn("scope=personal", result)
+        self.assertIn("owner_id=telegram_alice", result)
+        self.assertEqual(len(manager.calls), 1)
+        self.assertTrue(manager.calls[0]["all_users"])
+        self.assertIsNone(manager.calls[0]["memory_scope"])
+        self.assertFalse(manager.calls[0]["bump"])
+        self.assertEqual(manager.calls[0]["top_k"], 3)
+
+    async def test_admin_search_filters_scope_and_rejects_invalid_parameters(self):
+        class Manager:
+            called = False
+
+            async def recall_memories(self, *args, **kwargs):
+                self.called = True
+                self.kwargs = kwargs
+                return []
+
+        manager = Manager()
+        plugin = self._plugin(manager)
+        event = _Event("", admin=True)
+        result = await plugin_main.MemoryPlugin.tool_search_admin(
+            plugin, event, "rule", scope="invalid"
+        )
+        self.assertIn("Error: invalid scope 'invalid'", result)
+        self.assertFalse(manager.called)
+        result = await plugin_main.MemoryPlugin.tool_search_admin(
+            plugin, event, "rule", domain="invalid"
+        )
+        self.assertIn("Error: invalid domain 'invalid'", result)
+        self.assertFalse(manager.called)
+        result = await plugin_main.MemoryPlugin.tool_search_admin(
+            plugin, event, "rule", scope="group", top_k=2
+        )
+        self.assertEqual(result, "No active memories found")
+        self.assertEqual(manager.kwargs["memory_scope"], "group")
+
+    async def test_all_users_recall_enforces_requested_scope_filter(self):
+        manager = MemoryManager(kb_mgr=None, config={"max_memories_per_inject": 5})
+        captured_filters = []
+
+        async def retrieve(query, top_k, filters, **kwargs):
+            captured_filters.append(filters)
+            return []
+
+        manager._retrieve_with_filter = retrieve
+        await manager.recall_memories(
+            _Event("", admin=True),
+            "rule",
+            all_users=True,
+            memory_scope="conversation",
+            bump=False,
+            source="tool_search_admin",
+        )
+        self.assertEqual(
+            captured_filters,
+            [
+                {
+                    "is_memory_record": True,
+                    "deprecated": False,
+                    "memory_scope": "conversation",
+                }
+            ],
+        )
+
+    async def test_admin_remove_previews_before_exact_owner_confirmed_deletion(self):
+        preview = {
+            "count": 1,
+            "fingerprint": "f" * 64,
+            "records": [
+                {
+                    "content_len": 8,
+                    "content_sha256": "123456789abc",
+                    "preview": "personal rule",
+                }
+            ],
+        }
+
+        class Manager:
+            def __init__(self):
+                self.preview_calls = []
+                self.delete_calls = []
+
+            async def preview_admin_memory_removal(self, uri, scope, owner_id):
+                self.preview_calls.append((uri, scope, owner_id))
+                return preview
+
+            async def forget_admin_memory_by_target(
+                self, uri, scope, owner_id, expected_fingerprint
+            ):
+                self.delete_calls.append((uri, scope, owner_id, expected_fingerprint))
+                return {"status": "deleted", "deleted": 1, "preview": preview}
+
+        manager = Manager()
+        plugin = self._plugin(manager)
+        event = _Event("", admin=True)
+        result = await plugin_main.MemoryPlugin.tool_remove_admin(
+            plugin, event, "facts://personal-rule", "personal", "telegram_alice"
+        )
+        self.assertIn("No deletion has occurred", result)
+        self.assertEqual(manager.delete_calls, [])
+        confirmation = plugin_main._confirmation_code(
+            "remove-admin", preview["fingerprint"]
+        )
+        result = await plugin_main.MemoryPlugin.tool_remove_admin(
+            plugin,
+            event,
+            "facts://personal-rule",
+            "personal",
+            "telegram_alice",
+            confirmation,
+        )
+        self.assertEqual(result, "Memory deleted: facts://personal-rule (1 record(s))")
+        self.assertEqual(
+            manager.delete_calls,
+            [
+                (
+                    "facts://personal-rule",
+                    "personal",
+                    "telegram_alice",
+                    preview["fingerprint"],
+                )
+            ],
+        )
+
+    async def test_admin_remove_requires_exact_scope_owner_and_admin(self):
+        class Manager:
+            async def preview_admin_memory_removal(self, uri, scope, owner_id):
+                raise AssertionError("manager must not be reached")
+
+        plugin = self._plugin(Manager())
+        result = await plugin_main.MemoryPlugin.tool_remove_admin(
+            plugin, _Event("", admin=False), "facts://rule", "global"
+        )
+        self.assertEqual(
+            result, "Only administrators can remove memories across scopes"
+        )
+        result = await plugin_main.MemoryPlugin.tool_remove_admin(
+            plugin, _Event("", admin=True), "facts://rule", "personal"
+        )
+        self.assertEqual(
+            result, "Error: owner_id is required for scope 'personal' (owner_user_id)"
+        )
+        result = await plugin_main.MemoryPlugin.tool_remove_admin(
+            plugin, _Event("", admin=True), "facts://rule", "global", "telegram_alice"
+        )
+        self.assertEqual(result, "Error: owner_id must be empty for scope 'global'")
+
+    async def test_admin_removal_filters_to_exact_scope_and_owner(self):
+        class DocumentStorage:
+            def __init__(self):
+                self.filters = []
+
+            async def get_documents(self, **kwargs):
+                self.filters.append(kwargs)
+                return [
+                    {
+                        "id": "doc-personal",
+                        "text": "memory: personal rule",
+                        "metadata": {
+                            "uri": "facts://rule",
+                            "kb_doc_id": "doc-personal",
+                            "memory_scope": "personal",
+                            "owner_user_id": "telegram_alice",
+                            "is_memory_record": True,
+                            "deprecated": False,
+                        },
+                    }
+                ]
+
+        storage = DocumentStorage()
+        manager = MemoryManager(kb_mgr=None, config={"memory_delete_scan_page_size": 5})
+        manager._kb_helper = SimpleNamespace(
+            vec_db=SimpleNamespace(document_storage=storage)
+        )
+        preview = await manager.preview_admin_memory_removal(
+            "facts://rule", "personal", "telegram_alice"
+        )
+        self.assertEqual(preview["count"], 1)
+        self.assertEqual(
+            storage.filters[0]["metadata_filters"],
+            {
+                "uri": "facts://rule",
+                "memory_scope": "personal",
+                "owner_user_id": "telegram_alice",
+                "is_memory_record": True,
+                "deprecated": False,
+            },
+        )
+
+    async def test_admin_removal_rechecks_fingerprint_and_deletes_exact_target(self):
+        preview = {"count": 1, "records": [], "fingerprint": "current"}
+        manager = MemoryManager(kb_mgr=None, config={})
+        delete_calls = []
+
+        async def preview_removal(uri, scope, owner_id):
+            self.assertEqual(
+                (uri, scope, owner_id), ("facts://rule", "group", "telegram_group_9")
+            )
+            return preview
+
+        async def delete_by_filters(filters, uri):
+            delete_calls.append((filters, uri))
+            return 1
+
+        manager.preview_admin_memory_removal = preview_removal
+        manager._delete_by_filters = delete_by_filters
+        stale = await manager.forget_admin_memory_by_target(
+            "facts://rule", "group", "telegram_group_9", "stale"
+        )
+        self.assertEqual(stale["status"], "changed")
+        self.assertEqual(delete_calls, [])
+        deleted = await manager.forget_admin_memory_by_target(
+            "facts://rule", "group", "telegram_group_9", "current"
+        )
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertEqual(
+            delete_calls,
+            [
+                (
+                    {
+                        "uri": "facts://rule",
+                        "memory_scope": "group",
+                        "owner_session_id": "telegram_group_9",
+                        "is_memory_record": True,
+                        "deprecated": False,
+                    },
+                    "facts://rule",
+                )
+            ],
+        )
 
 
 class _CountingVectorDB:
@@ -320,6 +658,35 @@ class MemoryManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["verification"]["passed"])
         self.assertIs(manager._kb_helper, target)
         self.assertEqual(manager.current_kb_name, "target")
+
+
+class DebugObservabilityTests(unittest.TestCase):
+    def test_content_summary_hashes_and_truncates_without_full_content(self):
+        content = "  alpha\n beta\t" + "x" * 100
+        summary = memory_manager_module._debug_content_summary(content)
+
+        self.assertEqual(summary["content_len"], len(content))
+        self.assertEqual(len(summary["content_sha256"]), 12)
+        self.assertEqual(summary["preview"], "alpha beta " + "x" * 69 + "...")
+        self.assertNotIn("\n", summary["preview"])
+
+    def test_memory_summary_keeps_uri_and_injection_metadata(self):
+        memory = {
+            "text": "用于诊断的记忆正文",
+            "metadata": {
+                "uri": "facts://trace-test",
+                "memory_scope": "personal",
+                "_is_linked": True,
+            },
+        }
+
+        summary = memory_manager_module._debug_memory_summary(memory)
+
+        self.assertEqual(summary["uri"], "facts://trace-test")
+        self.assertEqual(summary["scope"], "personal")
+        self.assertTrue(summary["linked"])
+        self.assertEqual(summary["content_len"], len(memory["text"]))
+        self.assertEqual(summary["preview"], memory["text"])
 
 
 if __name__ == "__main__":

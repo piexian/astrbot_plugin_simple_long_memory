@@ -21,21 +21,11 @@ async def purge_deprecated_memories(
     kb_helper: Any,
     link_manager: MemoryLinkManager | None,
     after_days: int = 7,
-) -> dict[str, int]:
-    """物理删除 deprecated 超过 after_days 天的记忆。
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """物理清理废弃超期记忆，或仅返回 dry-run 候选统计。
 
-    按精确的 kb_doc_id 逐条删除，不会误删宽限期内的记录。
-    只用成功删除的子集清理 KB 文档和关联边，保证跨存储一致性。
-
-    Args:
-        vec_db: 向量数据库实例
-        kb_helper: KBHelper 实例
-        link_manager: 关联表管理器（可选，用于级联清理）
-        after_days: 废弃超期天数
-
-    Returns:
-        {"purged": int, "links_cleaned": int, "failed": int,
-         "errors": list[str], "partial": bool}
+    dry_run 为真时只查询候选，绝不修改向量、文档或关联表。
     """
     if after_days <= 0 or not kb_helper:
         return {
@@ -90,6 +80,17 @@ async def purge_deprecated_memories(
             "failed": 0,
             "errors": [f"query: {e}"],
             "partial": False,
+        }
+
+    if dry_run:
+        return {
+            "purged": 0,
+            "links_cleaned": 0,
+            "failed": 0,
+            "errors": [],
+            "partial": False,
+            "candidates": len(candidates),
+            "dry_run": True,
         }
 
     if not candidates:
