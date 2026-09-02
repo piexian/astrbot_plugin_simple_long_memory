@@ -5,7 +5,7 @@ import unittest
 
 from maintenance.agents.analyst import AnalystAgent
 from maintenance.agents.reviewer import ReviewerAgent
-from maintenance.runner import AgentManifest, MaintenanceRunner
+from maintenance.runner import AgentManifest, MaintenanceReport, MaintenanceRunner
 
 
 def _mem(
@@ -471,6 +471,97 @@ class DryRunMaintenanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner._llm._cache_enabled)
         with self.assertRaisesRegex(ValueError, "合法值"):
             await runner.run_test_stage("unknown")
+
+
+class _DeprecatingMemoryMgr(_FakeMemoryMgr):
+    """带 deprecate_memory 记录的 fake，用于矛盾执行路径。"""
+
+    def __init__(self):
+        super().__init__()
+        self.deprecate_calls: list[tuple[str, str]] = []
+
+    async def deprecate_memory(self, uri: str, reason: str = ""):
+        self.deprecate_calls.append((uri, reason))
+        return True
+
+
+class ContradictionExecutionTests(unittest.IsolatedAsyncioTestCase):
+    """矛盾闭环：approve 不自动执行转人工；管理员批准后真正废弃旧记忆。"""
+
+    def _runner(self, memory_mgr, kv: _FakeKV) -> MaintenanceRunner:
+        return MaintenanceRunner(
+            context=None,
+            memory_mgr=memory_mgr,
+            llm=_FakeLLM(),
+            config={},
+            kv_put=kv.put_kv_data,
+            kv_get=kv.get_kv_data,
+        )
+
+    def _report_with_approved_contradiction(self) -> MaintenanceReport:
+        report = MaintenanceReport(session_id="s1")
+        report.analyst_manifest = AgentManifest(
+            agent_type="analyst",
+            parsed=True,
+            operations=[
+                {
+                    "type": "contradiction",
+                    "old_uri": "u://old",
+                    "new_uri": "u://new",
+                    "reason": "偏好变更",
+                }
+            ],
+        )
+        report.reviewer_verdicts = [
+            {"index": 0, "verdict": "approve", "reason": "确认矛盾"}
+        ]
+        return report
+
+    async def test_approved_contradiction_goes_pending_without_execution(self):
+        kv = _FakeKV()
+        mgr = _DeprecatingMemoryMgr()
+        runner = self._runner(mgr, kv)
+
+        report = self._report_with_approved_contradiction()
+        await runner._execute_operations(report)
+
+        self.assertEqual(mgr.deprecate_calls, [])
+        self.assertEqual(report.executed_ops, 0)
+        self.assertEqual(report.skipped_ops, 1)
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["op"]["type"], "contradiction")
+        self.assertEqual(queue[0]["status"], "pending")
+        self.assertEqual(queue[0]["verdict_reason"], "矛盾待人工裁决: 确认矛盾")
+
+    async def test_execute_approved_contradiction_deprecates_old_uri(self):
+        mgr = _DeprecatingMemoryMgr()
+        runner = self._runner(mgr, _FakeKV())
+        op = {
+            "type": "contradiction",
+            "old_uri": "u://old",
+            "new_uri": "u://new",
+            "reason": "偏好变更",
+        }
+
+        self.assertTrue(await runner.execute_approved(op))
+        self.assertEqual(mgr.deprecate_calls, [("u://old", "偏好变更")])
+
+    async def test_execute_approved_contradiction_requires_old_uri_and_defaults_reason(
+        self,
+    ):
+        mgr = _DeprecatingMemoryMgr()
+        runner = self._runner(mgr, _FakeKV())
+
+        self.assertFalse(await runner.execute_approved({"type": "contradiction"}))
+        self.assertEqual(mgr.deprecate_calls, [])
+
+        self.assertTrue(
+            await runner.execute_approved(
+                {"type": "contradiction", "old_uri": "u://old"}
+            )
+        )
+        self.assertEqual(mgr.deprecate_calls, [("u://old", "contradiction resolved")])
 
 
 if __name__ == "__main__":

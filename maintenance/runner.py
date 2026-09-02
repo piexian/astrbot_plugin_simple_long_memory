@@ -443,6 +443,18 @@ class MaintenanceRunner:
                             f"[简单长期记忆] 操作 {i} 涉及 global 记忆，转人工审批"
                         )
                         continue
+                    # 矛盾裁决不自动执行：转人工确认，批准后由 execute_approved 真正废弃旧记忆
+                    if op.get("type") == "contradiction":
+                        reason = verdict.get("reason", "")
+                        pending_items.append(
+                            (op, {**verdict, "reason": f"矛盾待人工裁决: {reason}"})
+                        )
+                        skipped += 1
+                        logger.info(
+                            f"[简单长期记忆] 矛盾操作 {i} 转人工裁决: "
+                            f"{op.get('old_uri')} vs {op.get('new_uri')}"
+                        )
+                        continue
                     try:
                         success = await self._execute_operation(op)
                         if success:
@@ -807,11 +819,13 @@ class MaintenanceRunner:
             elif op_type == "new_link":
                 return await self._execute_new_link(op)
             elif op_type == "contradiction":
-                # 矛盾检测只记录，不执行实际操作
-                logger.info(
-                    f"[简单长期记忆] 检测到矛盾: {op.get('old_uri')} vs {op.get('new_uri')}"
+                # 管理员批准后的真实执行：废弃被取代的旧记忆
+                old_uri = op.get("old_uri", "")
+                if not old_uri:
+                    return False
+                return await self._memory_mgr.deprecate_memory(
+                    old_uri, reason=op.get("reason") or "contradiction resolved"
                 )
-                return True
             else:
                 logger.warning(f"[简单长期记忆] 未知操作类型: {op_type}")
                 return False
