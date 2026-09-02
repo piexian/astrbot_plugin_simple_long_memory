@@ -224,7 +224,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result,
-            ["未知测试项。合法值: purge, organizer, analyst, reviewer, cycle"],
+            ["未知测试项。合法值: purge, extract, organizer, analyst, reviewer, cycle"],
         )
 
     async def test_stats_label_marks_compressed_count_as_history(self):

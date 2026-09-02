@@ -100,6 +100,38 @@
     "consolidation_batch_size": {
       "description": "Consolidation Batch Size",
       "hint": "Maximum number of memories processed per consolidation run"
+    },
+    "maintenance_extract_enabled": {
+      "description": "Enable Conversation Extraction",
+      "hint": "During maintenance cycles, segment conversation history into blocks and extract new memories; when off, only existing memories are curated"
+    },
+    "maintenance_segmenter_model_id": {
+      "description": "Segmenter Model",
+      "hint": "LLM used to judge whether a conversation block is complete; falls back to the global maintenance model when empty"
+    },
+    "maintenance_curator_model_id": {
+      "description": "Curator Model",
+      "hint": "LLM used to extract memories from conversation blocks; falls back to the global maintenance model when empty"
+    },
+    "maintenance_segment_time_gap_minutes": {
+      "description": "Segment Time Gap (minutes)",
+      "hint": "Adjacent messages separated by more than this gap are pre-split into different conversation blocks"
+    },
+    "maintenance_segment_max_chars": {
+      "description": "Max Block Characters",
+      "hint": "Maximum characters of a flattened conversation block; beyond this the block rolls into the next segment for re-judgement"
+    },
+    "maintenance_segment_max_extensions": {
+      "description": "Max Segment Extensions",
+      "hint": "Maximum times an incomplete block may absorb following segments before being carried over to the next cycle"
+    },
+    "maintenance_extract_max_blocks_per_cycle": {
+      "description": "Max Blocks per Cycle",
+      "hint": "Maximum conversation blocks the segmenter may emit in one maintenance cycle; the rest is deferred to the next cycle"
+    },
+    "maintenance_extract_llm_budget_ratio": {
+      "description": "Extraction LLM Budget Ratio",
+      "hint": "Share of the per-cycle LLM call limit reserved for conversation extraction (segment + extract); the rest goes to existing-memory curation"
     }
   }
 }

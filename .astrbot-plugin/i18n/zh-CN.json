@@ -100,6 +100,38 @@
     "consolidation_batch_size": {
       "description": "巩固批量大小",
       "hint": "每次巩固任务处理的记忆条数上限"
+    },
+    "maintenance_extract_enabled": {
+      "description": "启用对话提取",
+      "hint": "整理周期内从平台消息历史切分对话块并提取新记忆，关闭后只做存量记忆整理"
+    },
+    "maintenance_segmenter_model_id": {
+      "description": "分段模型",
+      "hint": "用于判断对话块是否闭环的 LLM 模型，留空使用全局整理模型"
+    },
+    "maintenance_curator_model_id": {
+      "description": "提取整理模型",
+      "hint": "用于从对话块提取记忆的 LLM 模型，留空使用全局整理模型"
+    },
+    "maintenance_segment_time_gap_minutes": {
+      "description": "分段时间间隙（分钟）",
+      "hint": "相邻消息间隔超过此值时预切为不同对话块"
+    },
+    "maintenance_segment_max_chars": {
+      "description": "对话块最大字符数",
+      "hint": "单个对话块扁平化文本的最大字符数，超出后滚动并入下一段重判"
+    },
+    "maintenance_segment_max_extensions": {
+      "description": "分段最大滚动扩展次数",
+      "hint": "对话块未闭环时最多并入后续段的次数，超限后挂起等待下周期"
+    },
+    "maintenance_extract_max_blocks_per_cycle": {
+      "description": "每周期最大对话块数",
+      "hint": "单个整理周期内分段员最多产出的对话块数量，超出部分下周期处理"
+    },
+    "maintenance_extract_llm_budget_ratio": {
+      "description": "提取 LLM 预算占比",
+      "hint": "每周期 LLM 调用上限中分配给对话提取（分段+提取）的比例，其余留给存量整理"
     }
   }
 }

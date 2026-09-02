@@ -1,7 +1,8 @@
 """后台整理执行管线。
 
 一次整理周期 = 一条顺序管线：
-  purge（纯逻辑）→ organizer → analyst → reviewer（复核前两个角色的 manifest）
+  purge（纯逻辑）→ extract（分段员+整理师提取对话记忆）→ organizer → analyst
+  → reviewer（复核前几个角色的 manifest）
 
 所有 Agent 只输出结构化 manifest，Host 解析后才执行 DB 写入。
 """
@@ -17,9 +18,18 @@ from typing import Any
 from astrbot.api import logger
 
 from .agents.analyst import AnalystAgent
+from .agents.curator import CuratorAgent
 from .agents.organizer import OrganizerAgent
 from .agents.reviewer import ReviewerAgent
+from .agents.segmenter import CARRY_KV_KEY, CURSOR_KV_KEY, SegmenterAgent
 from .llm import MaintenanceLLM
+
+try:  # 正常插件加载（包内相对导入）
+    from ..extraction_utils import normalize_extracted_scope
+    from ..memory_protocol import MemoryScope, UMOInfo, normalize_memory_scope
+except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.path
+    from extraction_utils import normalize_extracted_scope
+    from memory_protocol import MemoryScope, UMOInfo, normalize_memory_scope
 
 
 @dataclass
@@ -49,6 +59,7 @@ class MaintenanceReport:
     # 各阶段统计
     purge_result: dict[str, Any] = field(default_factory=dict)
     dry_run: bool = False
+    extract_manifest: AgentManifest | None = None
     organizer_manifest: AgentManifest | None = None
     analyst_manifest: AgentManifest | None = None
     reviewer_verdicts: list[dict[str, Any]] = field(default_factory=list)
@@ -70,6 +81,18 @@ class MaintenanceReport:
             "duration_ms": self.duration_ms,
             "dry_run": self.dry_run,
             "purge_result": self.purge_result,
+            "extract": {
+                "ops_count": len(self.extract_manifest.operations)
+                if self.extract_manifest
+                else 0,
+                "parsed": self.extract_manifest.parsed
+                if self.extract_manifest
+                else False,
+                "error": self.extract_manifest.error if self.extract_manifest else "",
+                "metrics": self.extract_manifest.metrics
+                if self.extract_manifest
+                else {},
+            },
             "organizer": {
                 "ops_count": len(self.organizer_manifest.operations)
                 if self.organizer_manifest
@@ -105,6 +128,17 @@ class MaintenanceReport:
         }
 
 
+class _MaintenanceEvent:
+    """后台提取用最小事件 shim：无真实消息事件，只提供 store_memory 所需字段。"""
+
+    def __init__(self, umo: str, sender_id: str = "") -> None:
+        self.unified_msg_origin = umo
+        self._sender_id = sender_id
+
+    def get_sender_id(self) -> str:
+        return self._sender_id
+
+
 class MaintenanceRunner:
     """后台整理执行管线。"""
 
@@ -127,6 +161,8 @@ class MaintenanceRunner:
         # 执行阶段与人工审批共用的互斥锁：
         # run_cycle 阶段 4 与 /memory review approve 都会写记忆存储，必须互斥
         self._op_lock = asyncio.Lock()
+        # 最近一次提取 manifest（供 _run_reviewer 并入审核流，见 run_cycle）
+        self._extract_manifest_for_review: AgentManifest | None = None
         # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
         self._last_review_unresolved: dict[str, int] = {}
 
@@ -151,9 +187,10 @@ class MaintenanceRunner:
             # 重置 LLM 统计
             self._llm.reset_cycle_stats()
             logger.debug(
-                "[简单长期记忆] 整理周期配置: session=%s, organizer=%s, "
+                "[简单长期记忆] 整理周期配置: session=%s, extract=%s, organizer=%s, "
                 "analyst=%s, reviewer=%s, max_llm=%s, max_ops=%s",
                 session_id,
+                self._config.get("maintenance_extract_enabled", True),
                 self._config.get("maintenance_organizer_enabled", True),
                 self._config.get("maintenance_analyst_enabled", True),
                 self._config.get("maintenance_reviewer_enabled", True),
@@ -175,6 +212,16 @@ class MaintenanceRunner:
                     report.errors.append(f"purge: {e}")
                     logger.warning(f"[简单长期记忆] purge 失败: {e}")
 
+            # ── 阶段 0.5: extract（分段员切对话块 + 整理师提取记忆）──
+            if self._config.get("maintenance_extract_enabled", True):
+                try:
+                    report.extract_manifest = await self._run_extraction(
+                        dry_run=dry_run
+                    )
+                except Exception as e:
+                    report.errors.append(f"extract: {e}")
+                    logger.warning(f"[简单长期记忆] 提取阶段失败: {e}")
+
             # ── 阶段 1: organizer（整理师）──
             if self._config.get("maintenance_organizer_enabled", True):
                 try:
@@ -194,6 +241,9 @@ class MaintenanceRunner:
             # ── 阶段 3: reviewer（审核员）──
             if self._config.get("maintenance_reviewer_enabled", True):
                 try:
+                    # extract 操作并入审核流头部；经实例属性传递以保持
+                    # _run_reviewer(organizer, analyst) 调用签名不变
+                    self._extract_manifest_for_review = report.extract_manifest
                     report.reviewer_verdicts = await self._run_reviewer(
                         organizer_manifest=report.organizer_manifest,
                         analyst_manifest=report.analyst_manifest,
@@ -201,6 +251,8 @@ class MaintenanceRunner:
                 except Exception as e:
                     report.errors.append(f"reviewer: {e}")
                     logger.warning(f"[简单长期记忆] reviewer 失败: {e}")
+                finally:
+                    self._extract_manifest_for_review = None
 
             # ── 阶段 3.5: 互审模式（驳回理由回传修正，最多 2 轮）──
             max_revision_rounds = 2
@@ -252,10 +304,17 @@ class MaintenanceRunner:
             )
 
             # 落 KV（Phase 2 先日志输出，Phase 3 接 KV）
+            extract_info = ""
+            if report.extract_manifest is not None:
+                _em = report.extract_manifest.metrics
+                extract_info = (
+                    f", 提取=块{_em.get('blocks_processed', 0)}"
+                    f"/新增{_em.get('created', 0)}/更新{_em.get('updated', 0)}"
+                )
             logger.info(
                 f"[简单长期记忆] 整理周期完成: {session_id}, "
                 f"耗时 {report.duration_ms:.0f}ms, "
-                f"LLM 调用 {report.llm_stats.get('calls', 0)} 次"
+                f"LLM 调用 {report.llm_stats.get('calls', 0)} 次{extract_info}"
             )
 
         return report
@@ -275,9 +334,9 @@ class MaintenanceRunner:
         normalized = stage.strip().lower()
         if normalized == "cycle":
             return (await self.run_cycle(dry_run=True)).to_dict()
-        if normalized not in {"purge", "organizer", "analyst", "reviewer"}:
+        if normalized not in {"purge", "extract", "organizer", "analyst", "reviewer"}:
             raise ValueError(
-                "未知后台测试项，合法值: purge, organizer, analyst, reviewer, cycle"
+                "未知后台测试项，合法值: purge, extract, organizer, analyst, reviewer, cycle"
             )
         if self._running:
             raise RuntimeError("maintenance cycle already running")
@@ -295,6 +354,10 @@ class MaintenanceRunner:
                 result["purge"] = await self._memory_mgr.purge_deprecated(
                     after_days=self._config.get("auto_purge_after_days", 7),
                     dry_run=True,
+                )
+            elif normalized == "extract":
+                result["extract"] = self._test_manifest_summary(
+                    await self._run_extraction(dry_run=True)
                 )
             elif normalized == "organizer":
                 result["organizer"] = self._test_manifest_summary(
@@ -344,8 +407,10 @@ class MaintenanceRunner:
             failed = 0
             pending_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
-            # 收集所有操作和对应的审核结果
+            # 收集所有操作和对应的审核结果（提取操作排在最前，与审核下标一致）
             all_operations = []
+            if report.extract_manifest and report.extract_manifest.parsed:
+                all_operations.extend(report.extract_manifest.operations)
             if report.organizer_manifest and report.organizer_manifest.parsed:
                 all_operations.extend(report.organizer_manifest.operations)
             if report.analyst_manifest and report.analyst_manifest.parsed:
@@ -410,19 +475,24 @@ class MaintenanceRunner:
 
                 # 缺失裁决 → fail closed，拒绝执行（避免 reviewer 故障时放行破坏性操作）
                 if verdict is None:
-                    # additive 操作（new_link）仅在审核员整体禁用时直接放行；
+                    # additive 操作（new_link/create）仅在审核员整体禁用时直接放行；
                     # 审核员启用却缺失裁决属于异常（LLM 漏判），同样 fail closed 转待审
-                    if op.get("type") == "new_link" and not reviewer_enabled:
+                    if (
+                        op.get("type") in ("new_link", "create")
+                        and not reviewer_enabled
+                    ):
                         try:
                             success = await self._execute_operation(op)
                             if success:
                                 executed += 1
                             else:
                                 failed += 1
-                                report.errors.append(f"op[{i}] new_link 执行返回失败")
+                                report.errors.append(
+                                    f"op[{i}] {op.get('type')} 执行返回失败"
+                                )
                         except Exception as e:
                             failed += 1
-                            report.errors.append(f"op[{i}] new_link: {e}")
+                            report.errors.append(f"op[{i}] {op.get('type')}: {e}")
                         continue
                     # 其余情况（破坏性操作，或审核员启用但裁决缺失）→ 转待审队列
                     reason = (
@@ -504,6 +574,113 @@ class MaintenanceRunner:
         """
         async with self._op_lock:
             return await self._execute_operation(op)
+
+    async def _run_extraction(self, *, dry_run: bool) -> AgentManifest:
+        """提取阶段：分段员切对话块 → 整理师提取 create/update 操作。
+
+        LLM 预算占每周期上限的 maintenance_extract_llm_budget_ratio（默认 60%），
+        分段员用完后剩余额度给整理师；两者同时受 llm.remaining_calls 全局约束。
+        """
+        manifest = AgentManifest(agent_type="extract")
+        max_calls = int(self._config.get("maintenance_max_llm_calls", 50))
+        ratio = float(self._config.get("maintenance_extract_llm_budget_ratio", 0.6))
+        extract_budget = max(0, int(max_calls * ratio))
+
+        segmenter = SegmenterAgent(
+            context=self._context,
+            llm=self._llm,
+            config=self._config,
+            kv_get=self._kv_get,
+            kv_put=self._kv_put,
+        )
+        seg_result = await segmenter.collect_blocks(extract_budget)
+        seg_stats = seg_result.get("stats", {})
+        blocks = seg_result.get("blocks", [])
+
+        curator_budget = max(0, extract_budget - int(seg_stats.get("llm_calls", 0)))
+        curator = CuratorAgent(
+            context=self._context,
+            memory_mgr=self._memory_mgr,
+            llm=self._llm,
+            config=self._config,
+        )
+        cur_result = await curator.run(blocks, curator_budget)
+
+        manifest.parsed = True
+        manifest.notes = str(cur_result.get("notes", "") or "")
+        manifest.operations.extend(cur_result.get("create", []))
+        manifest.operations.extend(cur_result.get("update", []))
+        manifest.metrics = {
+            "segmenter": seg_stats,
+            "blocks": len(blocks),
+            "blocks_processed": cur_result.get("blocks_processed", 0),
+            "blocks_nothing": cur_result.get("blocks_nothing", 0),
+            "created": len(cur_result.get("create", [])),
+            "updated": len(cur_result.get("update", [])),
+            "llm_calls": int(seg_stats.get("llm_calls", 0))
+            + cur_result.get("llm_calls", 0),
+        }
+        if not dry_run:
+            await self._commit_extract_progress(
+                seg_result, cur_result.get("outcomes", [])
+            )
+        logger.debug(
+            "[简单长期记忆] 提取阶段完成: blocks=%s, processed=%s, create=%s, "
+            "update=%s, llm_calls=%s, dry_run=%s",
+            len(blocks),
+            manifest.metrics["blocks_processed"],
+            manifest.metrics["created"],
+            manifest.metrics["updated"],
+            manifest.metrics["llm_calls"],
+            dry_run,
+        )
+        return manifest
+
+    async def _commit_extract_progress(
+        self,
+        seg_result: dict[str, Any],
+        outcomes: list[tuple[Any, str]],
+    ) -> None:
+        """按块提交提取游标并应用 carry 更新（整字典读改写，数据量小）。
+
+        游标只随整理师已处理的块推进（skipped_budget 的块不推进，下周期重提）；
+        无产出块会话（短块/毒块跳过）直接采用分段员游标，避免每周期重扫。
+        """
+        if not self._kv_put or not self._kv_get:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            cursors = await self._kv_get(CURSOR_KV_KEY, None)
+            cursors = dict(cursors) if isinstance(cursors, dict) else {}
+            grouped: dict[str, list[tuple[Any, str]]] = {}
+            for block, outcome in outcomes:
+                grouped.setdefault(block.conv_key, []).append((block, outcome))
+            for conv_key, items in grouped.items():
+                for block, outcome in items:
+                    if outcome == "skipped_budget":
+                        continue
+                    cursors[conv_key] = {"id": block.last_id, "ts": now_iso}
+                    # 逐块提交：崩溃后已处理块不重拉、未处理块不丢
+                    await self._kv_put(CURSOR_KV_KEY, cursors)
+            block_convs = set(grouped)
+            for conv_key, last_id in (seg_result.get("cursor_updates") or {}).items():
+                if conv_key in block_convs:
+                    continue  # 有块会话由 outcome 驱动，避免跳过未提取块
+                cursors[conv_key] = {"id": last_id, "ts": now_iso}
+                await self._kv_put(CURSOR_KV_KEY, cursors)
+
+            carry_updates = seg_result.get("carry_updates") or {}
+            if carry_updates:
+                carries = await self._kv_get(CARRY_KV_KEY, None)
+                carries = dict(carries) if isinstance(carries, dict) else {}
+                for conv_key, value in carry_updates.items():
+                    if value is None:
+                        carries.pop(conv_key, None)  # None = 清除该键
+                    else:
+                        carries[conv_key] = value
+                    await self._kv_put(CARRY_KV_KEY, carries)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 提交提取进度失败: {e}")
 
     async def _run_organizer(self) -> AgentManifest:
         """运行整理师：去重合并、质量精炼。"""
@@ -628,8 +805,11 @@ class MaintenanceRunner:
         """运行审核员：复核操作建议。"""
         verdicts: list[dict[str, Any]] = []
 
-        # 收集待审核的 manifest
+        # 收集待审核的 manifest（提取操作排在最前，与执行阶段顺序一致）
         proposed_changes = []
+        extract_manifest = self._extract_manifest_for_review
+        if extract_manifest and extract_manifest.parsed:
+            proposed_changes.extend(extract_manifest.operations)
         if organizer_manifest and organizer_manifest.parsed:
             proposed_changes.extend(organizer_manifest.operations)
         if analyst_manifest and analyst_manifest.parsed:
@@ -810,7 +990,9 @@ class MaintenanceRunner:
         op_type = op.get("type", "")
 
         try:
-            if op_type == "merge":
+            if op_type == "create":
+                return await self._execute_create(op)
+            elif op_type == "merge":
                 return await self._execute_merge(op)
             elif op_type == "archive":
                 return await self._execute_archive(op)
@@ -831,6 +1013,60 @@ class MaintenanceRunner:
                 return False
         except Exception as e:
             logger.warning(f"[简单长期记忆] 执行操作失败: {op_type}, {e}")
+            return False
+
+    async def _execute_create(self, op: dict[str, Any]) -> bool:
+        """执行 create 操作（整理师从对话块提取的新记忆）。"""
+        content = str(op.get("content") or "").strip()
+        umo = str(op.get("umo") or "")
+        if not content or not umo:
+            return False
+
+        parsed = UMOInfo.parse(umo)
+        session_type = parsed.session_type
+        raw_scope = normalize_memory_scope(str(op.get("scope") or ""))
+        scope = normalize_extracted_scope(raw_scope, session_type)
+        if raw_scope == MemoryScope.GLOBAL:
+            # 双保险：curator 解析已降级 global，执行侧再拦一次并留痕
+            logger.info(
+                "[简单长期记忆] create 操作请求 global scope，已降级 personal: umo=%s",
+                umo,
+            )
+
+        subjects = [str(s) for s in (op.get("subjects") or []) if s]
+        subject = str(op.get("subject") or "") or (subjects[0] if subjects else "")
+        # 私聊无 subject 时以 session_id 兜底（私聊 session_id 即对端用户 id），
+        # 避免 store_memory 的 owner 推导拿到空 sender
+        sender_id = subject or parsed.session_id
+        if not sender_id:
+            logger.warning("[简单长期记忆] create 操作缺少可归属的 sender: umo=%s", umo)
+            return False
+        event = _MaintenanceEvent(umo=umo, sender_id=sender_id)
+        is_personal = scope == MemoryScope.PERSONAL
+        try:
+            uri = await self._memory_mgr.store_memory(
+                event=event,
+                content=content,
+                domain=str(op.get("domain") or "fact"),
+                disclosure=str(op.get("disclosure") or ""),
+                importance=int(op.get("importance", 3)),
+                memory_scope=scope,
+                subject=subject,
+                entities=op.get("entities") or [],
+                topics=op.get("topics") or [],
+                owner_sender_id=subject if is_personal else None,
+                owner_sender_ids=subjects if is_personal and subjects else None,
+                extra_metadata={"created_by": "maintenance_curator"},
+            )
+            logger.debug(
+                "[简单长期记忆] create 写入完成: uri=%s, scope=%s, umo=%s",
+                uri,
+                scope,
+                umo,
+            )
+            return bool(uri)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] create 写入失败: {e}")
             return False
 
     async def _execute_merge(self, op: dict[str, Any]) -> bool:

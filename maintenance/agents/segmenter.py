@@ -294,6 +294,11 @@ class SegmenterAgent:
 
             pending = prev_carry if first_block else None
             first_block = False
+            if pending and cand.first_id != pending.get("start_id"):
+                # runner 按块提交游标后崩溃重拉，旧 carry 起点已与候选块错配，
+                # 视为过期 carry 丢弃并清除（不继承其 cycles/fail_count）
+                pending = None
+                new_carry = None
             prev_cycles = pending.get("cycles", 0) if pending else 0
             prev_fails = pending.get("fail_count", 0) if pending else 0
             advance = False  # True=继续下一块；False=游标停块首，本会话结束

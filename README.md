@@ -56,6 +56,14 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | maintenance_window | 整理执行时间窗口；cron 命中窗口外时跳过并记 DEBUG | `02:00-06:00` |
 | maintenance_max_ops_per_cycle | 每周期操作数硬上限 | `100` |
 | maintenance_pending_queue_max | 待审队列容量上限 | `500` |
+| maintenance_extract_enabled | 启用夜间对话提取（对话块→记忆） | `true` |
+| maintenance_segmenter_model_id | 分段模型（留空用整理模型） | 留空 |
+| maintenance_curator_model_id | 提取整理模型（留空用整理模型） | 留空 |
+| maintenance_segment_time_gap_minutes | 分段时间间隙（分钟） | `30` |
+| maintenance_segment_max_chars | 对话块最大字符数 | `8000` |
+| maintenance_segment_max_extensions | 分段最大滚动扩展次数 | `3` |
+| maintenance_extract_max_blocks_per_cycle | 每周期最大对话块数 | `20` |
+| maintenance_extract_llm_budget_ratio | 提取 LLM 预算占每周期上限比例 | `0.6` |
 | context_max_rounds | 最大拉取对话轮数 | `50` |
 | context_max_chars | 最大拉取字符数 | `30000` |
 | context_max_age_days | 对话最大回溯天数 | `7` |
@@ -69,7 +77,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 /memory list [--all] [页码]                                  - 列出记忆（默认第 1 页）
 /memory search [--all] <关键词>                            - 搜索记忆
 /memory stats [--all]                                      - 查看记忆统计
-/memory test [purge|organizer|analyst|reviewer|cycle]     - 管理员测试（后台项固定 dry-run）
+/memory test [purge|extract|organizer|analyst|reviewer|cycle]     - 管理员测试（后台项固定 dry-run）
 /memory forget <URI> [--user <用户ID>]                    - 删除指定记忆
 /memory clear [--all|--user <用户ID>] [--confirm <确认码>]  - 清空记忆（管理员）
 /memory rebuild [--to <知识库名>] [--confirm <确认码>]     - 重建或迁移记忆（管理员）
@@ -206,6 +214,8 @@ AI 可以通过以下工具主动操作记忆：
 2. **整理师**：余弦 ≥0.9 预筛候选对，LLM 裁决 merge/none，merge 走 supersede 语义（不物理删除）
 3. **分析师**：余弦 ≥0.7 预筛候选对，排除已连边，发现关联和矛盾
 4. **审核员**：复核操作建议，approve 执行 / reject 跳过 / controversial 待人工审核
+
+**夜间对话提取**：整理周期先从平台消息历史按会话游标滚动切出闭环对话块（分段员判断完整性），再由整理师对照同会话旧记忆提取新记忆或更新建议——已有等价内容时输出更新而非重复创建，闲聊等无信息增量的块直接跳过。提取预算默认占每周期 LLM 上限的 60%（`maintenance_extract_llm_budget_ratio`）；游标按块提交，崩溃后从下一块续跑，可用 `maintenance_extract_enabled` 整体关闭。
 
 **安全机制**：
 - 两级预筛：候选先经向量余弦预筛，再交 LLM 裁决，不全量喂记忆池

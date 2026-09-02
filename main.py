@@ -37,7 +37,6 @@ from .memory_protocol import (
     UMOInfo,
     format_memory_for_injection,
     format_memory_for_user,
-    normalize_memory_scope,
 )
 
 if TYPE_CHECKING:
@@ -45,7 +44,6 @@ if TYPE_CHECKING:
 
 from .prompts import (
     ALLOWED_MEMORY_TYPES,
-    MAX_EXTRACTED_MEMORIES,
     MEMORY_CONSOLIDATION_PROMPT,
     MEMORY_EXTRACTION_PROMPT,
     RECALL_QUERY_PROMPT,
@@ -56,58 +54,30 @@ from .prompts import (
     sanitize_memory_content as _sanitize_memory_content,
 )
 
+# 提取解析共享逻辑已抽至 extraction_utils（maintenance.agents.curator 共用），
+# 以下同名别名仅为兼容外部引用而保留（re-export），本文件内不再直接使用
+from .extraction_utils import (
+    normalize_extracted_scope as _normalize_extracted_scope,  # noqa: F401
+)
+from .extraction_utils import (
+    normalize_subject_id as _normalize_subject_id,  # noqa: F401
+)
+from .extraction_utils import (
+    normalize_subject_ids as _normalize_subject_ids,  # noqa: F401
+)
+from .extraction_utils import (
+    parse_extracted_memories as _shared_parse_extracted_memories,
+)
+from .extraction_utils import (
+    sanitize_string_list as _sanitize_string_list,  # noqa: F401
+)
+from .extraction_utils import (
+    strip_json_fence as _strip_json_fence_text,
+)
+
 DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT = 10
 DEFAULT_MAX_SESSION_SNAPSHOTS = 20
 DEFAULT_MAX_SNAPSHOT_CHARS = 8000
-
-
-def _sanitize_string_list(value: Any, limit: int = 8) -> list[str]:
-    if not isinstance(value, list):
-        return []
-
-    result = []
-    for item in value[:limit]:
-        text = _sanitize_memory_content(str(item))[:80]
-        if text:
-            result.append(text)
-    return result
-
-
-def _normalize_extracted_scope(scope: str, session_type: str) -> str:
-    """规范化自动提取的记忆作用域。
-
-    自动提取不能写入全局记忆；全局记忆只能由管理员工具显式创建。
-    """
-    scope = normalize_memory_scope(scope)
-    if scope == MemoryScope.GLOBAL:
-        return MemoryScope.PERSONAL
-    if session_type != "group" and scope == MemoryScope.GROUP:
-        return MemoryScope.PERSONAL
-    return scope
-
-
-def _normalize_subject_id(subject: str) -> str:
-    subject = subject.strip()
-    for prefix in ("用户:", "user:", "sender:"):
-        if subject.lower().startswith(prefix):
-            return subject[len(prefix) :].strip()
-    return subject
-
-
-def _normalize_subject_ids(value: Any) -> list[str]:
-    if value is None or value == "":
-        return []
-    raw_values = value if isinstance(value, list) else str(value).split(",")
-    subjects = []
-    for item in raw_values:
-        subject = _normalize_subject_id(_sanitize_memory_content(str(item))[:120])
-        if (
-            subject
-            and subject.lower() != "none"
-            and subject not in {"current_sender", "group", "conversation"}
-        ):
-            subjects.append(subject)
-    return list(dict.fromkeys(subjects))
 
 
 def _current_speaker_subject(event: AstrMessageEvent, scope: str) -> str:
@@ -854,83 +824,13 @@ class MemoryPlugin(Star):
 
     def _strip_json_fence(self, text: str) -> str:
         """移除 markdown JSON 围栏"""
-        text = text.strip()
-        if not text.startswith("```"):
-            return text
-        text = re.sub(r"^```\w*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-        return text.strip()
+        return _strip_json_fence_text(text)
 
     def _parse_extracted_memories(
         self, text: str, session_type: str = "private"
     ) -> list[dict[str, Any]]:
         """解析 LLM 返回的记忆 JSON，带校验和上限"""
-        text = self._strip_json_fence(text)
-        try:
-            data = json.loads(text)
-            if not isinstance(data, list):
-                return []
-
-            # 校验并限制结果
-            validated = []
-            for item in data[:MAX_EXTRACTED_MEMORIES]:  # 限制数量
-                if not isinstance(item, dict):
-                    continue
-
-                # 校验必需字段
-                content = item.get("content", "")
-                if not content or not isinstance(content, str):
-                    continue
-
-                # 清理内容，防止 Prompt Injection
-                content = _sanitize_memory_content(content)
-                if not content:
-                    continue
-
-                # 校验并规范化字段
-                mem_type = str(item.get("type", "fact")).lower()
-                if mem_type not in ALLOWED_MEMORY_TYPES:
-                    mem_type = "fact"
-
-                scope = _normalize_extracted_scope(
-                    str(item.get("scope", "personal")), session_type
-                )
-                subjects = _normalize_subject_ids(item.get("subjects"))
-                if not subjects:
-                    subjects = _normalize_subject_ids(item.get("subject", ""))
-                subject = subjects[0] if subjects else ""
-                if session_type == "group" and scope == MemoryScope.PERSONAL:
-                    if not subjects:
-                        continue
-                entities = _sanitize_string_list(item.get("entities", []))
-                topics = _sanitize_string_list(item.get("topics", []))
-                disclosure = _sanitize_memory_content(str(item.get("disclosure", "")))[
-                    :200
-                ]
-
-                try:
-                    importance = int(item.get("importance", 3))
-                    importance = max(1, min(5, importance))
-                except (TypeError, ValueError):
-                    importance = 3
-
-                validated.append(
-                    {
-                        "scope": scope,
-                        "type": mem_type,
-                        "content": content,
-                        "subject": subject,
-                        "subjects": subjects,
-                        "entities": entities,
-                        "topics": topics,
-                        "disclosure": disclosure,
-                        "importance": importance,
-                    }
-                )
-
-            return validated
-        except json.JSONDecodeError:
-            return []
+        return _shared_parse_extracted_memories(text, session_type)
 
     def _build_conversation_from_snapshots(
         self, snapshots: list[dict[str, Any]]
@@ -1358,22 +1258,29 @@ class MemoryPlugin(Star):
             return
         if len(args) > 1:
             yield event.plain_result(
-                "用法: /memory test [purge|organizer|analyst|reviewer|cycle]"
+                "用法: /memory test [purge|extract|organizer|analyst|reviewer|cycle]"
             )
             return
         stage = args[0].lower() if args else "storage"
         if stage in {"help", "--help", "-h"}:
             yield event.plain_result(
-                "用法: /memory test [purge|organizer|analyst|reviewer|cycle]\n"
+                "用法: /memory test [purge|extract|organizer|analyst|reviewer|cycle]\n"
                 "不带参数测试记忆读写；后台阶段固定 dry-run，不写入记忆或待审队列。"
             )
             return
         if stage in {"storage", "memory"}:
             yield event.plain_result(await self._run_memory_test(event))
             return
-        if stage not in {"purge", "organizer", "analyst", "reviewer", "cycle"}:
+        if stage not in {
+            "purge",
+            "extract",
+            "organizer",
+            "analyst",
+            "reviewer",
+            "cycle",
+        }:
             yield event.plain_result(
-                "未知测试项。合法值: purge, organizer, analyst, reviewer, cycle"
+                "未知测试项。合法值: purge, extract, organizer, analyst, reviewer, cycle"
             )
             return
         yield event.plain_result(await self._run_maintenance_test(stage))
@@ -1907,6 +1814,20 @@ class MemoryPlugin(Star):
                     candidates=purge.get("candidates", 0),
                     purged=purge.get("purged", 0),
                     failed=purge.get("failed", 0),
+                )
+            )
+        extract = result.get("extract")
+        if isinstance(extract, dict):
+            metrics = extract.get("metrics") or {}
+            seg = metrics.get("segmenter") or {}
+            report.append(
+                "  extract: 解析 {parsed}，扫描会话 {convs}，产出块 {blocks}，"
+                "新增 {created}，更新 {updated}".format(
+                    parsed="成功" if extract.get("parsed") else "失败",
+                    convs=seg.get("conversations_scanned", 0),
+                    blocks=metrics.get("blocks", 0),
+                    created=metrics.get("created", 0),
+                    updated=metrics.get("updated", 0),
                 )
             )
         for name in ("organizer", "analyst"):

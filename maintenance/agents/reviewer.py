@@ -299,6 +299,16 @@ class ReviewerAgent:
 
         cache 为单次 review() 运行共享：同一 URI 只拉取一次，含未命中的负缓存。
         """
+        if op.get("type") == "create":
+            # create 无既有 URI 可拉，给审核员看提案正文与来源摘要
+            return {
+                "memories": {},
+                "proposed_create": {
+                    "content": op.get("content", ""),
+                    "scope": op.get("scope", ""),
+                    "source_excerpt": op.get("source_excerpt", ""),
+                },
+            }
         memories: dict[str, Any] = {}
         for uri in self._op_uris(op)[:10]:
             if uri not in cache:

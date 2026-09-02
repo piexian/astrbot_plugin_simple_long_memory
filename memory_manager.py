@@ -947,6 +947,7 @@ class MemoryManager:
         topics: list[str] | None = None,
         owner_sender_id: str | None = None,
         owner_sender_ids: list[str] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> str:
         """存储记忆到知识库
 
@@ -1023,6 +1024,8 @@ class MemoryManager:
                 "entities": entities,
                 "topics": topics,
             }
+            if extra_metadata:
+                item.update(extra_metadata)
             self._pending_writes.append(item)
             # 持久化缓冲区到 KV，防进程重启丢失
             if self._kv_put:
@@ -1059,6 +1062,9 @@ class MemoryManager:
             memory_content=content,
             owner_sender_ids=owner_sender_ids,
         )
+        # 调用方附加的 provenance 字段（如 created_by）；系统字段以显式赋值为准
+        if extra_metadata:
+            metadata.update(extra_metadata)
 
         # 生成 KB 文档 ID 并关联到向量条目
         doc_id = str(uuid.uuid4())

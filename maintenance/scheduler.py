@@ -213,7 +213,7 @@ class MaintenanceScheduler:
                 f"[简单长期记忆] 自动清理已启动: cron={purge_cron}, 超期={purge_days}天"
             )
 
-        # 整理周期（完整管线：purge → organizer → analyst → reviewer）
+        # 整理周期（完整管线：purge → extract → organizer → analyst → reviewer）
         if self._config.get("maintenance_enabled", False):
             maintenance_cron = self._config.get("maintenance_cron", "0 3 * * *")
             if not self._validate_cron(maintenance_cron, "memory_maintenance_cycle"):
