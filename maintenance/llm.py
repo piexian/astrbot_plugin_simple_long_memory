@@ -248,6 +248,18 @@ class MaintenanceLLM:
 
     # ─── 任务接口 ───────────────────────────────────────────
 
+    async def chat_json(
+        self, system_prompt: str, user_prompt: str, model_id: str = ""
+    ) -> dict[str, Any] | None:
+        """通用 JSON 对话：失败/超预算/解析失败均返回 None（不落磁盘缓存）。
+
+        预算计数由 _chat 内部完成，此处不重复计数。
+        """
+        raw = await self._chat(system_prompt, user_prompt, model_id)
+        if raw is None:
+            return None
+        return self._parse_json(raw)
+
     async def judge_relation(
         self,
         text_a: str,

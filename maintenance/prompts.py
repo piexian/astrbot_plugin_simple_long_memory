@@ -117,6 +117,26 @@ $related_changes
 """
 
 
+# ── 分段员默认模板 ──────────────────────────────────────────────
+
+SEGMENT_BOUNDARY_PROMPT = """\
+你是对话分段员。给你一段按时间顺序排列的对话块，判断它是否构成一段完整闭环的对话。
+
+## 完整闭环的标准
+- 话题自然收束：讨论有结论或自然结束
+- 无悬而未决的问答：提出的问题已得到回答或被明确搁置
+- 无未闭合的约定：改期、待办、承诺等已有明确结果
+
+## 对话块
+$block_text
+
+## 输出格式（严格 JSON，不要输出其他内容）
+{"complete": true, "reason": "<=20字"}
+- complete：对话块完整闭环置 true，否则 false
+- reason：判断理由，不超过 20 字
+"""
+
+
 def build_prompt(
     default_template: str,
     variables: dict[str, Any],
