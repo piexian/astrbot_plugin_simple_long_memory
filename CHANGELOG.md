@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.0 (2026-09-03)
+
+### 新增
+- **夜间对话提取（分段员 + 整理师）**：整理周期在 purge 后新增提取阶段。分段员从平台消息历史按会话游标分段滚动拉取，时间间隙零成本预切 + LLM 闭环判定，不完整则滚动并入下一段重判；挂起块跨周期续判，毒块连续失败 2 次跳过，连续 3 个周期未闭环强制截断产出。整理师对每个闭环块检索同会话旧记忆做新老对照，输出 create / update / 空三态——已有等价内容时更新而非重复创建，闲聊块允许零产出。提取预算默认占每周期 LLM 上限 60%（`maintenance_extract_llm_budget_ratio`），游标按块提交，崩溃后从下一块续跑。
+- **提取溯源与审核**：新记忆带 `created_by=maintenance_curator` 与来源摘要；create 操作经审核员复核（审核员整体禁用时按 additive 放行），请求 global 一律降级 personal。
+- **新配置键**：`maintenance_extract_enabled`、`maintenance_segmenter_model_id`、`maintenance_curator_model_id`、`maintenance_segment_time_gap_minutes`、`maintenance_segment_max_chars`、`maintenance_segment_max_extensions`、`maintenance_extract_max_blocks_per_cycle`、`maintenance_extract_llm_budget_ratio`。
+- **`/memory test extract`**：dry-run 演练提取链路，只回显统计摘要不写任何数据。
+
+
 ## v0.4.5 (2026-09-03)
 
 ### 修复
