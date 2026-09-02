@@ -1017,6 +1017,11 @@ class MemoryPlugin(Star):
                 _debug_content_summary(query, preview_limit=0),
             )
 
+            # 池空短路：无活跃记忆时跳过查询优化与召回，避免空库白烧 LLM/embedding
+            if not await self.memory_mgr.has_any_active_memory():
+                logger.debug("[简单长期记忆] 召回短路: 无活跃记忆, source=auto_inject")
+                return
+
             # 检索优化：调用 LLM 提炼关键词
             if self.config.get("optimize_recall_query", False):
                 query = await self._optimize_recall_query(event, query)

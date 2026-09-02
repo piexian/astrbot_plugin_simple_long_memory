@@ -1290,6 +1290,16 @@ class MemoryManager:
         )
         return new_uri
 
+    async def has_any_active_memory(self) -> bool:
+        """知识库中是否仍有活跃（未废弃）记忆。"""
+        if not self._kb_helper:
+            return False
+        docs = await self.vec_db.document_storage.get_documents(
+            metadata_filters={"is_memory_record": True, "deprecated": False},
+            limit=1,
+        )
+        return bool(docs)
+
     async def recall_memories(
         self,
         event: AstrMessageEvent,
@@ -1327,6 +1337,15 @@ class MemoryManager:
             memory_scope or "",
             bump,
         )
+        # 池空短路：无活跃记忆时跳过全部检索通道，避免空库白烧 embedding
+        if self._kb_helper and not await self.has_any_active_memory():
+            logger.debug(
+                "[简单长期记忆] 召回短路: 无活跃记忆, trace_id=%s, source=%s",
+                trace_id,
+                source,
+            )
+            return []
+
         if top_k is None:
             top_k = self.config.get("max_memories_per_inject", 5)
         fetch_k = max(top_k, min(top_k * 3, 20))
@@ -1338,7 +1357,7 @@ class MemoryManager:
             if memory_scope:
                 filters["memory_scope"] = memory_scope
             raw = await self._retrieve_with_filter(
-                query, fetch_k, filters, trace_id=trace_id
+                query, fetch_k, filters, trace_id=trace_id, final_top_k=top_k
             )
             deduped = self._dedupe_memories(raw)
             memories = deduped[:top_k]
@@ -1368,7 +1387,9 @@ class MemoryManager:
             )
 
             tasks = [
-                self._retrieve_with_filter(query, fetch_k, filters, trace_id=trace_id)
+                self._retrieve_with_filter(
+                    query, fetch_k, filters, trace_id=trace_id, final_top_k=top_k
+                )
                 for filters in filters_list
             ]
             results_list = await asyncio.gather(*tasks)
@@ -1673,6 +1694,7 @@ class MemoryManager:
         top_k: int,
         filters: dict[str, Any],
         trace_id: str = "",
+        final_top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         started_at = time.monotonic()
         logger.debug(
@@ -1724,8 +1746,13 @@ class MemoryManager:
             else dense_memories
         )
         # 融合后统一 rerank（复用知识库配置的 rerank provider）
+        # 候选数不超过最终 top_k 时 rerank 不影响截断，且排序会被信号重排覆盖，直接跳过
         rerank_applied = False
-        if use_rerank and memories:
+        if (
+            use_rerank
+            and memories
+            and (final_top_k is None or len(memories) > final_top_k)
+        ):
             rerank_provider = getattr(self.vec_db, "rerank_provider", None)
             if rerank_provider:
                 try:
