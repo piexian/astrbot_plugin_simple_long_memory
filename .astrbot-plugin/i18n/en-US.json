@@ -132,6 +132,14 @@
     "maintenance_extract_llm_budget_ratio": {
       "description": "Extraction LLM Budget Ratio",
       "hint": "Share of the per-cycle LLM call limit reserved for conversation extraction (segment + extract); the rest goes to existing-memory curation"
+    },
+    "maintenance_extract_conv2_enabled": {
+      "description": "ConversationV2 Fallback Extraction",
+      "hint": "Conversations without platform message history (e.g. private chats) fall back to LLM conversation records for extraction"
+    },
+    "maintenance_extract_conv2_chunk_messages": {
+      "description": "ConversationV2 Chunk Size",
+      "hint": "ConversationV2 records carry no timestamps; every N messages are cut into one candidate block"
     }
   }
 }

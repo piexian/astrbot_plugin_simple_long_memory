@@ -659,14 +659,31 @@ class MaintenanceRunner:
                 for block, outcome in items:
                     if outcome == "skipped_budget":
                         continue
-                    cursors[conv_key] = {"id": block.last_id, "ts": now_iso}
+                    if getattr(block, "source", "pmh") == "conv2":
+                        # conv2 无行 id，游标为内容锚点 + 消息下标
+                        cursors[conv_key] = {
+                            "source": "conv2",
+                            "anchor": str(getattr(block, "end_anchor", "") or ""),
+                            "idx": block.last_id,
+                            "ts": now_iso,
+                        }
+                    else:
+                        cursors[conv_key] = {"id": block.last_id, "ts": now_iso}
                     # 逐块提交：崩溃后已处理块不重拉、未处理块不丢
                     await self._kv_put(CURSOR_KV_KEY, cursors)
             block_convs = set(grouped)
-            for conv_key, last_id in (seg_result.get("cursor_updates") or {}).items():
+            for conv_key, value in (seg_result.get("cursor_updates") or {}).items():
                 if conv_key in block_convs:
                     continue  # 有块会话由 outcome 驱动，避免跳过未提取块
-                cursors[conv_key] = {"id": last_id, "ts": now_iso}
+                if isinstance(value, dict) and value.get("source") == "conv2":
+                    cursors[conv_key] = {
+                        "source": "conv2",
+                        "anchor": str(value.get("anchor") or ""),
+                        "idx": int(value.get("idx") or 0),
+                        "ts": now_iso,
+                    }
+                else:
+                    cursors[conv_key] = {"id": value, "ts": now_iso}
                 await self._kv_put(CURSOR_KV_KEY, cursors)
 
             carry_updates = seg_result.get("carry_updates") or {}

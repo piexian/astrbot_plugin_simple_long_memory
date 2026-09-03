@@ -299,6 +299,18 @@
     "default": 0.6,
     "hint": "每周期 LLM 调用上限中分配给对话提取（分段+提取）的比例，其余留给存量整理"
   },
+  "maintenance_extract_conv2_enabled": {
+    "description": "ConversationV2 兜底提取",
+    "type": "bool",
+    "default": true,
+    "hint": "无平台消息历史的会话（如私聊）改用 LLM 对话记录兜底提取"
+  },
+  "maintenance_extract_conv2_chunk_messages": {
+    "description": "ConversationV2 分段消息数",
+    "type": "int",
+    "default": 40,
+    "hint": "ConversationV2 对话记录无时间戳，按每 N 条消息切为一个候选块"
+  },
   "review_notify_enabled": {
     "description": "待审通知开关",
     "type": "bool",

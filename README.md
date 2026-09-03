@@ -64,6 +64,8 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | maintenance_segment_max_extensions | 分段最大滚动扩展次数 | `3` |
 | maintenance_extract_max_blocks_per_cycle | 每周期最大对话块数 | `20` |
 | maintenance_extract_llm_budget_ratio | 提取 LLM 预算占每周期上限比例 | `0.6` |
+| maintenance_extract_conv2_enabled | 无平台消息历史的会话（私聊等）改用 LLM 对话记录兜底提取 | `true` |
+| maintenance_extract_conv2_chunk_messages | ConversationV2 兜底分段消息数 | `40` |
 | context_max_rounds | 最大拉取对话轮数 | `50` |
 | context_max_chars | 最大拉取字符数 | `30000` |
 | context_max_age_days | 对话最大回溯天数 | `7` |
@@ -215,7 +217,7 @@ AI 可以通过以下工具主动操作记忆：
 3. **分析师**：余弦 ≥0.7 预筛候选对，排除已连边，发现关联和矛盾
 4. **审核员**：复核操作建议，approve 执行 / reject 跳过 / controversial 待人工审核
 
-**夜间对话提取**：整理周期先从平台消息历史按会话游标滚动切出闭环对话块（分段员判断完整性），再由整理师对照同会话旧记忆提取新记忆或更新建议——已有等价内容时输出更新而非重复创建，闲聊等无信息增量的块直接跳过。提取预算默认占每周期 LLM 上限的 60%（`maintenance_extract_llm_budget_ratio`）；游标按块提交，崩溃后从下一块续跑，可用 `maintenance_extract_enabled` 整体关闭。
+**夜间对话提取**：整理周期先从平台消息历史按会话游标滚动切出闭环对话块（分段员判断完整性），再由整理师对照同会话旧记忆提取新记忆或更新建议——已有等价内容时输出更新而非重复创建，闲聊等无信息增量的块直接跳过。提取预算默认占每周期 LLM 上限的 60%（`maintenance_extract_llm_budget_ratio`）；游标按块提交，崩溃后从下一块续跑，可用 `maintenance_extract_enabled` 整体关闭。平台消息历史无数据的会话（私聊或未开启消息历史的群聊）由 ConversationV2 对话记录兜底：无时间戳按 `maintenance_extract_conv2_chunk_messages` 条切段，游标用内容锚点续跑，锚点丢失或首见会话只处理最新一段（宁可少提不重复），可用 `maintenance_extract_conv2_enabled` 关闭。
 
 **安全机制**：
 - 两级预筛：候选先经向量余弦预筛，再交 LLM 裁决，不全量喂记忆池
