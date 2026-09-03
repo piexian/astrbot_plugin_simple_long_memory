@@ -714,7 +714,7 @@ class SegmenterAgent:
     @staticmethod
     def _anchor(role: str, text: str) -> str:
         """消息内容锚点：sha256(f\"{role}:{文本}\")[:16]，作 conv2 游标/carry 比对。"""
-        return hashlib.sha256(f"{role}:{text}".encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(f"{role}:{text}".encode()).hexdigest()[:16]
 
     @staticmethod
     def _new_carry(

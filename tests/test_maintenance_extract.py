@@ -5,22 +5,23 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from test_maintenance_segmenter import (
+    _KV,
+    INCOMPLETE,
+    _config,
+    _row,
+    _StubSegmenter,
+)
+from test_maintenance_segmenter import (
+    _FakeLLM as _SegFakeLLM,
+)
+from test_memory_commands import plugin_main
+
 import maintenance.runner as runner_module
 from maintenance.agents.curator import CuratorAgent
 from maintenance.agents.reviewer import ReviewerAgent
 from maintenance.agents.segmenter import ConversationBlock
 from maintenance.runner import MaintenanceRunner
-from test_maintenance_segmenter import (
-    INCOMPLETE,
-    _FakeLLM as _SegFakeLLM,
-)
-from test_maintenance_segmenter import (
-    _KV,
-    _config,
-    _row,
-    _StubSegmenter,
-)
-from test_memory_commands import plugin_main
 
 
 def _block(

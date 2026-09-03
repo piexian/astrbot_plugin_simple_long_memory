@@ -42,18 +42,6 @@ from .memory_protocol import (
 if TYPE_CHECKING:
     from .memory_manager import MemoryManager
 
-from .prompts import (
-    ALLOWED_MEMORY_TYPES,
-    MEMORY_CONSOLIDATION_PROMPT,
-    MEMORY_EXTRACTION_PROMPT,
-    RECALL_QUERY_PROMPT,
-    VALID_TOOL_DOMAINS,
-    VALID_TOOL_SCOPES,
-)
-from .prompts import (
-    sanitize_memory_content as _sanitize_memory_content,
-)
-
 # 提取解析共享逻辑已抽至 extraction_utils（maintenance.agents.curator 共用），
 # 以下同名别名仅为兼容外部引用而保留（re-export），本文件内不再直接使用
 from .extraction_utils import (
@@ -73,6 +61,17 @@ from .extraction_utils import (
 )
 from .extraction_utils import (
     strip_json_fence as _strip_json_fence_text,
+)
+from .prompts import (
+    ALLOWED_MEMORY_TYPES,
+    MEMORY_CONSOLIDATION_PROMPT,
+    MEMORY_EXTRACTION_PROMPT,
+    RECALL_QUERY_PROMPT,
+    VALID_TOOL_DOMAINS,
+    VALID_TOOL_SCOPES,
+)
+from .prompts import (
+    sanitize_memory_content as _sanitize_memory_content,
 )
 
 DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT = 10

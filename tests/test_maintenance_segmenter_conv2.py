@@ -7,13 +7,6 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import maintenance.runner as runner_module
-from maintenance.agents.segmenter import (
-    CURSOR_KV_KEY,
-    ConversationBlock,
-    SegmenterAgent,
-)
-from maintenance.runner import MaintenanceRunner
 from test_maintenance_extract import (
     _FakeCurator,
     _FakeSegmenter,
@@ -22,13 +15,21 @@ from test_maintenance_extract import (
     _seg_result,
 )
 from test_maintenance_segmenter import (
-    INCOMPLETE,
-    _FakeLLM,
     _KV,
+    INCOMPLETE,
     _config,
+    _FakeLLM,
     _row,
     _StubSegmenter,
 )
+
+import maintenance.runner as runner_module
+from maintenance.agents.segmenter import (
+    CURSOR_KV_KEY,
+    ConversationBlock,
+    SegmenterAgent,
+)
+from maintenance.runner import MaintenanceRunner
 
 _MSG_BODY = "聊" * 60
 
@@ -45,7 +46,7 @@ def _msgs(n):
 def _msg_anchor(i):
     """与 SegmenterAgent._anchor 同算法，定位 _msgs 第 i 条的锚点。"""
     role = "user" if i % 2 == 0 else "assistant"
-    return hashlib.sha256(f"{role}:{_MSG_BODY}{i}".encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(f"{role}:{_MSG_BODY}{i}".encode()).hexdigest()[:16]
 
 
 def _conv2_conv(platform_id, user_id, messages, updated_at, cid="cid-1"):
