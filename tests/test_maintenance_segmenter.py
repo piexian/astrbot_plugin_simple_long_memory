@@ -411,7 +411,9 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.last_id, 4)  # 空行 id=3 被游标越过
         self.assertEqual(block.message_count, 3)
         ts = (now - timedelta(hours=3)).strftime("%m-%d %H:%M")
-        self.assertEqual(block.text.splitlines()[0], f"[{ts}] 甲: @乙 在吗")
+        self.assertEqual(
+            block.text.splitlines()[0], f"[{ts}] sender_id=u1 (甲): @乙 在吗"
+        )
         self.assertIn("] bot: 在的", block.text)
         self.assertEqual(block.char_count, len(block.text))
         self.assertEqual(result["cursor_updates"], {"qq:g1": 4})

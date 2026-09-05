@@ -217,7 +217,11 @@ AI 可以通过以下工具主动操作记忆：
 3. **分析师**：余弦 ≥0.7 预筛候选对，排除已连边，发现关联和矛盾
 4. **审核员**：复核操作建议，approve 执行 / reject 跳过 / controversial 待人工审核
 
-**夜间对话提取**：整理周期先从平台消息历史按会话游标滚动切出闭环对话块（分段员判断完整性），再由整理师对照同会话旧记忆提取新记忆或更新建议——已有等价内容时输出更新而非重复创建，闲聊等无信息增量的块直接跳过。提取预算默认占每周期 LLM 上限的 60%（`maintenance_extract_llm_budget_ratio`）；游标按块提交，崩溃后从下一块续跑，可用 `maintenance_extract_enabled` 整体关闭。平台消息历史无数据的会话（私聊或未开启消息历史的群聊）由 ConversationV2 对话记录兜底：无时间戳按 `maintenance_extract_conv2_chunk_messages` 条切段，游标用内容锚点续跑，锚点丢失或首见会话只处理最新一段（宁可少提不重复），可用 `maintenance_extract_conv2_enabled` 关闭。
+**夜间对话提取**：整理周期先从平台消息历史按会话游标滚动切出闭环对话块，再由整理师对照同会话旧记忆提取新增或更新建议，闲聊可零产出。提取预算默认占每周期 LLM 上限的 60%（`maintenance_extract_llm_budget_ratio`），其中分段最多使用一半，保留其余调用用于提取。
+
+提案先保存到本地，写入成功、审核明确拒绝或可靠进入人工待审队列后才推进对应块的游标。写入失败、操作超限或队列满时会保留原提案，重启后继续处理；LLM 失败会重试，不算作“无需记忆”。未处理完的会话即使没有新消息也会继续扫描。可用 `maintenance_extract_enabled` 整体关闭。
+
+平台消息历史无数据的会话由 ConversationV2 对话记录兜底：按 `maintenance_extract_conv2_chunk_messages` 条预切，游标用内容锚点续跑，锚点丢失或首见会话只处理最新一段，可用 `maintenance_extract_conv2_enabled` 关闭。两种来源均遵守 `maintenance_segment_max_chars`；单条超长消息会拆分，并记录消息内位置以便续跑。分段字符上限至少为 64，ConversationV2 分段消息数至少为 1，低于下限的配置按下限处理。
 
 **安全机制**：
 - 两级预筛：候选先经向量余弦预筛，再交 LLM 裁决，不全量喂记忆池

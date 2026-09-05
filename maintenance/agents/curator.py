@@ -52,7 +52,7 @@ class CuratorAgent:
                 "blocks_processed": int,
                 "blocks_nothing": int,
                 "llm_calls": int,
-                "outcomes": [(block, "created"|"updated"|"nothing"|"skipped_budget")],
+                "outcomes": [(block, "created"|"updated"|"nothing"|"failed"|"skipped_budget")],
             }
         """
         result: dict[str, Any] = {
@@ -65,14 +65,24 @@ class CuratorAgent:
             "outcomes": [],
         }
         notes: list[str] = []
+        blocked_conversations: set[str] = set()
         for block in blocks:
             if (
-                result["llm_calls"] >= max_llm_calls
+                block.conv_key in blocked_conversations
+                or result["llm_calls"] >= max_llm_calls
                 or getattr(self._llm, "remaining_calls", 1) <= 0
             ):
                 result["outcomes"].append((block, "skipped_budget"))
                 continue
-            outcome = await self._process_block(block, result, notes)
+            try:
+                outcome = await self._process_block(block, result, notes)
+            except Exception as e:
+                logger.warning(
+                    "[简单长期记忆] 整理师处理失败: conv=%s, err=%s", block.conv_key, e
+                )
+                outcome = "failed"
+            if outcome == "failed":
+                blocked_conversations.add(block.conv_key)
             result["outcomes"].append((block, outcome))
         result["notes"] = "; ".join(notes)[:300]
         logger.debug(
@@ -92,6 +102,9 @@ class CuratorAgent:
     ) -> str:
         """处理单个对话块，返回 outcome。"""
         parsed_umo = UMOInfo.parse(block.umo)
+        sender_ids = list(getattr(block, "sender_ids", []))
+        if parsed_umo.session_type != "group" and not sender_ids:
+            sender_ids = [parsed_umo.session_id]
         old_memories = await self._retrieve_old_memories(block, parsed_umo)
         old_uris = {m["uri"] for m in old_memories}
         existing_text = (
@@ -105,6 +118,7 @@ class CuratorAgent:
                 "session_id": parsed_umo.session_id,
                 "existing_memories": existing_text,
                 "conversation": block.text,
+                "sender_ids": json.dumps(sender_ids, ensure_ascii=False),
             },
         )
         result["llm_calls"] += 1
@@ -112,23 +126,35 @@ class CuratorAgent:
             system, "只回 JSON。", model_id=self._model_id
         )
         result["blocks_processed"] += 1
-        if parsed_json is None:
-            # LLM 失败按无产出处理，游标照常推进（与自动提取路径的保守策略一致）
+        if (
+            not isinstance(parsed_json, dict)
+            or not ({"memories", "updates"} & parsed_json.keys())
+            or not isinstance(parsed_json.get("memories", []), list)
+            or not isinstance(parsed_json.get("updates", []), list)
+        ):
             logger.warning(
                 "[简单长期记忆] 整理师 LLM 失败: conv=%s, ids=%s-%s",
                 block.conv_key,
                 block.first_id,
                 block.last_id,
             )
-            result["blocks_nothing"] += 1
-            return "nothing"
+            return "failed"
 
         memories = validate_extracted_memories(
             parsed_json.get("memories"), parsed_umo.session_type
         )
         source_excerpt = " ".join(block.text.split())[:200]
+        creates = []
         for mem in memories:
-            result["create"].append(
+            if mem["scope"] == "personal":
+                subjects = mem["subjects"] or (
+                    sender_ids if parsed_umo.session_type != "group" else []
+                )
+                if not subjects or not set(subjects).issubset(sender_ids):
+                    continue
+                mem["subjects"] = subjects
+                mem["subject"] = subjects[0]
+            creates.append(
                 {
                     "type": "create",
                     "content": mem["content"],
@@ -143,15 +169,20 @@ class CuratorAgent:
                     "umo": block.umo,
                     "source_excerpt": source_excerpt,
                     "truncated_block": block.truncated,
+                    "sender_ids": sender_ids,
+                    "_extract_block": block.key,
                 }
             )
         updates = self._parse_updates(parsed_json.get("updates"), old_uris)
+        for op in updates:
+            op["_extract_block"] = block.key
+        result["create"].extend(creates)
         result["update"].extend(updates)
         note = str(parsed_json.get("notes") or "").strip()
         if note:
             notes.append(note)
 
-        if memories:
+        if creates:
             outcome = "created"
         elif updates:
             outcome = "updated"
@@ -165,7 +196,7 @@ class CuratorAgent:
             block.first_id,
             block.last_id,
             outcome,
-            len(memories),
+            len(creates),
             len(updates),
         )
         return outcome

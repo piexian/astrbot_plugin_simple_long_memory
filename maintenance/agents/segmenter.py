@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -42,6 +43,22 @@ class ConversationBlock:
     last_id: int  # 末行 id（游标推进目标；conv2 路径为消息下标）
     source: str = "pmh"  # pmh=平台消息历史，conv2=ConversationV2 兜底
     end_anchor: str = ""  # conv2 路径填块末消息内容锚点，pmh 为空
+    first_offset: int = 0
+    last_offset: int = 0
+    sender_ids: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        position = [
+            self.conv_key,
+            self.source,
+            self.first_id,
+            self.first_offset,
+            self.last_id,
+            self.last_offset,
+            self.end_anchor,
+        ]
+        return hashlib.sha256(json.dumps(position).encode()).hexdigest()
 
 
 @dataclass
@@ -55,6 +72,10 @@ class _Candidate:
     body_chars: int = 0  # 纯文本字符数（不含时间戳/发送者装饰），预过滤用
     first_anchor: str = ""  # 首条消息内容锚点（conv2 carry 起点比对用）
     last_anchor: str = ""  # 末条消息内容锚点（conv2 游标推进目标）
+    first_offset: int = 0
+    last_offset: int = 0
+    sender_ids: list[str] = field(default_factory=list)
+    fragmented: bool = False
 
     @property
     def text(self) -> str:
@@ -66,6 +87,9 @@ class _Candidate:
         self.last_id = other.last_id
         self.last_ts = other.last_ts
         self.last_anchor = other.last_anchor
+        self.last_offset = other.last_offset
+        self.sender_ids = list(dict.fromkeys(self.sender_ids + other.sender_ids))
+        self.fragmented = self.fragmented or other.fragmented
 
 
 class SegmenterAgent:
@@ -89,12 +113,17 @@ class SegmenterAgent:
             minutes=config.get("maintenance_segment_time_gap_minutes", 30)
         )
         self._min_chars = config.get("extraction_min_content_length", 150)
-        self._max_chars = config.get("maintenance_segment_max_chars", 8000)
+        self._max_chars = max(
+            64, int(config.get("maintenance_segment_max_chars", 8000))
+        )
         self._max_extensions = config.get("maintenance_segment_max_extensions", 3)
         self._max_blocks = config.get("maintenance_extract_max_blocks_per_cycle", 20)
         self._model_id = config.get("maintenance_segmenter_model_id", "")
         self._conv2_enabled = config.get("maintenance_extract_conv2_enabled", True)
-        self._conv2_chunk = config.get("maintenance_extract_conv2_chunk_messages", 40)
+        self._conv2_chunk = max(
+            1, int(config.get("maintenance_extract_conv2_chunk_messages", 40))
+        )
+        self._resume_keys: set[str] = set()
 
     # ─── 数据访问（薄方法，测试可覆写） ──────────────────────
 
@@ -177,7 +206,8 @@ class SegmenterAgent:
             except (TypeError, ValueError):
                 continue
             # updated_at 为 0 无法判断新鲜度，保守跳过
-            if updated < since_epoch:
+            key = f"{getattr(conv, 'platform_id', '')}:{conv.user_id}"
+            if updated < since_epoch and key not in self._resume_keys:
                 continue
             out.append(conv)
         return out
@@ -228,6 +258,7 @@ class SegmenterAgent:
         carries = self._normalize_carries(
             await self._kv_get(CARRY_KV_KEY, None) if self._kv_get else None
         )
+        self._resume_keys = set(cursors) | set(carries)
 
         now = datetime.now(timezone.utc)
         # 游标早于 24h 的会话可能仍有未处理旧消息，窗口要覆盖最早游标
@@ -240,6 +271,19 @@ class SegmenterAgent:
         conversations = (
             [] if history_db_missing else await self._list_active_conversations(since)
         )
+        pmh_keys = {f"{p}:{u}" for p, u in conversations}
+        pmh_resume = {
+            key for key, value in cursors.items() if value.get("source") != "conv2"
+        } | {key for key, value in carries.items() if not value.get("start_anchor")}
+        conversations = list(
+            dict.fromkeys(
+                [tuple(key.split(":", 1)) for key in sorted(pmh_resume) if ":" in key]
+                + conversations
+            )
+        )
+        result["discovered"] = {
+            f"{p}:{u}": {"id": 0, "ts": since.isoformat()} for p, u in conversations
+        }
         logger.debug(
             "[简单长期记忆] 分段员扫描: since=%s, conversations=%s, cursors=%s",
             since.isoformat(),
@@ -253,13 +297,17 @@ class SegmenterAgent:
             stats["conversations_scanned"] += 1
             conv_key = f"{platform_id}:{user_id}"
             cursor_id = cursors.get(conv_key, {}).get("id", 0)
+            cursor_offset = cursors.get(conv_key, {}).get("offset", 0)
             try:
-                rows = await self._fetch_all(platform_id, user_id, cursor_id)
+                rows = await self._fetch_all(
+                    platform_id, user_id, cursor_id - bool(cursor_offset)
+                )
                 if rows:
+                    pmh_keys.add(conv_key)
                     await self._collect_conversation(
                         platform_id,
                         user_id,
-                        segments=self._pre_split(rows),
+                        segments=self._pre_split(rows, cursor_id, cursor_offset),
                         prev_carry=carries.get(conv_key),
                         source="pmh",
                         cursor_id=cursor_id,
@@ -275,8 +323,16 @@ class SegmenterAgent:
 
         # ConversationV2 兜底：只处理 pmh 窗口内无数据的会话，避免双源重复提取
         if self._conv2_enabled:
-            pmh_keys = {f"{p}:{u}" for p, u in conversations}
             conv2_convs = await self._list_conv2_conversations(since.timestamp())
+            for conv in conv2_convs:
+                key = f"{getattr(conv, 'platform_id', '')}:{conv.user_id}"
+                if key not in pmh_keys:
+                    result["discovered"][key] = {
+                        "source": "conv2",
+                        "anchor": "",
+                        "idx": 0,
+                        "ts": since.isoformat(),
+                    }
             for conv in conv2_convs:
                 if stats["budget_exhausted"] or stats["block_cap_reached"]:
                     break
@@ -351,7 +407,9 @@ class SegmenterAgent:
         if conv2_cursor is None:
             # 首见会话只处理最新一段，防首日积压全量倾倒
             start = max(0, len(items) - self._conv2_chunk)
+            start_offset = 0
         else:
+            start_offset = 0
             anchor = str(conv2_cursor.get("anchor") or "")
             # 从后往前找：内容重复时取最后出现位置，宁可少提不重复
             hit = -1
@@ -360,7 +418,8 @@ class SegmenterAgent:
                     hit = i
                     break
             if hit >= 0:
-                start = hit + 1
+                start_offset = int(conv2_cursor.get("offset", 0))
+                start = hit if start_offset else hit + 1
             else:
                 # 锚点丢失（窗口滑动/历史重置）：保守只处理最新一段并重锚
                 stats["anchor_miss"] += 1
@@ -381,7 +440,7 @@ class SegmenterAgent:
         except (TypeError, ValueError):
             updated = 0
         last_ts = datetime.fromtimestamp(updated, tz=timezone.utc) if updated else now
-        segments = self._pre_split_conv2(items, start, last_ts)
+        segments = self._pre_split_conv2(items, start, last_ts, start_offset)
         await self._collect_conversation(
             platform_id,
             user_id,
@@ -413,6 +472,7 @@ class SegmenterAgent:
         conv_key = f"{platform_id}:{user_id}"
         adv_id: int | None = None  # 游标推进到的末条（pmh=行 id，conv2=消息下标）
         adv_anchor = ""  # conv2 末条消息内容锚点
+        adv_offset = 0
         new_carry = prev_carry
         idx = 0
         first_block = True  # 只有首个候选块继承 prev_carry（跨周期挂起的块必在块首）
@@ -435,8 +495,9 @@ class SegmenterAgent:
             idx += 1
 
             # 预过滤：短闲聊块不消耗 LLM，游标照常推进
-            if cand.body_chars < self._min_chars:
+            if cand.body_chars < self._min_chars and not cand.fragmented:
                 adv_id, adv_anchor = cand.last_id, cand.last_anchor
+                adv_offset = cand.last_offset
                 stats["blocks_skipped_short"] += 1
                 logger.debug(
                     "[简单长期记忆] 分段员预过滤短块: conv=%s, ids=%s-%s, chars=%s",
@@ -456,6 +517,7 @@ class SegmenterAgent:
                     stale = cand.first_anchor != pending.get("start_anchor", "")
                 else:
                     stale = cand.first_id != pending.get("start_id")
+                stale = stale or cand.first_offset != pending.get("start_offset", 0)
                 if stale:
                     pending = None
                     new_carry = None
@@ -497,6 +559,7 @@ class SegmenterAgent:
                             cand.last_id,
                         )
                         adv_id, adv_anchor = cand.last_id, cand.last_anchor
+                        adv_offset = cand.last_offset
                         new_carry = None
                         stats["poison_skipped"] += 1
                         advance = True
@@ -519,6 +582,7 @@ class SegmenterAgent:
                         result, conv_key, platform_id, user_id, cand, False, source
                     )
                     adv_id, adv_anchor = cand.last_id, cand.last_anchor
+                    adv_offset = cand.last_offset
                     new_carry = None
                     stats[
                         "conv2_blocks_emitted"
@@ -547,6 +611,7 @@ class SegmenterAgent:
                             result, conv_key, platform_id, user_id, cand, True, source
                         )
                         adv_id, adv_anchor = cand.last_id, cand.last_anchor
+                        adv_offset = cand.last_offset
                         new_carry = None
                         stats["blocks_truncated"] += 1
                         advance = True
@@ -569,6 +634,7 @@ class SegmenterAgent:
                         result, conv_key, platform_id, user_id, cand, False, source
                     )
                     adv_id, adv_anchor = cand.last_id, cand.last_anchor
+                    adv_offset = cand.last_offset
                     new_carry = None
                     stats[
                         "conv2_blocks_emitted"
@@ -598,8 +664,12 @@ class SegmenterAgent:
                     "anchor": adv_anchor,
                     "idx": adv_id,
                 }
-            elif adv_id != cursor_id:
-                result["cursor_updates"][conv_key] = adv_id
+                if adv_offset:
+                    result["cursor_updates"][conv_key]["offset"] = adv_offset
+            else:
+                result["cursor_updates"][conv_key] = (
+                    {"id": adv_id, "offset": adv_offset} if adv_offset else adv_id
+                )
         if new_carry != prev_carry:
             result["carry_updates"][conv_key] = new_carry
 
@@ -622,7 +692,9 @@ class SegmenterAgent:
                 break
         return rows
 
-    def _pre_split(self, rows: list[Any]) -> list[_Candidate]:
+    def _pre_split(
+        self, rows: list[Any], cursor_id: int = 0, cursor_offset: int = 0
+    ) -> list[_Candidate]:
         """零成本预切：相邻消息 created_at 间隙超阈值切成候选块。"""
         segments: list[_Candidate] = []
         current: _Candidate | None = None
@@ -632,41 +704,92 @@ class SegmenterAgent:
             if current is not None and prev_ts is not None and ts - prev_ts > self._gap:
                 segments.append(current)
                 current = None
-            if current is None:
-                current = _Candidate(first_id=row.id, last_id=row.id, last_ts=ts)
-            # 空文本行不入文本但仍在块内，游标按行 id 推进照常越过
-            current.last_id = row.id
-            current.last_ts = ts
             line, body_len = self._flatten_row(row)
-            if line:
-                current.lines.append(line)
-                current.body_chars += body_len
+            offset = cursor_offset if row.id == cursor_id else 0
+            sender_id = str(getattr(row, "sender_id", "") or "")
+            sender_ids = [sender_id] if sender_id and sender_id != "bot" else []
+            for piece in self._message_pieces(
+                row.id, ts, line, body_len, offset, sender_ids=sender_ids
+            ):
+                if (
+                    current is not None
+                    and len(current.text) + 1 + len(piece.text) > self._max_chars
+                ):
+                    segments.append(current)
+                    current = None
+                if current is None:
+                    current = piece
+                else:
+                    current.absorb(piece)
             prev_ts = ts
         if current is not None:
             segments.append(current)
         return segments
 
     def _pre_split_conv2(
-        self, items: list[tuple[str, str, str, str]], start: int, last_ts: datetime
+        self,
+        items: list[tuple[str, str, str, str]],
+        start: int,
+        last_ts: datetime,
+        start_offset: int = 0,
     ) -> list[_Candidate]:
         """ConversationV2 无时间戳，从 start 起按消息数等分切段（id 为全列表下标）。"""
         segments: list[_Candidate] = []
         idx = start
         while idx < len(items):
             chunk = items[idx : idx + self._conv2_chunk]
-            cand = _Candidate(
-                first_id=idx,
-                last_id=idx + len(chunk) - 1,
-                last_ts=last_ts,
-                first_anchor=chunk[0][3],
-                last_anchor=chunk[-1][3],
-            )
-            for _, sender, text, _ in chunk:
-                cand.lines.append(f"{sender}: {text}")
-                cand.body_chars += len(text)
-            segments.append(cand)
+            cand = None
+            for n, (_, sender, text, anchor) in enumerate(chunk, idx):
+                offset = start_offset if n == start else 0
+                for piece in self._message_pieces(
+                    n, last_ts, f"{sender}: {text}", len(text), offset, anchor
+                ):
+                    if (
+                        cand is not None
+                        and len(cand.text) + 1 + len(piece.text) > self._max_chars
+                    ):
+                        segments.append(cand)
+                        cand = None
+                    if cand is None:
+                        cand = piece
+                    else:
+                        cand.absorb(piece)
+            if cand is not None:
+                segments.append(cand)
             idx += len(chunk)
         return segments
+
+    def _message_pieces(
+        self,
+        mid: int,
+        ts: datetime,
+        line: str,
+        body_len: int,
+        offset: int = 0,
+        anchor: str = "",
+        sender_ids: list[str] | None = None,
+    ) -> Iterator[_Candidate]:
+        body = line[-body_len:] if body_len else ""
+        prefix = line[:-body_len] if body_len else ""
+        prefix = prefix[: self._max_chars // 2]
+        width = self._max_chars - len(prefix)
+        positions = range(offset, len(body), width) if body else [0]
+        for pos in positions:
+            text = body[pos : pos + width]
+            end = pos + len(text)
+            yield _Candidate(
+                first_id=mid,
+                last_id=mid,
+                last_ts=ts,
+                lines=[prefix + text] if text else [],
+                body_chars=len(text),
+                first_anchor=anchor,
+                last_anchor=anchor,
+                first_offset=pos,
+                last_offset=end if end < len(body) else 0,
+                sender_ids=list(sender_ids or []),
+                fragmented=len(body) > width,
+            )
 
     def _flatten_conv2_history(
         self, history_raw: Any, conv_key: str
@@ -728,6 +851,8 @@ class SegmenterAgent:
         if source == "conv2":
             # conv2 跨周期 carry 用首条消息锚点做起点比对（下标会随窗口滑动）
             carry["start_anchor"] = cand.first_anchor
+        if cand.first_offset:
+            carry["start_offset"] = cand.first_offset
         return carry
 
     def _flatten_row(self, row: Any) -> tuple[str, int]:
@@ -758,7 +883,8 @@ class SegmenterAgent:
         if sender_id == "bot":
             sender = "bot"
         else:
-            sender = str(getattr(row, "sender_name", None) or sender_id or "未知")
+            name = str(getattr(row, "sender_name", None) or "")
+            sender = f"sender_id={sender_id or 'unknown'} ({name})"
         ts = self._aware(row.created_at).strftime("%m-%d %H:%M")
         return f"[{ts}] {sender}: {body}", len(body)
 
@@ -784,6 +910,9 @@ class SegmenterAgent:
             last_id=cand.last_id,
             source=source,
             end_anchor=cand.last_anchor if source == "conv2" else "",
+            first_offset=cand.first_offset,
+            last_offset=cand.last_offset,
+            sender_ids=cand.sender_ids,
         )
         result["blocks"].append(block)
         logger.debug(
@@ -807,6 +936,10 @@ class SegmenterAgent:
             return out
         for key, value in raw.items():
             if isinstance(value, dict):
+                try:
+                    offset = max(0, int(value.get("offset", 0)))
+                except (TypeError, ValueError):
+                    continue
                 if value.get("source") == "conv2":
                     try:
                         idx = int(value.get("idx") or 0)
@@ -818,12 +951,16 @@ class SegmenterAgent:
                         "idx": idx,
                         "ts": str(value.get("ts") or ""),
                     }
+                    if offset:
+                        out[key]["offset"] = offset
                     continue
                 try:
                     cid = int(value.get("id") or 0)
                 except (TypeError, ValueError):
                     continue
                 out[key] = {"id": cid, "ts": str(value.get("ts") or "")}
+                if offset:
+                    out[key]["offset"] = offset
             elif isinstance(value, int) and not isinstance(value, bool):
                 out[key] = {"id": value, "ts": ""}  # 旧格式纯 int
         return out
@@ -845,6 +982,11 @@ class SegmenterAgent:
             except (TypeError, ValueError):
                 continue
             anchor = value.get("start_anchor")
+            if value.get("start_offset"):
+                try:
+                    carry["start_offset"] = max(0, int(value["start_offset"]))
+                except (TypeError, ValueError):
+                    continue
             if isinstance(anchor, str) and anchor:
                 carry["start_anchor"] = anchor
             out[key] = carry

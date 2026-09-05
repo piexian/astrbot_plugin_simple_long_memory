@@ -980,6 +980,29 @@ class MemoryManager:
         if uri is None:
             uri = str(MemoryURI.generate(domain))
 
+        extraction_id = (extra_metadata or {}).get("extraction_id")
+        if extraction_id:
+            for item in self._pending_writes:
+                if item.get("extraction_id") == extraction_id:
+                    if self._kv_put:
+                        await self._kv_put(
+                            "rebuild_pending_writes", self._pending_writes
+                        )
+                    return item["uri"]
+            if self._kb_helper:
+                existing = await self.vec_db.document_storage.get_documents(
+                    metadata_filters={
+                        "extraction_id": extraction_id,
+                        "is_memory_record": True,
+                    },
+                    limit=1,
+                )
+                if existing:
+                    await self._ensure_extraction_vector(existing[0])
+                    return str(
+                        _safe_parse_metadata(existing[0].get("metadata", {}))["uri"]
+                    )
+
         logger.debug(
             "[简单长期记忆] 存储开始: uri=%s, domain=%s, memory_type=%s, "
             "scope=%s, visibility=%s, importance=%s, content=%s",
@@ -1114,6 +1137,28 @@ class MemoryManager:
         )
         return uri
 
+    async def _ensure_extraction_vector(self, document: dict[str, Any]) -> None:
+        # AstrBot commits the document before its vector; a retry can see either
+        # a missing vector or one that was added in memory but not saved to disk.
+        storage = self.vec_db.embedding_storage
+        doc_id = int(document["id"])
+        prepared = self._prepare_faiss_index(storage.index)
+        vector, status, detail = self._reconstruct_faiss_vector(
+            storage.index, doc_id, prepared
+        )
+        if status in {"index_unavailable", "faiss_unavailable"}:
+            raise RuntimeError(f"Cannot verify extraction vector: {detail}")
+        if vector is None:
+            import numpy as np
+
+            embedding = await self.vec_db.embedding_provider.get_embedding(
+                document["text"]
+            )
+            await storage.delete([doc_id])
+            await storage.insert(np.asarray(embedding, dtype=np.float32), doc_id)
+        else:
+            await storage.save_index()
+
     async def replace_memory(
         self,
         old_metadata: dict[str, Any],
@@ -1142,6 +1187,19 @@ class MemoryManager:
         old_uri = old_metadata.get("uri", "")
         new_uri = str(MemoryURI.generate(old_domain))
         new_doc_id = str(uuid.uuid4())
+        existing_replacement = []
+        if updated_by == "maintenance_curator" and old_metadata.get("extraction_id"):
+            existing_replacement = await self.vec_db.document_storage.get_documents(
+                metadata_filters={
+                    "extraction_id": old_metadata["extraction_id"],
+                    "is_memory_record": True,
+                },
+                limit=1,
+            )
+            if existing_replacement:
+                await self._ensure_extraction_vector(existing_replacement[0])
+                meta = _safe_parse_metadata(existing_replacement[0].get("metadata", {}))
+                new_uri, new_doc_id = meta["uri"], meta["kb_doc_id"]
 
         logger.debug(
             "[简单长期记忆] 替换开始: old_uri=%s, old_doc_id=%s, new_uri=%s, "
@@ -1171,11 +1229,12 @@ class MemoryManager:
         formatted_content = format_memory_content(new_content, new_metadata)
 
         # 先写入新记录
-        await self.vec_db.insert(
-            content=formatted_content,
-            metadata=new_metadata,
-            id=new_doc_id,
-        )
+        if not existing_replacement:
+            await self.vec_db.insert(
+                content=formatted_content,
+                metadata=new_metadata,
+                id=new_doc_id,
+            )
         logger.debug(
             "[简单长期记忆] 替换新向量写入完成: new_uri=%s, new_doc_id=%s",
             new_uri,
@@ -4126,6 +4185,9 @@ class MemoryManager:
                     "topics": item.get("topics", []),
                     "memory_content": content,
                 }
+                for key in ("created_by", "extraction_id"):
+                    if key in item:
+                        metadata[key] = item[key]
 
                 doc_id = str(uuid.uuid4())
                 metadata["kb_doc_id"] = doc_id

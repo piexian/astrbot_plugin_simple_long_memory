@@ -22,6 +22,7 @@ from .agents.curator import CuratorAgent
 from .agents.organizer import OrganizerAgent
 from .agents.reviewer import ReviewerAgent
 from .agents.segmenter import CARRY_KV_KEY, CURSOR_KV_KEY, SegmenterAgent
+from .extraction_journal import ExtractionJournal
 from .llm import MaintenanceLLM
 
 try:  # 正常插件加载（包内相对导入）
@@ -165,6 +166,7 @@ class MaintenanceRunner:
         self._extract_manifest_for_review: AgentManifest | None = None
         # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
         self._last_review_unresolved: dict[str, int] = {}
+        self._extract_journal = ExtractionJournal(kv_get, kv_put)
 
     async def run_cycle(self, *, dry_run: bool = False) -> MaintenanceReport:
         """执行一次完整整理周期；dry_run 时不执行阶段 4 写入。"""
@@ -484,6 +486,7 @@ class MaintenanceRunner:
                         try:
                             success = await self._execute_operation(op)
                             if success:
+                                await self._extract_journal.acknowledge(op)
                                 executed += 1
                             else:
                                 failed += 1
@@ -528,6 +531,7 @@ class MaintenanceRunner:
                     try:
                         success = await self._execute_operation(op)
                         if success:
+                            await self._extract_journal.acknowledge(op)
                             executed += 1
                         else:
                             failed += 1
@@ -548,8 +552,16 @@ class MaintenanceRunner:
                             f"[简单长期记忆] 争议项待人工审核: {op.get('type')}, "
                             f"理由: {verdict.get('reason', '')}"
                         )
+                    elif verdict.get("verdict") == "reject":
+                        await self._extract_journal.acknowledge(op)
 
-            await self._flush_pending_review(pending_items, report.session_id)
+            persisted = await self._flush_pending_review(
+                pending_items, report.session_id
+            )
+            for op, _ in pending_items:
+                if self._op_signature(op) in persisted:
+                    await self._extract_journal.acknowledge(op)
+            await self._finish_extract_progress()
 
             report.executed_ops = executed
             report.skipped_ops = skipped
@@ -579,9 +591,18 @@ class MaintenanceRunner:
         """提取阶段：分段员切对话块 → 整理师提取 create/update 操作。
 
         LLM 预算占每周期上限的 maintenance_extract_llm_budget_ratio（默认 60%），
-        分段员用完后剩余额度给整理师；两者同时受 llm.remaining_calls 全局约束。
+        分段最多使用提取预算的一半，其余留给整理师；两者也受全局预算约束。
         """
         manifest = AgentManifest(agent_type="extract")
+        journal = (
+            ExtractionJournal(self._kv_get, None) if dry_run else self._extract_journal
+        )
+        if await journal.load():
+            manifest.parsed = True
+            manifest.operations = journal.pending
+            manifest.metrics = journal.state.get("metrics", {})
+            manifest.notes = journal.state.get("notes", "")
+            return manifest
         max_calls = int(self._config.get("maintenance_max_llm_calls", 50))
         ratio = float(self._config.get("maintenance_extract_llm_budget_ratio", 0.6))
         extract_budget = max(0, int(max_calls * ratio))
@@ -593,7 +614,7 @@ class MaintenanceRunner:
             kv_get=self._kv_get,
             kv_put=self._kv_put,
         )
-        seg_result = await segmenter.collect_blocks(extract_budget)
+        seg_result = await segmenter.collect_blocks(extract_budget // 2)
         seg_stats = seg_result.get("stats", {})
         blocks = seg_result.get("blocks", [])
 
@@ -621,9 +642,9 @@ class MaintenanceRunner:
             + cur_result.get("llm_calls", 0),
         }
         if not dry_run:
-            await self._commit_extract_progress(
-                seg_result, cur_result.get("outcomes", [])
-            )
+            await journal.prepare(seg_result, cur_result, manifest.metrics)
+            manifest.operations = journal.pending
+            await self._finish_extract_progress()
         logger.debug(
             "[简单长期记忆] 提取阶段完成: blocks=%s, processed=%s, create=%s, "
             "update=%s, llm_calls=%s, dry_run=%s",
@@ -636,6 +657,14 @@ class MaintenanceRunner:
         )
         return manifest
 
+    async def _finish_extract_progress(self) -> None:
+        journal = self._extract_journal
+        if journal.state:
+            await self._commit_extract_progress(
+                journal.state["segment"], journal.outcomes()
+            )
+            await journal.clear_if_finished()
+
     async def _commit_extract_progress(
         self,
         seg_result: dict[str, Any],
@@ -643,7 +672,7 @@ class MaintenanceRunner:
     ) -> None:
         """按块提交提取游标并应用 carry 更新（整字典读改写，数据量小）。
 
-        游标只随整理师已处理的块推进（skipped_budget 的块不推进，下周期重提）；
+        游标只随已持久化完成的连续块推进，失败或未完成块及其后续块保留；
         无产出块会话（短块/毒块跳过）直接采用分段员游标，避免每周期重扫。
         """
         if not self._kv_put or not self._kv_get:
@@ -652,13 +681,17 @@ class MaintenanceRunner:
         try:
             cursors = await self._kv_get(CURSOR_KV_KEY, None)
             cursors = dict(cursors) if isinstance(cursors, dict) else {}
+            for key, value in seg_result.get("discovered", {}).items():
+                cursors.setdefault(key, value)
+            if seg_result.get("discovered"):
+                await self._kv_put(CURSOR_KV_KEY, dict(cursors))
             grouped: dict[str, list[tuple[Any, str]]] = {}
             for block, outcome in outcomes:
                 grouped.setdefault(block.conv_key, []).append((block, outcome))
             for conv_key, items in grouped.items():
                 for block, outcome in items:
-                    if outcome == "skipped_budget":
-                        continue
+                    if outcome not in {"created", "updated", "nothing"}:
+                        break
                     if getattr(block, "source", "pmh") == "conv2":
                         # conv2 无行 id，游标为内容锚点 + 消息下标
                         cursors[conv_key] = {
@@ -669,8 +702,10 @@ class MaintenanceRunner:
                         }
                     else:
                         cursors[conv_key] = {"id": block.last_id, "ts": now_iso}
+                    if getattr(block, "last_offset", 0):
+                        cursors[conv_key]["offset"] = block.last_offset
                     # 逐块提交：崩溃后已处理块不重拉、未处理块不丢
-                    await self._kv_put(CURSOR_KV_KEY, cursors)
+                    await self._kv_put(CURSOR_KV_KEY, dict(cursors))
             block_convs = set(grouped)
             for conv_key, value in (seg_result.get("cursor_updates") or {}).items():
                 if conv_key in block_convs:
@@ -682,9 +717,13 @@ class MaintenanceRunner:
                         "idx": int(value.get("idx") or 0),
                         "ts": now_iso,
                     }
+                    if value.get("offset"):
+                        cursors[conv_key]["offset"] = value["offset"]
+                elif isinstance(value, dict):
+                    cursors[conv_key] = {**value, "ts": now_iso}
                 else:
                     cursors[conv_key] = {"id": value, "ts": now_iso}
-                await self._kv_put(CURSOR_KV_KEY, cursors)
+                await self._kv_put(CURSOR_KV_KEY, dict(cursors))
 
             carry_updates = seg_result.get("carry_updates") or {}
             if carry_updates:
@@ -698,6 +737,7 @@ class MaintenanceRunner:
                     await self._kv_put(CARRY_KV_KEY, carries)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 提交提取进度失败: {e}")
+            raise
 
     async def _run_organizer(self) -> AgentManifest:
         """运行整理师：去重合并、质量精炼。"""
@@ -912,14 +952,21 @@ class MaintenanceRunner:
         self,
         items: list[tuple[dict[str, Any], dict[str, Any]]],
         session_id: str,
-    ) -> None:
+    ) -> set[str]:
         """周期结束批量写入待审队列：单次 KV 读写 + 签名去重 + 终态清理 + pending 容量上限 + 单调 id。"""
         if not items or not self._kv_put or not self._kv_get:
-            return
+            return set()
         try:
             import time as _time
 
             queue = await self._kv_get("maintenance_pending_review", None) or []
+            # A prior queue write may have succeeded before its journal acknowledgement.
+            settled_sigs = {
+                it.get("op_signature") or self._op_signature(it["op"])
+                for it in queue
+                if it.get("status") in {"approved", "rejected"}
+                and it.get("op", {}).get("_extract_id")
+            }
 
             # 单调递增 id：从原始队列取最大 id 作为下限，清理终态后 id 不复用，
             # 避免与管理员已见条目撞号
@@ -936,7 +983,7 @@ class MaintenanceRunner:
             existing_sigs = {
                 it.get("op_signature") or self._op_signature(it.get("op", {}))
                 for it in queue
-            }
+            } | settled_sigs
             queue_max = self._config.get("maintenance_pending_queue_max", 500)
 
             added = 0
@@ -979,8 +1026,10 @@ class MaintenanceRunner:
             # 待审通知推送（每周期最多一次）
             if added and self._config.get("review_notify_enabled", True):
                 await self._send_review_notification(len(queue))
+            return existing_sigs
         except Exception as e:
             logger.warning(f"[简单长期记忆] 写入待审队列失败: {e}")
+            return set()
 
     async def _send_review_notification(self, pending_count: int) -> None:
         """向管理员推送待审通知。"""
@@ -1052,6 +1101,9 @@ class MaintenanceRunner:
 
         subjects = [str(s) for s in (op.get("subjects") or []) if s]
         subject = str(op.get("subject") or "") or (subjects[0] if subjects else "")
+        if scope == MemoryScope.PERSONAL and "sender_ids" in op:
+            if not set(subjects or [subject]).issubset(op["sender_ids"]):
+                return False
         # 私聊无 subject 时以 session_id 兜底（私聊 session_id 即对端用户 id），
         # 避免 store_memory 的 owner 推导拿到空 sender
         sender_id = subject or parsed.session_id
@@ -1061,6 +1113,9 @@ class MaintenanceRunner:
         event = _MaintenanceEvent(umo=umo, sender_id=sender_id)
         is_personal = scope == MemoryScope.PERSONAL
         try:
+            extra = {"created_by": "maintenance_curator"}
+            if op.get("_extract_id"):
+                extra["extraction_id"] = op["_extract_id"]
             uri = await self._memory_mgr.store_memory(
                 event=event,
                 content=content,
@@ -1073,7 +1128,7 @@ class MaintenanceRunner:
                 topics=op.get("topics") or [],
                 owner_sender_id=subject if is_personal else None,
                 owner_sender_ids=subjects if is_personal and subjects else None,
-                extra_metadata={"created_by": "maintenance_curator"},
+                extra_metadata=extra,
             )
             logger.debug(
                 "[简单长期记忆] create 写入完成: uri=%s, scope=%s, umo=%s",
@@ -1121,12 +1176,25 @@ class MaintenanceRunner:
         if not uri or not new_content:
             return False
 
+        extraction_id = op.get("_extract_id")
+        done = []
+        if extraction_id:
+            done = await self._memory_mgr.vec_db.document_storage.get_documents(
+                metadata_filters={
+                    "extraction_id": extraction_id,
+                    "is_memory_record": True,
+                },
+                limit=1,
+            )
+
         # 先拉取旧记忆的 metadata
         old_docs = await self._memory_mgr.vec_db.document_storage.get_documents(
             metadata_filters={"uri": uri, "is_memory_record": True},
             limit=1,
         )
         if not old_docs:
+            if done:
+                return True
             logger.warning(f"[简单长期记忆] update 找不到记忆: {uri}")
             return False
 
@@ -1139,11 +1207,13 @@ class MaintenanceRunner:
             except Exception:
                 raw_meta = {}
         old_metadata = raw_meta if isinstance(raw_meta, dict) else {}
+        if extraction_id:
+            old_metadata = {**old_metadata, "extraction_id": extraction_id}
         try:
             new_uri = await self._memory_mgr.replace_memory(
                 old_metadata=old_metadata,
                 new_content=new_content,
-                updated_by="organizer",
+                updated_by="maintenance_curator" if extraction_id else "organizer",
             )
             return bool(new_uri)
         except Exception as e:

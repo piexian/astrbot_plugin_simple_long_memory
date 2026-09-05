@@ -188,6 +188,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
                 "uri": "facts://old1",
                 "new_content": "用户现在改喝拿铁",
                 "reason": "偏好变更",
+                "_extract_block": blocks[1].key,
             },
         )
 
@@ -324,12 +325,12 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([o for _, o in result2["outcomes"]], ["skipped_budget"])
         self.assertEqual(llm2.calls, 0)
 
-    async def test_llm_failure_counts_as_nothing(self):
+    async def test_llm_failure_is_retryable(self):
         llm = _CuratorLLM(responses=[None])
         curator = _curator(llm)
         result = await curator.run([_block()], 5)
-        self.assertEqual([o for _, o in result["outcomes"]], ["nothing"])
-        self.assertEqual(result["blocks_nothing"], 1)
+        self.assertEqual([o for _, o in result["outcomes"]], ["failed"])
+        self.assertEqual(result["blocks_nothing"], 0)
 
     async def test_curator_model_id_from_config(self):
         llm = _CuratorLLM()
@@ -442,10 +443,12 @@ class RunnerExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def _patched(self, seg, cur):
-        return [
-            patch.object(runner_module, "SegmenterAgent", lambda **kw: seg),
-            patch.object(runner_module, "CuratorAgent", lambda **kw: cur),
-        ]
+        if not hasattr(self, "_patches"):
+            self._patches = [
+                patch.object(runner_module, "SegmenterAgent", lambda **kw: seg),
+                patch.object(runner_module, "CuratorAgent", lambda **kw: cur),
+            ]
+        return self._patches
 
     async def test_budget_split_60_40(self):
         blocks = [_block()]
@@ -459,7 +462,7 @@ class RunnerExtractionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             for p in self._patched(seg, cur):
                 p.stop()
-        self.assertEqual(seg.budgets, [30])  # int(50 * 0.6)
+        self.assertEqual(seg.budgets, [15])  # 分段最多使用提取预算的一半
         self.assertEqual(cur.budgets, [28])  # 30 - 分段员实际 2
         self.assertTrue(manifest.parsed)
         self.assertEqual(manifest.metrics["blocks"], 1)
@@ -573,7 +576,8 @@ class RunnerExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kw["event"].get_sender_id(), "u1")
         self.assertEqual(kw["memory_scope"], "personal")
         self.assertEqual(kw["owner_sender_id"], "u1")
-        self.assertEqual(kw["extra_metadata"], {"created_by": "maintenance_curator"})
+        self.assertEqual(kw["extra_metadata"]["created_by"], "maintenance_curator")
+        self.assertTrue(kw["extra_metadata"]["extraction_id"])
         # 游标已提交
         self.assertIn(
             "qq:qq:private:u1", kv.store.get("maintenance_extract_cursors", {})
