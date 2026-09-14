@@ -220,3 +220,23 @@ class RealtimeIdentityTests(unittest.IsolatedAsyncioTestCase):
             'trusted_sender_ids: ["bob"]',
             plugin.context.llm_generate.await_args.kwargs["prompt"],
         )
+
+    async def test_invalid_umo_keeps_snapshot_buffer_intact(self):
+        cls = plugin_main.MemoryPlugin
+        plugin = cls.__new__(cls)
+        plugin.config = {"auto_memorize": True, "extraction_interval": 1}
+        plugin.memory_mgr = SimpleNamespace()
+        plugin._complete_snapshot_with_response = lambda *args: None
+        plugin._increment_session_counter = lambda *args: 1
+        drained = []
+
+        def _drain(*args):
+            drained.append(args)
+            return [{"sender_id": "bob", "prompt": "喜欢咖啡", "response": "收到"}]
+
+        plugin._get_and_clear_session_snapshots = _drain
+        await plugin.extract_memories(
+            Event("BARE_HEX", "alice"),
+            SimpleNamespace(completion_text="收到"),
+        )
+        self.assertEqual(drained, [])

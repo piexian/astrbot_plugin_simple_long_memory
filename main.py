@@ -1014,6 +1014,12 @@ class MemoryPlugin(Star):
             if current_count % extraction_interval != 0:
                 return
 
+            # 先校验 UMO 再清空快照缓冲，无效 UMO 保留累积对话等下个间隔重试
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            if not parsed_umo.is_valid:
+                logger.warning("[简单长期记忆] 自动提取跳过: invalid_umo")
+                return
+
             # 获取累积的快照列表
             snapshots = self._get_and_clear_session_snapshots(event)
             if not snapshots:
@@ -1039,10 +1045,6 @@ class MemoryPlugin(Star):
                 logger.debug("[简单长期记忆] 未配置提取模型，跳过记忆提取")
                 return
 
-            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
-            if not parsed_umo.is_valid:
-                logger.warning("[简单长期记忆] 自动提取跳过: invalid_umo")
-                return
             allowed_sender_ids = list(
                 dict.fromkeys(
                     str(snapshot["sender_id"])
