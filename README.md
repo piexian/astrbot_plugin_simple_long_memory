@@ -33,7 +33,10 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | auto_memorize | 自动记忆模式开关 | `true` |
 | extraction_interval | 每 N 轮对话触发一次记忆提取 | `20` |
 | extraction_min_content_length | 对话总长度低于此值时跳过提取 | `150` |
-| global_memory | 全局记忆模式（跨会话召回） | `true` |
+| global_memory | 按人跨会话共享（沿用旧键，仅影响 personal） | `true` |
+| share_group_across_groups | 同一平台实例内跨群共用 group 记忆，不进入私聊 | `false` |
+| recall_query_max_chars | 召回查询字符上限（128–2048，当前提问优先） | `1200` |
+| recall_timeout_seconds | 召回总预算，含自动注入的查询优化（2–30 秒） | `12` |
 | max_memories_per_inject | 每次 LLM 请求注入的最大记忆条数 | `5` |
 | max_memory_list_scan | 记忆列表扫描上限 | `200` |
 | memory_delete_scan_page_size | 记忆删除扫描分页大小 | `1000` |
@@ -91,7 +94,8 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 - 未知参数、缺少参数值、禁止的位置参数都会直接报错；参数值含空格时请使用引号。
 - `test`、`clear`、`rebuild`、`review` 需要管理员权限；`list`、`search`、`stats` 默认只操作当前用户可见范围。
 - `--all` 仅管理员可用；`--all` 与 `--user` 不能同时使用。
-- 后台测试项 `purge`、`organizer`、`analyst`、`reviewer`、`cycle` 会调用真实分析链路，但固定为 dry-run，不写入记忆、向量、关联或待审队列。
+- 后台测试项 `purge`、`extract`、`organizer`、`analyst`、`reviewer`、`cycle` 调用真实分析链路但固定 dry-run，不写入记忆、向量、关联、待审队列或 LLM 磁盘缓存。
+- **不带阶段的 `/memory test` 会真实写入、召回并尝试删除测试记忆，不是只读检查。** 生产验证使用明确的维护阶段；真实读写回归应使用隔离测试库。
 
 #### 命令参数
 | 命令 | 参数说明 | 默认行为与限制 |
@@ -99,7 +103,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | `list` | `[--all]`、`[页码]` | 页码必须是正整数，默认 `1`，每页 `10` 条；`--all` 查看全部用户，管理员专用。 |
 | `search` | `[--all]`、`<关键词>` | 关键词必填；多个词会作为一个搜索短语；`--all` 查看全部用户，管理员专用。 |
 | `stats` | `[--all]` | 无参数时统计当前用户；`--all` 统计全部用户，管理员专用；不接受位置参数。 |
-| `test` | `[purge\|organizer\|analyst\|reviewer\|cycle]` | 无子参数执行记忆写入、召回、删除测试；指定后台阶段时固定 dry-run；管理员专用。 |
+| `test` | `[purge\|extract\|organizer\|analyst\|reviewer\|cycle]` | 无子参数执行真实记忆写入、召回、删除测试；指定后台阶段时固定 dry-run；管理员专用。 |
 | `forget` | `<URI>`、`[--user <用户ID>]` | URI 必填；普通用户只能删除自己的 URI；管理员不带 `--user` 按 URI 删除全部匹配记录，带 `--user` 只删除指定用户记录。 |
 | `clear` | `[--all\|--user <用户ID>]`、`[--confirm <确认码>]` | 默认清空当前用户；`--all` 清空全部用户；`--user` 清空指定用户；两者互斥。首次执行不带确认码只显示影响数量和确认命令。 |
 | `rebuild` | `[--to <知识库名>]`、`[--confirm <确认码>]` | 不带 `--to` 原地重建当前知识库；带 `--to` 迁移到目标知识库；首次执行不带确认码只预览，不会执行。 |
@@ -130,7 +134,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 
 ### 群聊场景
 
-群聊中记忆按归属分为三种，机器人自动判断无需手动设置：
+记忆分为以下四种作用域，两个共享开关只改变读取范围，不改变记录归属：
 
 | 作用域 | 说明 | 日常例子 |
 |--------|------|----------|
@@ -139,7 +143,22 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | `group` | 群共享记忆，群友都可见 | "群里约了每周五打游戏"、"这个群的固定梗" |
 | `conversation` | 当前会话临时上下文 | "刚才说的那个 bug 还没修完" |
 
-私聊默认召回 `personal` 记忆，并可使用 `conversation` 记录当前私聊会话上下文。
+私聊可召回 global、本人的 personal 和当前私聊的 conversation；group 记忆不进入私聊。
+
+两个共享开关独立，旧 `global_memory=false` 不会因升级被改成开启：
+
+| 按人共享 | 跨群共用 | 可见范围（global 始终保持管理员显式共享语义） |
+|---|---|---|
+| 开 | 关 | personal 跟随本人跨群/私聊，group 仅本群 |
+| 开 | 开 | personal 跟随本人，group 另在同一平台实例各群共用 |
+| 关 | 关 | personal 和 conversation 留在原会话，group 仅本群 |
+| 关 | 开 | personal 留在原会话，仅 group 跨群共用 |
+
+- personal 只对所属用户可见，多主体记忆只对列出的成员可见；`visibility=group` 不代表全群公开。成员候选先做 SQL 精确筛选，再按扫描预算选取；共享读取不授予修改或删除权限。
+- conversation 永不跨会话；平台实例不同的个人 ID 不自动合并，昵称相同也不关联。
+- 提取只接受事件快照/平台历史中的结构化身份。群聊 ConversationV2 无可靠发送者时，不从 `User ID:` 文本猜人、不把未知个人事实改成群公共记忆；私聊可用有效 UMO 的对端 ID 校验明确主体。无效 UMO 保留提取进度待处理。
+- 自动构建查询和公共召回入口均限长；明确长度错误全轮最多缩短重试一次。dense 失败仍尝试本地稀疏/触发条件检索，单通道失败不丢弃其他结果；网络、认证、限流错误不重试整轮。查询优化最多占总预算的 40%，并受自身超时配置限制。
+- 本次升级不回填历史 owner、不删疑似孤儿记录；旧错误归属需独立核验。回滚代码前关闭跨群共用，旧版本不能正确读取新产生的 group 记忆，不能以取消归属校验作为回滚办法。
 
 > 从旧版本升级到 v0.3 后，请执行 `/memory rebuild`。运行时召回和列表只认新 metadata 结构；旧格式记录需要通过重建补齐 `memory_scope`、owner、visibility 等字段后才会进入新作用域模型。
 > 重建只处理当前知识库 `kb_id` 下的记忆记录，避免误迁移其它知识库或无法可靠归属的数据。

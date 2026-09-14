@@ -27,10 +27,20 @@ from .llm import MaintenanceLLM
 
 try:  # 正常插件加载（包内相对导入）
     from ..extraction_utils import normalize_extracted_scope
-    from ..memory_protocol import MemoryScope, UMOInfo, normalize_memory_scope
+    from ..memory_protocol import (
+        MemoryScope,
+        UMOInfo,
+        normalize_memory_scope,
+        validate_owner_ids,
+    )
 except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.path
     from extraction_utils import normalize_extracted_scope
-    from memory_protocol import MemoryScope, UMOInfo, normalize_memory_scope
+    from memory_protocol import (
+        MemoryScope,
+        UMOInfo,
+        normalize_memory_scope,
+        validate_owner_ids,
+    )
 
 
 @dataclass
@@ -1089,6 +1099,9 @@ class MaintenanceRunner:
             return False
 
         parsed = UMOInfo.parse(umo)
+        if not parsed.is_valid:
+            logger.warning("[简单长期记忆] create 拒绝无效 UMO")
+            return False
         session_type = parsed.session_type
         raw_scope = normalize_memory_scope(str(op.get("scope") or ""))
         scope = normalize_extracted_scope(raw_scope, session_type)
@@ -1101,11 +1114,19 @@ class MaintenanceRunner:
 
         subjects = [str(s) for s in (op.get("subjects") or []) if s]
         subject = str(op.get("subject") or "") or (subjects[0] if subjects else "")
-        if scope == MemoryScope.PERSONAL and "sender_ids" in op:
-            if not set(subjects or [subject]).issubset(op["sender_ids"]):
+        allowed_sender_ids = list(op.get("sender_ids") or [])
+        if parsed.session_type == "private" and "sender_ids" not in op:
+            allowed_sender_ids = [parsed.session_id]
+        if scope == MemoryScope.PERSONAL:
+            try:
+                subjects = validate_owner_ids(
+                    subjects or ([subject] if subject else []), allowed_sender_ids
+                )
+            except ValueError:
+                logger.warning("[简单长期记忆] create 拒绝个人记忆: untrusted_subject")
                 return False
-        # 私聊无 subject 时以 session_id 兜底（私聊 session_id 即对端用户 id），
-        # 避免 store_memory 的 owner 推导拿到空 sender
+            subject = subjects[0]
+        # 非个人记忆可用会话 ID 构造维护事件，但不能据此创建个人 owner。
         sender_id = subject or parsed.session_id
         if not sender_id:
             logger.warning("[简单长期记忆] create 操作缺少可归属的 sender: umo=%s", umo)
@@ -1129,6 +1150,7 @@ class MaintenanceRunner:
                 owner_sender_id=subject if is_personal else None,
                 owner_sender_ids=subjects if is_personal and subjects else None,
                 extra_metadata=extra,
+                allowed_sender_ids=allowed_sender_ids,
             )
             logger.debug(
                 "[简单长期记忆] create 写入完成: uri=%s, scope=%s, umo=%s",

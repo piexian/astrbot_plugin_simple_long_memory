@@ -17,6 +17,23 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+def normalize_session_type(value: str) -> str:
+    """兼容 AstrBot 消息类型与旧版小写类型，不改写原始 UMO。"""
+    return {
+        "GroupMessage": "group",
+        "FriendMessage": "private",
+        "OtherMessage": "other",
+    }.get(value, value)
+
+
+def validate_owner_ids(subjects: list[str], allowed: list[str]) -> list[str]:
+    """归属只能来自调用方提供的结构化身份，不能从对话正文推定。"""
+    owners = list(dict.fromkeys(subjects))
+    if not owners or any(not owner or owner not in allowed for owner in owners):
+        raise ValueError("personal owner must be one of the trusted sender IDs")
+    return owners
+
+
 @dataclass
 class UMOInfo:
     """UMO (unified_msg_origin) 解析结果
@@ -43,9 +60,21 @@ class UMOInfo:
         parts = umo.split(":", 2)
         return cls(
             platform_id=parts[0] if len(parts) > 0 else "",
-            session_type=parts[1] if len(parts) > 1 else "private",
+            session_type=normalize_session_type(parts[1]) if len(parts) > 1 else "",
             session_id=parts[2] if len(parts) > 2 else "",
         )
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(
+            self.platform_id
+            and self.session_id
+            and self.session_type in {"group", "private", "other"}
+        )
+
+    @property
+    def is_group(self) -> bool:
+        return self.is_valid and self.session_type == "group"
 
 
 @dataclass

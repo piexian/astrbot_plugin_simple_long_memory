@@ -35,6 +35,13 @@ from .memory_protocol import (
     build_user_id,
     format_memory_content,
     normalize_memory_scope,
+    validate_owner_ids,
+)
+from .recall_utils import (
+    bound_query,
+    is_query_length_error,
+    query_max_chars,
+    recall_timeout,
 )
 
 if TYPE_CHECKING:
@@ -792,15 +799,8 @@ class MemoryManager:
     def _is_visible_shared_personal(
         self, event: AstrMessageEvent, metadata: dict[str, Any]
     ) -> bool:
-        """多 owner personal 记忆只对 owner_user_ids 内的用户可见。"""
-        if metadata.get("memory_scope") != MemoryScope.PERSONAL:
-            return True
-        if metadata.get("visibility") != MemoryVisibility.GROUP:
-            return True
-        owner_user_ids = metadata.get("owner_user_ids", [])
-        if not isinstance(owner_user_ids, list):
-            owner_user_ids = []
-        return self._current_owner_user_id(event) in owner_user_ids
+        """所有读取通道使用相同的归属与共享规则。"""
+        return self._is_memory_visible(event, {"metadata": metadata})
 
     def _filter_visible_shared_personal(
         self, event: AstrMessageEvent, memories: list[dict[str, Any]]
@@ -812,13 +812,98 @@ class MemoryManager:
                 visible.append(memory)
         return visible
 
+    async def _shared_personal_documents(
+        self,
+        event: AstrMessageEvent,
+        domain: str | None = None,
+        *,
+        limit: int = 200,
+        trace_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """先按数组成员限定候选，避免其他人的记忆挤占共享检索窗口。"""
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        if not parsed.is_valid or not event.get_sender_id():
+            return []
+        filters = {
+            "memory_scope": MemoryScope.PERSONAL,
+            "visibility": MemoryVisibility.GROUP,
+            "platform_id": parsed.platform_id,
+            "is_memory_record": True,
+            "deprecated": False,
+        }
+        if not self.config.get("global_memory", True):
+            filters["umo"] = event.unified_msg_origin
+        if domain:
+            filters["domain"] = domain
+        where, params = self._filters_to_sql(filters)
+        params.update(owner=self._current_owner_user_id(event), limit=limit)
+        try:
+            from sqlalchemy import text as sa_text
+
+            async with self.vec_db.document_storage.get_session() as session:
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT id, text, metadata FROM documents WHERE "
+                            + where
+                            + " AND json_type(metadata,'$.owner_user_ids') = 'array'"
+                            + " AND EXISTS (SELECT 1 FROM json_each(metadata,'$.owner_user_ids')"
+                            + " WHERE value = :owner) ORDER BY id DESC LIMIT :limit"
+                        ),
+                        params,
+                    )
+                ).all()
+            logger.debug(
+                "[简单长期记忆] 共享成员候选: trace_id=%s, count=%s, limit=%s",
+                trace_id or "-",
+                len(rows),
+                limit,
+            )
+            return [
+                {
+                    "id": row.id,
+                    "text": row.text,
+                    "metadata": _safe_parse_metadata(row.metadata),
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.debug(
+                "[简单长期记忆] 共享成员查询失败: trace_id=%s, error_type=%s",
+                trace_id or "-",
+                type(e).__name__,
+            )
+            return []
+
+    async def _retrieve_shared_personal(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        top_k: int,
+        domain: str | None,
+        trace_id: str = "",
+    ) -> list[dict[str, Any]]:
+        docs = await self._shared_personal_documents(
+            event, domain, limit=self._memory_list_scan_limit(1, 200), trace_id=trace_id
+        )
+        tokens = self._tokenize_query(query) or query.lower().split()
+        for doc in docs:
+            text = doc.get("text", "").lower()
+            doc["similarity"] = sum(token.lower() in text for token in tokens) / max(
+                len(tokens), 1
+            )
+        docs = [doc for doc in docs if self._is_memory_visible(event, doc)]
+        return self._rerank_by_signal(docs, query=query)[:top_k]
+
     def _scope_filter(
         self,
         event: AstrMessageEvent,
         memory_scope: str,
-        global_memory: bool = True,
+        global_memory: bool | None = None,
     ) -> dict[str, Any]:
-        _, owner_user_id, owner_session_id = self._event_scope_ids(event)
+        parsed, owner_user_id, owner_session_id = self._event_scope_ids(event)
+        if global_memory is None:
+            global_memory = self.config.get("global_memory", True)
         scope = normalize_memory_scope(memory_scope)
 
         if scope == MemoryScope.GLOBAL:
@@ -830,6 +915,11 @@ class MemoryManager:
                 "memory_scope": MemoryScope.GROUP,
                 "owner_session_id": owner_session_id,
             }
+            if parsed.is_group and self.config.get("share_group_across_groups", False):
+                filters = {
+                    "memory_scope": MemoryScope.GROUP,
+                    "platform_id": parsed.platform_id,
+                }
         elif scope == MemoryScope.CONVERSATION:
             filters = {
                 "memory_scope": MemoryScope.CONVERSATION,
@@ -948,6 +1038,7 @@ class MemoryManager:
         owner_sender_id: str | None = None,
         owner_sender_ids: list[str] | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        allowed_sender_ids: list[str] | None = None,
     ) -> str:
         """存储记忆到知识库
 
@@ -974,6 +1065,34 @@ class MemoryManager:
         owner_sender_ids = _normalize_sender_ids(
             owner_sender_ids, owner_sender_id or event.get_sender_id()
         )
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        if not parsed.is_valid:
+            raise ValueError("Invalid UMO: expected platform:message_type:session_id")
+        if memory_scope == MemoryScope.GROUP and not parsed.is_group:
+            raise ValueError("group scope requires a group conversation")
+        if memory_scope == MemoryScope.PERSONAL:
+            owner_sender_ids = validate_owner_ids(
+                owner_sender_ids,
+                [event.get_sender_id()]
+                if allowed_sender_ids is None
+                else allowed_sender_ids,
+            )
+        protected = {
+            "user_id",
+            "platform_id",
+            "sender_id",
+            "umo",
+            "session_type",
+            "session_id",
+            "memory_scope",
+            "owner_user_id",
+            "owner_user_ids",
+            "owner_session_id",
+            "visibility",
+            "speaker_id",
+        }
+        if protected.intersection(extra_metadata or {}):
+            raise ValueError("extra_metadata must not override scope or ownership")
         if memory_scope == MemoryScope.PERSONAL and len(owner_sender_ids) > 1:
             visibility = MemoryVisibility.GROUP
 
@@ -1042,7 +1161,7 @@ class MemoryManager:
                 "owner_user_id": owner_user_id,
                 "owner_session_id": owner_session_id,
                 "visibility": visibility,
-                "speaker_id": owner_sender_ids[0],
+                "speaker_id": event.get_sender_id(),
                 "subject": subject,
                 "entities": entities,
                 "topics": topics,
@@ -1365,6 +1484,22 @@ class MemoryManager:
         )
         return bool(docs)
 
+    async def _run_recall_channel(
+        self, call: Any, deadline: float, trace_id: str
+    ) -> Any:
+        """隔离单通道故障；同一召回共享截止时间，不重启整轮请求。"""
+        try:
+            return await asyncio.wait_for(
+                call, timeout=max(0.001, deadline - time.monotonic())
+            )
+        except Exception as e:
+            logger.warning(
+                "[简单长期记忆] 召回通道降级: trace_id=%s, error_type=%s",
+                trace_id,
+                type(e).__name__,
+            )
+            return []
+
     async def recall_memories(
         self,
         event: AstrMessageEvent,
@@ -1375,6 +1510,7 @@ class MemoryManager:
         memory_scope: str | None = None,
         bump: bool = False,
         source: str = "unspecified",
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
         """召回相关记忆（自动按用户隔离）
 
@@ -1390,6 +1526,21 @@ class MemoryManager:
         """
         trace_id = uuid.uuid4().hex[:8]
         started_at = time.monotonic()
+        deadline = min(
+            deadline or float("inf"), started_at + recall_timeout(self.config)
+        )
+        original_length = len(query)
+        query = bound_query(query, query_max_chars(self.config))
+        retry_budget = [1]
+        if len(query) != original_length:
+            logger.debug(
+                "[简单长期记忆] 查询限长: trace_id=%s, before=%s, after=%s",
+                trace_id,
+                original_length,
+                len(query),
+            )
+        if not query:
+            return []
         logger.debug(
             "[简单长期记忆] 召回开始: trace_id=%s, source=%s, query=%s, "
             "domain=%s, requested_top_k=%s, all_users=%s, scope=%s, bump=%s",
@@ -1403,7 +1554,9 @@ class MemoryManager:
             bump,
         )
         # 池空短路：无活跃记忆时跳过全部检索通道，避免空库白烧 embedding
-        if self._kb_helper and not await self.has_any_active_memory():
+        if self._kb_helper and not await self._run_recall_channel(
+            self.has_any_active_memory(), deadline, trace_id
+        ):
             logger.debug(
                 "[简单长期记忆] 召回短路: 无活跃记忆, trace_id=%s, source=%s",
                 trace_id,
@@ -1421,8 +1574,18 @@ class MemoryManager:
                 filters["domain"] = domain
             if memory_scope:
                 filters["memory_scope"] = memory_scope
-            raw = await self._retrieve_with_filter(
-                query, fetch_k, filters, trace_id=trace_id, final_top_k=top_k
+            raw = await self._run_recall_channel(
+                self._retrieve_with_filter(
+                    query,
+                    fetch_k,
+                    filters,
+                    trace_id=trace_id,
+                    final_top_k=top_k,
+                    deadline=deadline,
+                    retry_budget=retry_budget,
+                ),
+                deadline,
+                trace_id,
             )
             deduped = self._dedupe_memories(raw)
             memories = deduped[:top_k]
@@ -1453,11 +1616,26 @@ class MemoryManager:
 
             tasks = [
                 self._retrieve_with_filter(
-                    query, fetch_k, filters, trace_id=trace_id, final_top_k=top_k
+                    query,
+                    fetch_k,
+                    filters,
+                    trace_id=trace_id,
+                    final_top_k=top_k,
+                    event=event,
+                    deadline=deadline,
+                    retry_budget=retry_budget,
                 )
                 for filters in filters_list
             ]
-            results_list = await asyncio.gather(*tasks)
+            if memory_scope in (None, MemoryScope.PERSONAL):
+                tasks.append(
+                    self._retrieve_shared_personal(
+                        event, query, fetch_k, domain, trace_id
+                    )
+                )
+            results_list = await asyncio.gather(
+                *(self._run_recall_channel(call, deadline, trace_id) for call in tasks)
+            )
             channel_counts = [len(items) for items in results_list]
             combined = [item for sublist in results_list for item in sublist]
             visible = self._filter_visible_shared_personal(event, combined)
@@ -1496,18 +1674,28 @@ class MemoryManager:
                 for m in memories
                 if m.get("metadata", {}).get("uri")
             ]
-            await self._bump_recall_stats(recalled_uris, trace_id=trace_id)
+            await self._run_recall_channel(
+                self._bump_recall_stats(recalled_uris, trace_id=trace_id),
+                deadline,
+                trace_id,
+            )
 
         # 召回时注入关联记忆（单跳，最多 3 条，排除 contradicts/supersedes）
-        if self._link_manager and not (all_users and memory_scope):
-            linked_memories = await self._inject_linked_memories(
-                memories, event, all_users=all_users, trace_id=trace_id
+        if self._link_manager and not memory_scope:
+            linked_memories = await self._run_recall_channel(
+                self._inject_linked_memories(
+                    memories, event, all_users=all_users, trace_id=trace_id
+                ),
+                deadline,
+                trace_id,
             )
             if linked_memories:
                 memories.extend(linked_memories)
                 # 关联注入后截断到 top_k，避免超出调用方预期
                 if top_k and len(memories) > top_k:
                     memories = memories[:top_k]
+        if not all_users:
+            memories = [m for m in memories if self._is_memory_visible(event, m)]
         logger.debug(
             "[简单长期记忆] 召回完成: trace_id=%s, source=%s, count=%s, "
             "elapsed_ms=%s, memories=%s",
@@ -1679,37 +1867,38 @@ class MemoryManager:
 
         确保关联记忆注入时验证可见性，避免跨 scope 泄露。
         """
-        meta = memory.get("metadata", {})
+        meta = _safe_parse_metadata(memory.get("metadata", {}))
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        if not parsed.is_valid or meta.get("deprecated", False):
+            return False
         scope = meta.get("memory_scope", MemoryScope.PERSONAL)
-        owner = meta.get("owner_user_id", "")
-
-        # global 记忆所有人可见
         if scope == MemoryScope.GLOBAL:
             return True
-
-        # 获取当前用户信息（build_user_id 统一命名空间）
-        current_user = self._current_owner_user_id(event)
-        parsed = UMOInfo.parse(event.unified_msg_origin)
-        # personal 记忆：仅 owner 可见（包括多 owner 共享场景）
         if scope == MemoryScope.PERSONAL:
-            # 单 owner：直接比较
-            if owner == current_user:
-                return True
-            # 多 owner 共享：检查 owner_user_ids
-            return self._is_visible_shared_personal(event, meta)
-
-        # group 记忆：同群可见（session_id 含群聊标识）
+            current_user = self._current_owner_user_id(event)
+            owners = meta.get("owner_user_ids", [])
+            is_owner = meta.get("owner_user_id") == current_user
+            if meta.get("visibility") == MemoryVisibility.GROUP:
+                is_owner = is_owner or (
+                    isinstance(owners, list) and current_user in owners
+                )
+            return is_owner and (
+                self.config.get("global_memory", True)
+                or meta.get("umo") == event.unified_msg_origin
+            )
         if scope == MemoryScope.GROUP:
-            mem_session = meta.get("owner_session_id", "")
-            current_session = build_session_id(parsed.platform_id, parsed.session_id)
-            return mem_session == current_session
-
-        # conversation 记忆：精确匹配完整 UMO，避免私聊/群聊 ID 碰撞
+            origin = UMOInfo.parse(str(meta.get("umo") or ""))
+            if not parsed.is_group or not origin.is_group:
+                return False
+            if origin.platform_id != parsed.platform_id:
+                return False
+            return bool(
+                self.config.get("share_group_across_groups", False)
+                or meta.get("owner_session_id")
+                == build_session_id(parsed.platform_id, parsed.session_id)
+            )
         if scope == MemoryScope.CONVERSATION:
-            mem_umo = meta.get("umo", "")
-            return bool(mem_umo) and mem_umo == event.unified_msg_origin
-
-        # 默认不可见
+            return meta.get("umo") == event.unified_msg_origin
         return False
 
     def _build_recall_filters(
@@ -1720,6 +1909,10 @@ class MemoryManager:
         memory_scope: str | None = None,
     ) -> list[dict[str, Any]]:
         parsed = UMOInfo.parse(event.unified_msg_origin)
+        if not parsed.is_valid or (
+            memory_scope == MemoryScope.GROUP and not parsed.is_group
+        ):
+            return []
         scopes = (
             [normalize_memory_scope(memory_scope)]
             if memory_scope
@@ -1737,20 +1930,6 @@ class MemoryManager:
             if domain:
                 filters["domain"] = domain
             filters_list.append(filters)
-            if scope == MemoryScope.PERSONAL:
-                if parsed.session_type == "group":
-                    group_personal_filters = {
-                        "memory_scope": MemoryScope.PERSONAL,
-                        "owner_session_id": build_session_id(
-                            parsed.platform_id, parsed.session_id
-                        ),
-                        "visibility": MemoryVisibility.GROUP,
-                        "is_memory_record": True,
-                        "deprecated": False,
-                    }
-                    if domain:
-                        group_personal_filters["domain"] = domain
-                    filters_list.append(group_personal_filters)
         return filters_list
 
     async def _retrieve_with_filter(
@@ -1760,6 +1939,9 @@ class MemoryManager:
         filters: dict[str, Any],
         trace_id: str = "",
         final_top_k: int | None = None,
+        event: AstrMessageEvent | None = None,
+        deadline: float | None = None,
+        retry_budget: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         started_at = time.monotonic()
         logger.debug(
@@ -1770,12 +1952,45 @@ class MemoryManager:
         )
         use_rerank = self.config.get("use_reranker", True)
         # 稠密检索（本阶段不 rerank，融合后再统一 rerank）
-        dense_results = await self.vec_db.retrieve(
-            query=query,
-            k=top_k,
-            rerank=False,
-            metadata_filters=filters,
-        )
+        deadline = deadline or time.monotonic() + recall_timeout(self.config)
+        retry_budget = [1] if retry_budget is None else retry_budget
+        dense_query = query
+        dense_results = []
+        for attempt in range(2):
+            try:
+                dense_results = await asyncio.wait_for(
+                    self.vec_db.retrieve(
+                        query=dense_query,
+                        k=top_k,
+                        rerank=False,
+                        metadata_filters=filters,
+                    ),
+                    timeout=max(0.001, (deadline - time.monotonic()) * 0.65),
+                )
+                break
+            except Exception as e:
+                if (
+                    attempt == 0
+                    and retry_budget[0]
+                    and len(dense_query) > 128
+                    and is_query_length_error(e)
+                ):
+                    retry_budget[0] -= 1
+                    dense_query = bound_query(
+                        dense_query, max(128, len(dense_query) // 2)
+                    )
+                    logger.debug(
+                        "[简单长期记忆] 长度超限缩短重试: trace_id=%s, chars=%s",
+                        trace_id,
+                        len(dense_query),
+                    )
+                    continue
+                logger.warning(
+                    "[简单长期记忆] dense 降级至本地检索: trace_id=%s, error_type=%s",
+                    trace_id,
+                    type(e).__name__,
+                )
+                break
         dense_memories: list[dict[str, Any]] = []
         for result in dense_results:
             data = result.data
@@ -1810,6 +2025,8 @@ class MemoryManager:
             if len(channels) > 1
             else dense_memories
         )
+        if event is not None:
+            memories = [m for m in memories if self._is_memory_visible(event, m)]
         # 融合后统一 rerank（复用知识库配置的 rerank provider）
         # 候选数不超过最终 top_k 时 rerank 不影响截断，且排序会被信号重排覆盖，直接跳过
         rerank_applied = False
@@ -1822,7 +2039,10 @@ class MemoryManager:
             if rerank_provider:
                 try:
                     docs = [m.get("text", "") for m in memories]
-                    reranked = await rerank_provider.rerank(query, docs)
+                    reranked = await asyncio.wait_for(
+                        rerank_provider.rerank(query, docs),
+                        timeout=max(0.001, (deadline - time.monotonic()) * 0.8),
+                    )
                     reranked = sorted(
                         reranked, key=lambda x: x.relevance_score, reverse=True
                     )
@@ -2467,23 +2687,9 @@ class MemoryManager:
                 limit=page_size,
             )
         else:
-            parsed = UMOInfo.parse(event.unified_msg_origin)
-            offset = (page - 1) * page_size
-            if parsed.session_type == "group":
-                docs, total, truncated = await self._list_visible_user_documents(
-                    event, domain, page=page, page_size=page_size
-                )
-            else:
-                filters = self._build_user_filter(event)
-                filters["deprecated"] = False
-                if domain:
-                    filters["domain"] = domain
-                total = await self.vec_db.count_documents(metadata_filter=filters)
-                docs = await self.vec_db.document_storage.get_documents(
-                    metadata_filters=filters,
-                    offset=offset,
-                    limit=page_size,
-                )
+            docs, total, truncated = await self._list_visible_user_documents(
+                event, domain, page=page, page_size=page_size
+            )
 
         memories = []
         for doc in docs:
@@ -2506,25 +2712,10 @@ class MemoryManager:
         page: int = 1,
         page_size: int = 10,
     ) -> tuple[list[dict[str, Any]], int, bool]:
-        parsed = UMOInfo.parse(event.unified_msg_origin)
         scan_limit = self._memory_list_scan_limit(page, page_size)
-        source_filters = [
-            self._scope_filter(event, MemoryScope.PERSONAL),
-            {
-                "memory_scope": MemoryScope.PERSONAL,
-                "owner_session_id": build_session_id(
-                    parsed.platform_id, parsed.session_id
-                ),
-                "visibility": MemoryVisibility.GROUP,
-                "is_memory_record": True,
-                "deprecated": False,
-            },
-            self._scope_filter(event, MemoryScope.GROUP),
-            self._scope_filter(event, MemoryScope.CONVERSATION),
-        ]
-        if domain:
-            for filters in source_filters:
-                filters["domain"] = domain
+        source_filters = self._build_recall_filters(
+            event, self.config.get("global_memory", True), domain=domain
+        )
 
         docs_by_source = await asyncio.gather(
             *(
@@ -2536,6 +2727,9 @@ class MemoryManager:
             )
         )
 
+        docs_by_source.append(
+            await self._shared_personal_documents(event, domain, limit=scan_limit + 1)
+        )
         visible = []
         seen = set()
         scanned_all_sources = True

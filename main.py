@@ -37,7 +37,9 @@ from .memory_protocol import (
     UMOInfo,
     format_memory_for_injection,
     format_memory_for_user,
+    validate_owner_ids,
 )
+from .recall_utils import bound_query, query_max_chars, recall_timeout
 
 if TYPE_CHECKING:
     from .memory_manager import MemoryManager
@@ -106,15 +108,21 @@ def _normalize_contexts(contexts: Any) -> list[dict[str, Any]]:
     return list(contexts) if isinstance(contexts, list) else []
 
 
-def _build_recall_query(prompt: str, contexts: list[dict[str, Any]]) -> str:
-    """构建召回查询，包含 prompt 和最近的上下文"""
-    parts = [prompt] if prompt else []
-    for ctx in contexts[-3:]:  # 最近 3 条上下文
-        role = ctx.get("role", "")
+def _build_recall_query(
+    prompt: str, contexts: list[dict[str, Any]], max_chars: int = 1200
+) -> str:
+    """优先保留当前提问，用剩余预算补最近的自然语言上下文。"""
+    query = bound_query(prompt, max_chars)
+    for ctx in reversed(contexts[-3:]):
+        if not isinstance(ctx, dict) or ctx.get("role") not in {"user", "assistant"}:
+            continue
+        remaining = max_chars - len(query)
+        if remaining <= 15:
+            break
         content = _flatten_content(ctx.get("content", ""))
         if content:
-            parts.append(f"[{role}]: {content}")
-    return "\n".join(parts)
+            query += f"\n[{ctx['role']}]: {content[:400]}"[:remaining]
+    return query.strip()
 
 
 def _make_memory_text_part(content: str) -> Any | None:
@@ -908,7 +916,10 @@ class MemoryPlugin(Star):
 
             # 构建召回查询
             contexts = _normalize_contexts(request.contexts)
-            query = _build_recall_query(request.prompt or "", contexts)
+            deadline = time.monotonic() + recall_timeout(self.config)
+            query = _build_recall_query(
+                request.prompt or "", contexts, query_max_chars(self.config)
+            )
 
             logger.debug(
                 "[简单长期记忆] 自动注入查询已构建: contexts=%s, query=%s",
@@ -917,13 +928,27 @@ class MemoryPlugin(Star):
             )
 
             # 池空短路：无活跃记忆时跳过查询优化与召回，避免空库白烧 LLM/embedding
-            if not await self.memory_mgr.has_any_active_memory():
+            if not await asyncio.wait_for(
+                self.memory_mgr.has_any_active_memory(),
+                timeout=max(0.001, deadline - time.monotonic()),
+            ):
                 logger.debug("[简单长期记忆] 召回短路: 无活跃记忆, source=auto_inject")
                 return
 
             # 检索优化：调用 LLM 提炼关键词
             if self.config.get("optimize_recall_query", False):
-                query = await self._optimize_recall_query(event, query)
+                try:
+                    query = await asyncio.wait_for(
+                        self._optimize_recall_query(event, query),
+                        timeout=min(
+                            recall_timeout(self.config) * 0.4,
+                            max(0.001, deadline - time.monotonic()),
+                        ),
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[简单长期记忆] 查询优化降级: error_type=%s", type(e).__name__
+                    )
 
             # 召回相关记忆（注入路径：bump=True 计入 recall_count 反馈）
             memories = await self.memory_mgr.recall_memories(
@@ -932,6 +957,7 @@ class MemoryPlugin(Star):
                 top_k=self.config.get("max_memories_per_inject", 5),
                 bump=True,
                 source="auto_inject",
+                deadline=deadline,
             )
 
             if memories:
@@ -1014,6 +1040,16 @@ class MemoryPlugin(Star):
                 return
 
             parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            if not parsed_umo.is_valid:
+                logger.warning("[简单长期记忆] 自动提取跳过: invalid_umo")
+                return
+            allowed_sender_ids = list(
+                dict.fromkeys(
+                    str(snapshot["sender_id"])
+                    for snapshot in snapshots
+                    if snapshot.get("sender_id")
+                )
+            )
 
             logger.debug(
                 "[简单长期记忆] 自动提取开始: snapshots=%s, conversation=%s, "
@@ -1031,6 +1067,7 @@ class MemoryPlugin(Star):
                 session_type=parsed_umo.session_type,
                 session_id=parsed_umo.session_id,
                 sender_id=event.get_sender_id(),
+                known_sender_ids=json.dumps(allowed_sender_ids, ensure_ascii=False),
                 conversation=conversation,
             )
             try:
@@ -1069,12 +1106,18 @@ class MemoryPlugin(Star):
                 memory_domain = mem.get("type", "fact")
                 scope = mem.get("scope", MemoryScope.PERSONAL)
                 content = mem.get("content", "")
-                subject = mem.get("subject", "") or _current_speaker_subject(
-                    event, scope
-                )
-                subjects = mem.get("subjects", [])
-                if not subjects and subject:
-                    subjects = [subject]
+                subject = mem.get("subject", "")
+                subjects = mem.get("subjects", []) or ([subject] if subject else [])
+                if scope == MemoryScope.PERSONAL:
+                    try:
+                        subjects = validate_owner_ids(subjects, allowed_sender_ids)
+                    except ValueError:
+                        logger.warning(
+                            "[简单长期记忆] 自动提取拒绝个人记忆: untrusted_subject"
+                        )
+                        continue
+                else:
+                    subject = _current_speaker_subject(event, scope)
                 entities = mem.get("entities", [])
                 topics = mem.get("topics", [])
                 disclosure = mem.get("disclosure", "")
@@ -1100,6 +1143,7 @@ class MemoryPlugin(Star):
                         entities=entities,
                         topics=topics,
                         owner_sender_ids=owner_sender_ids,
+                        allowed_sender_ids=allowed_sender_ids,
                     )
                     stored_count += 1
                     logger.debug(
@@ -1133,7 +1177,7 @@ class MemoryPlugin(Star):
                 round((time.monotonic() - extraction_started_at) * 1000),
             )
             logger.info(
-                f"[简单长期记忆] 已从 {len(snapshots)} 轮对话中提取 {len(memories)} 条记忆"
+                f"[简单长期记忆] 已从 {len(snapshots)} 轮对话中存储 {stored_count} 条记忆（候选 {len(memories)} 条）"
             )
 
         except Exception as e:
