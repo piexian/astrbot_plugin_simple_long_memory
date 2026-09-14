@@ -11,14 +11,22 @@ import re
 from typing import Any
 
 try:  # 正常插件加载（包内相对导入）
-    from .memory_protocol import MemoryScope, normalize_memory_scope
+    from .memory_protocol import (
+        MemoryScope,
+        normalize_memory_scope,
+        normalize_session_type,
+    )
     from .prompts import (
         ALLOWED_MEMORY_TYPES,
         MAX_EXTRACTED_MEMORIES,
         sanitize_memory_content,
     )
 except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.path
-    from memory_protocol import MemoryScope, normalize_memory_scope
+    from memory_protocol import (
+        MemoryScope,
+        normalize_memory_scope,
+        normalize_session_type,
+    )
     from prompts import (
         ALLOWED_MEMORY_TYPES,
         MAX_EXTRACTED_MEMORIES,
@@ -43,6 +51,7 @@ def normalize_extracted_scope(scope: str, session_type: str) -> str:
 
     自动提取不能写入全局记忆；全局记忆只能由管理员工具显式创建。
     """
+    session_type = normalize_session_type(session_type)
     scope = normalize_memory_scope(scope)
     if scope == MemoryScope.GLOBAL:
         return MemoryScope.PERSONAL
@@ -89,6 +98,7 @@ def validate_extracted_memories(
     data: Any, session_type: str = "private"
 ) -> list[dict[str, Any]]:
     """校验并规范化 LLM 提取的记忆列表，带数量上限与注入清理。"""
+    session_type = normalize_session_type(session_type)
     if not isinstance(data, list):
         return []
 

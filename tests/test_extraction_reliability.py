@@ -101,7 +101,12 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         kv, mgr = _KVLog(), _StoreMemoryMgr()
         mgr.store_memory = AsyncMock(side_effect=RuntimeError("write failed"))
         block = _block()
-        op = {"type": "create", "content": "用户喜欢咖啡", "umo": block.umo}
+        op = {
+            "type": "create",
+            "content": "用户喜欢咖啡",
+            "umo": block.umo,
+            "subject": "u1",
+        }
         with (
             patch.object(
                 runner_module,
@@ -143,9 +148,17 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         kv, mgr = _KVLog(), _StoreMemoryMgr()
         now = datetime.now(timezone.utc)
         rows = [
-            _row(i + 1, "聊" * 200, now - timedelta(hours=10 - i)) for i in range(10)
+            _row(
+                i + 1,
+                "聊" * 200,
+                now - timedelta(hours=10 - i),
+                umo="qq:GroupMessage:g1",
+            )
+            for i in range(10)
         ]
-        seg = _StubSegmenter(rows, [("qq", "g1")], _FakeLLM(), _config(), kv)
+        seg = _StubSegmenter(
+            rows, [("qq", "qq:GroupMessage:g1")], _FakeLLM(), _config(), kv
+        )
         curator = CuratorAgent(None, mgr, _CuratorLLM(), {})
         with (
             patch.object(runner_module, "SegmenterAgent", return_value=seg),
@@ -198,7 +211,12 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         mgr = real_manager(kv)
         mgr.vec_db.crash_after_insert = True
         block = _block()
-        op = {"type": "create", "content": "用户喜欢咖啡", "umo": block.umo}
+        op = {
+            "type": "create",
+            "content": "用户喜欢咖啡",
+            "umo": block.umo,
+            "subject": "u1",
+        }
         with (
             patch.object(
                 runner_module,
@@ -221,7 +239,12 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         kv.fail_ack = True
         mgr = real_manager(kv)
         block = _block()
-        op = {"type": "create", "content": "用户喜欢咖啡", "umo": block.umo}
+        op = {
+            "type": "create",
+            "content": "用户喜欢咖啡",
+            "umo": block.umo,
+            "subject": "u1",
+        }
         with (
             patch.object(
                 runner_module,
@@ -266,6 +289,7 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
                             "content": "喜欢咖啡",
                             "new_content": "喜欢咖啡",
                             "umo": event.unified_msg_origin,
+                            "subject": "u1",
                             "_extract_id": "partial-write",
                         }
                         if operation == "update":
@@ -321,7 +345,7 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         kv, mgr = DurableKV(), _StoreMemoryMgr()
         block = _block()
         ops = [
-            {"type": "create", "content": text, "umo": block.umo}
+            {"type": "create", "content": text, "umo": block.umo, "subject": "u1"}
             for text in ("喜欢咖啡", "喜欢跑步")
         ]
         with (
@@ -347,7 +371,12 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
             {"id": 1, "status": "pending", "op": {"type": "archive", "uri": "old"}}
         ]
         block = _block()
-        op = {"type": "create", "content": "用户喜欢咖啡", "umo": block.umo}
+        op = {
+            "type": "create",
+            "content": "用户喜欢咖啡",
+            "umo": block.umo,
+            "subject": "u1",
+        }
         r = self.runner(
             mgr, kv, maintenance_reviewer_enabled=True, maintenance_pending_queue_max=1
         )
@@ -532,6 +561,7 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 "type": "create",
                 "content": text,
                 "umo": block.umo,
+                "subject": "u1",
                 "_extract_block": block.key,
             }
             for block, text in ((first, "先"), (second, "后"))
@@ -565,7 +595,7 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         kv, mgr = DurableKV(), _StoreMemoryMgr()
         kv.fail_ack = True
         block = _block()
-        op = {"type": "create", "content": "待审", "umo": block.umo}
+        op = {"type": "create", "content": "待审", "umo": block.umo, "subject": "u1"}
         r = self.runner(mgr, kv, maintenance_reviewer_enabled=True)
         r._run_reviewer = AsyncMock(return_value=[])
         with (
@@ -599,7 +629,7 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         kv, mgr = CursorFailureKV(), _StoreMemoryMgr()
         block = _block()
-        op = {"type": "create", "content": "已写入", "umo": block.umo}
+        op = {"type": "create", "content": "已写入", "umo": block.umo, "subject": "u1"}
         with (
             patch.object(
                 runner_module,

@@ -17,11 +17,11 @@ from ..prompts import CURATOR_EXTRACTION_PROMPT, build_prompt
 
 try:  # 正常插件加载（包内相对导入）
     from ...extraction_utils import validate_extracted_memories
-    from ...memory_protocol import UMOInfo, build_session_id
+    from ...memory_protocol import UMOInfo, build_session_id, validate_owner_ids
     from ...prompts import sanitize_memory_content
 except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.path
     from extraction_utils import validate_extracted_memories
-    from memory_protocol import UMOInfo, build_session_id
+    from memory_protocol import UMOInfo, build_session_id, validate_owner_ids
     from prompts import sanitize_memory_content
 
 
@@ -102,8 +102,11 @@ class CuratorAgent:
     ) -> str:
         """处理单个对话块，返回 outcome。"""
         parsed_umo = UMOInfo.parse(block.umo)
+        if not parsed_umo.is_valid or parsed_umo.platform_id != block.platform_id:
+            logger.warning("[简单长期记忆] 整理师跳过无效 UMO，不提交提取进度")
+            return "failed"
         sender_ids = list(getattr(block, "sender_ids", []))
-        if parsed_umo.session_type != "group" and not sender_ids:
+        if parsed_umo.session_type == "private" and not sender_ids:
             sender_ids = [parsed_umo.session_id]
         old_memories = await self._retrieve_old_memories(block, parsed_umo)
         old_uris = {m["uri"] for m in old_memories}
@@ -147,10 +150,12 @@ class CuratorAgent:
         creates = []
         for mem in memories:
             if mem["scope"] == "personal":
-                subjects = mem["subjects"] or (
-                    sender_ids if parsed_umo.session_type != "group" else []
-                )
-                if not subjects or not set(subjects).issubset(sender_ids):
+                try:
+                    subjects = validate_owner_ids(mem["subjects"], sender_ids)
+                except ValueError:
+                    logger.warning(
+                        "[简单长期记忆] 整理师拒绝个人记忆: untrusted_subject"
+                    )
                     continue
                 mem["subjects"] = subjects
                 mem["subject"] = subjects[0]
@@ -217,6 +222,7 @@ class CuratorAgent:
                     "is_memory_record": True,
                     "deprecated": False,
                     "owner_session_id": owner_session_id,
+                    "umo": block.umo,
                 },
             )
         except Exception as e:
@@ -235,6 +241,14 @@ class CuratorAgent:
                     meta = json.loads(meta)
                 except Exception:
                     meta = {}
+            if meta.get("memory_scope") == "personal":
+                sender_ids = list(getattr(block, "sender_ids", []))
+                if parsed_umo.session_type == "private" and not sender_ids:
+                    sender_ids = [parsed_umo.session_id]
+                allowed = {f"{parsed_umo.platform_id}_{sid}" for sid in sender_ids}
+                owners = meta.get("owner_user_ids") or [meta.get("owner_user_id")]
+                if not isinstance(owners, list) or not set(owners).issubset(allowed):
+                    continue
             uri = str(meta.get("uri") or "")
             if not uri:
                 continue

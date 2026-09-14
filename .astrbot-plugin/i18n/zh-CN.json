@@ -30,8 +30,20 @@
       "hint": "对话总内容低于此字符数时跳过记忆提取，避免无意义短对话被记忆"
     },
     "global_memory": {
-      "description": "跨会话召回个人记忆",
-      "hint": "开启后同一用户可跨会话召回个人记忆；关闭后仅召回当前会话的个人记忆"
+      "description": "按人跨会话共享",
+      "hint": "同一平台实例内，个人记忆跟随本人跨群聊和私聊召回；关闭后仅本会话可见。不控制群公共记忆或 global 记忆"
+    },
+    "share_group_across_groups": {
+      "description": "跨群聊共用",
+      "hint": "仅将 group 公共记忆共享给同一平台实例的其他群聊，不进入私聊，不扩展 personal 或 conversation 可见性"
+    },
+    "recall_query_max_chars": {
+      "description": "召回查询字符上限",
+      "hint": "限制自动注入与工具召回查询（128–2048 字符），优先保留当前提问；明确长度超限时全轮最多缩短重试一次"
+    },
+    "recall_timeout_seconds": {
+      "description": "召回总预算（秒）",
+      "hint": "召回通道共用截止时间（2–30 秒）；自动注入的查询优化最多占 40%。单通道失败保留其他结果，不重试整轮"
     },
     "max_memories_per_inject": {
       "description": "每次注入的记忆数量",

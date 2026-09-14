@@ -209,6 +209,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
                 "is_memory_record": True,
                 "deprecated": False,
                 "owner_session_id": "qq_g1",
+                "umo": "qq:group:g1",
             },
         )
 
@@ -254,7 +255,12 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
             responses=[
                 {
                     "memories": [
-                        {"scope": "global", "type": "fact", "content": "试图写全局"}
+                        {
+                            "scope": "global",
+                            "type": "fact",
+                            "content": "试图写全局",
+                            "subject": "u1",
+                        }
                     ],
                     "updates": [],
                 }
@@ -278,7 +284,14 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         llm = _CuratorLLM(
             responses=[
                 {
-                    "memories": [{"scope": "personal", "type": "fact", "content": "c"}],
+                    "memories": [
+                        {
+                            "scope": "personal",
+                            "type": "fact",
+                            "content": "c",
+                            "subject": "u1",
+                        }
+                    ],
                     "updates": [],
                 }
             ]
