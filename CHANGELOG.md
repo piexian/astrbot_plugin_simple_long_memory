@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.1 (2026-11-01)
+
+### 修复
+- **记忆修改越权**：`/memory clear` 不再要求管理员，普通用户可清空自己的记忆；`memory_update`、`memory_forget` 与 clear 统一经 `authorize_memory_mutation` 校验目标归属，`--all` 与指定他人目标仍限管理员；管理员可按 URI 跨用户更新与删除，global 记忆仅管理员可改。
+
 ## v0.6.0 (2026-09-15)
 
 - 拆分共享开关：沿用 `global_memory` 控制按人跨会话共享，新增 `share_group_across_groups`（默认关闭）仅控制同平台实例的 group 跨群共用。
