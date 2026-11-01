@@ -8,7 +8,7 @@
 - **记忆注入**：在每次 LLM 请求前，自动召回相关记忆并注入到对话上下文
 - **用户隔离**：通过 `user_id` 实现用户级记忆隔离，互不干扰
 - **群聊记忆作用域**：支持群聊场景下的记忆归属区分（个人记忆 vs 群共享记忆）
-- **LLM 工具**：提供 `memory_recall`、`memory_store`、`memory_forget` 工具供 AI 主动操作
+- **LLM 工具**：提供 `memory_recall`、`memory_store`、`memory_update`、`memory_forget` 工具供 AI 主动操作
 - **用户命令**：通过 `/memory` 指令组管理记忆
 - **知识库管理**：记忆直接存储在 AstrBot 内置知识库中，可在知识库管理界面直接查看、检索、删除记忆
 
@@ -84,7 +84,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 /memory stats [--all]                                      - 查看记忆统计
 /memory test [purge|extract|organizer|analyst|reviewer|cycle]     - 管理员测试（后台项固定 dry-run）
 /memory forget <URI> [--user <用户ID>]                    - 删除指定记忆
-/memory clear [--all|--user <用户ID>] [--confirm <确认码>]  - 清空记忆（管理员）
+/memory clear [--all|--user <用户ID>] [--confirm <确认码>]  - 清空记忆（默认本人；管理员可指定用户或全部）
 /memory rebuild [--to <知识库名>] [--confirm <确认码>]     - 重建或迁移记忆（管理员）
 /memory rebuild --clear-cache [--confirm <确认码>]        - 清理重建缓存（管理员）
 /memory review [list|approve <ID>|reject <ID>|clear]       - 处理后台待审队列（管理员）
@@ -92,7 +92,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 
 - 所有命令前缀跟随 AstrBot 的 `wake_prefix` 配置，下面以 `/` 为例。参数中的 `<...>` 表示必填值，`[...]` 表示可选值。
 - 未知参数、缺少参数值、禁止的位置参数都会直接报错；参数值含空格时请使用引号。
-- `test`、`clear`、`rebuild`、`review` 需要管理员权限；`list`、`search`、`stats` 默认只操作当前用户可见范围。
+- `test`、`rebuild`、`review` 需要管理员权限；`clear` 普通用户仅能清空自己的记忆；`list`、`search`、`stats` 默认只操作当前用户可见范围。
 - `--all` 仅管理员可用；`--all` 与 `--user` 不能同时使用。
 - 后台测试项 `purge`、`extract`、`organizer`、`analyst`、`reviewer`、`cycle` 调用真实分析链路但固定 dry-run，不写入记忆、向量、关联、待审队列或 LLM 磁盘缓存。
 - **不带阶段的 `/memory test` 会真实写入、召回并尝试删除测试记忆，不是只读检查。** 生产验证使用明确的维护阶段；真实读写回归应使用隔离测试库。
@@ -105,7 +105,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | `stats` | `[--all]` | 无参数时统计当前用户；`--all` 统计全部用户，管理员专用；不接受位置参数。 |
 | `test` | `[purge\|extract\|organizer\|analyst\|reviewer\|cycle]` | 无子参数执行真实记忆写入、召回、删除测试；指定后台阶段时固定 dry-run；管理员专用。 |
 | `forget` | `<URI>`、`[--user <用户ID>]` | URI 必填；普通用户只能删除自己的 URI；管理员不带 `--user` 按 URI 删除全部匹配记录，带 `--user` 只删除指定用户记录。 |
-| `clear` | `[--all\|--user <用户ID>]`、`[--confirm <确认码>]` | 默认清空当前用户；`--all` 清空全部用户；`--user` 清空指定用户；两者互斥。首次执行不带确认码只显示影响数量和确认命令。 |
+| `clear` | `[--all\|--user <用户ID>]`、`[--confirm <确认码>]` | 默认清空当前用户；普通用户仅能清空自己的记忆（`--user` 只能填本人 ID）；`--all` 清空全部用户、`--user` 指定他人仅管理员可用；两者互斥。首次执行不带确认码只显示影响数量和确认命令。 |
 | `rebuild` | `[--to <知识库名>]`、`[--confirm <确认码>]` | 不带 `--to` 原地重建当前知识库；带 `--to` 迁移到目标知识库；首次执行不带确认码只预览，不会执行。 |
 | `rebuild --clear-cache` | `[--confirm <确认码>]` | 清理中断重建的 KV 缓存；不能与 `--to` 同时使用；重建进行中禁止清理。 |
 | `review` | `[list\|approve <ID>\|reject <ID>\|clear]` | 不带参数等同 `list`；`approve` 执行对应操作后标记已批准；`reject` 标记废案；`clear` 清空待审队列；管理员专用。 |
@@ -195,10 +195,11 @@ AI 可以通过以下工具主动操作记忆：
 
 - `memory_recall(query)` — 搜索长期记忆
 - `memory_store(content, memory_type, disclosure)` — 存储记忆
+- `memory_update(uri, content, disclosure)` — 按 URI 更新记忆内容与触发条件（普通用户仅限自己的记忆；global 记忆仅管理员可改，管理员可跨用户更新）
 - `memory_store_global(content, memory_type, disclosure)` — 存储全局记忆（需开启 `enable_admin_global_memory_tool`，仅管理员可用）
 - `memory_search_admin(query, domain, scope, top_k)` — 搜索所有活跃记忆并返回精确管理目标（需开启 `enable_admin_global_memory_tool`，仅管理员；`domain`、`scope` 可选，`top_k` 为 1-20）
 - `memory_remove_admin(uri, scope, owner_id, confirm)` — 预览后按 URI、scope 和归属确认删除（同一开关、仅管理员；global 不传 `owner_id`，personal 使用 `owner_user_id`，group 使用 `owner_session_id`，conversation 使用完整 `umo`）
-- `memory_forget(uri)` — 删除当前用户有权限的记忆
+- `memory_forget(uri)` — 删除当前用户有权限的记忆（管理员可按 URI 删除全部匹配记录）
 
 `memory_remove_admin` 首次调用只返回 URI、scope、归属、计数、正文长度、SHA-256 短指纹、80 字符预览和确认码，不会删除。确认调用会再次核对当前记录指纹；管理员可管理 global、personal、group 和 conversation 记忆，但必须指定精确 scope，非 global 还必须指定对应归属。
 ### 记忆类型
