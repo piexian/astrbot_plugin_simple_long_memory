@@ -2319,8 +2319,10 @@ class MemoryManager:
             deduped.append(mem)
         return deduped
 
-    async def forget_memory(self, event: AstrMessageEvent, uri: str) -> int:
-        """删除当前用户指定 URI 的记忆（LLM 工具用，按 user_id 隔离）
+    async def forget_memory(
+        self, event: AstrMessageEvent, uri: str, *, all_users: bool = False
+    ) -> int:
+        """删除当前用户指定 URI 的记忆，管理员可按 URI 删除全部记录。
 
         Args:
             event: 消息事件
@@ -2329,6 +2331,9 @@ class MemoryManager:
         Returns:
             删除数。无权限和不存在都返回 0，避免泄漏跨用户 URI 存在性。
         """
+        if all_users:
+            return await self.forget_memory_by_uri(uri)
+
         filters = self._build_user_filter(event)
         filters["uri"] = uri
         deleted = await self._delete_by_filters(filters, uri)
@@ -2764,30 +2769,29 @@ class MemoryManager:
         self,
         event: AstrMessageEvent,
         uri: str,
+        *,
+        all_users: bool = False,
     ) -> dict[str, Any] | None:
-        """通过 URI 获取记忆
-
-        Args:
-            event: 消息事件
-            uri: 记忆 URI
-
-        Returns:
-            记忆数据或 None
-        """
-        filters = self._build_user_filter(event)
-        filters["uri"] = uri
+        """通过 URI 查询当前用户或管理员可见的活跃记忆。"""
+        if all_users:
+            filters: dict[str, Any] = {
+                "uri": uri,
+                "is_memory_record": True,
+                "deprecated": False,
+            }
+        else:
+            filters = self._build_user_filter(event)
+            filters["uri"] = uri
 
         docs = await self.vec_db.document_storage.get_documents(
             metadata_filters=filters,
             limit=1,
         )
-
         if not docs:
             return None
 
         doc = docs[0]
         metadata = _safe_parse_metadata(doc.get("metadata", {}))
-
         return {
             "text": doc.get("text", ""),
             "metadata": metadata,

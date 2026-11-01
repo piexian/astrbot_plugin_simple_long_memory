@@ -109,6 +109,222 @@ def _memory(index: int) -> dict:
 
 
 class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_memory_mutation_authorization_uses_canonical_user_id(self):
+        member = _Event("")
+        self.assertIsNone(plugin_main.authorize_memory_mutation(member))
+        self.assertIsNone(
+            plugin_main.authorize_memory_mutation(member, target_user_id="test_42")
+        )
+        self.assertEqual(
+            plugin_main.authorize_memory_mutation(member, target_user_id="test_99"),
+            "普通用户只能修改自己的记忆",
+        )
+        self.assertEqual(
+            plugin_main.authorize_memory_mutation(member, all_users=True),
+            "该操作需要管理员权限",
+        )
+
+        admin = _Event("", admin=True)
+        self.assertIsNone(
+            plugin_main.authorize_memory_mutation(
+                admin, target_user_id="test_99", all_users=True
+            )
+        )
+
+    async def test_clear_allows_own_target_and_rejects_foreign_target(self):
+        class Manager:
+            def __init__(self):
+                self.calls = []
+
+            async def count_clear_memories_by_user(self, event, target_user_id):
+                self.calls.append(("count", target_user_id))
+                return 2
+
+            async def clear_memories_by_user(self, event, target_user_id):
+                self.calls.append(("clear", target_user_id))
+                return 2
+
+        manager = Manager()
+        plugin = SimpleNamespace(
+            memory_mgr=manager,
+            _get_cmd_prefix=lambda: "/",
+        )
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event("memory clear --user test_42"),
+        )
+        self.assertIn("预计影响: 2 条", result[0])
+        self.assertEqual(manager.calls, [("count", "test_42")])
+
+        confirm = plugin_main._confirmation_code("clear", "user:test_42")
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event(f"memory clear --user test_42 --confirm {confirm}"),
+        )
+        self.assertEqual(result, ["已清空用户 test_42 的 2 条记忆"])
+        self.assertEqual(
+            manager.calls,
+            [("count", "test_42"), ("clear", "test_42")],
+        )
+
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event("memory clear --user test_99"),
+        )
+        self.assertEqual(result, ["普通用户只能修改自己的记忆"])
+        self.assertEqual(
+            manager.calls,
+            [("count", "test_42"), ("clear", "test_42")],
+        )
+
+    async def test_admin_can_clear_all_users(self):
+        class Manager:
+            async def count_clear_memories(self, event, all_users=False):
+                self.preview = all_users
+                return 4
+
+            async def clear_memories(self, event, all_users=False):
+                self.cleared = all_users
+                return 4
+
+        manager = Manager()
+        plugin = SimpleNamespace(
+            memory_mgr=manager,
+            _get_cmd_prefix=lambda: "/",
+        )
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event("memory clear --all", admin=True),
+        )
+        self.assertIn("预计影响: 4 条", result[0])
+        self.assertTrue(manager.preview)
+
+        confirm = plugin_main._confirmation_code("clear", "all")
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event(f"memory clear --all --confirm {confirm}", admin=True),
+        )
+        self.assertEqual(result, ["已清空全部 4 条记忆"])
+        self.assertTrue(manager.cleared)
+
+    async def test_memory_update_uses_owner_authorization(self):
+        class Manager:
+            def __init__(self):
+                self.replace_calls = []
+
+            async def get_memory_by_uri(self, event, uri, *, all_users=False):
+                return {
+                    "metadata": {
+                        "uri": uri,
+                        "memory_scope": "personal",
+                        "owner_user_id": "test_99",
+                        "domain": "facts",
+                        "importance": 3,
+                    }
+                }
+
+            async def replace_memory(self, **kwargs):
+                self.replace_calls.append(kwargs)
+                return "facts://new"
+
+        manager = Manager()
+        plugin = SimpleNamespace(memory_mgr=manager)
+        result = await plugin_main.MemoryPlugin.tool_update(
+            plugin,
+            _Event("", admin=False),
+            "facts://old",
+            "new content",
+        )
+        self.assertEqual(result, "Error: 普通用户只能修改自己的记忆")
+        self.assertEqual(manager.replace_calls, [])
+
+        result = await plugin_main.MemoryPlugin.tool_update(
+            plugin,
+            _Event("", admin=True),
+            "facts://old",
+            "new content",
+        )
+        self.assertEqual(result, "Memory updated: facts://old -> facts://new")
+        self.assertEqual(manager.replace_calls[0]["updated_by"], "admin")
+
+    async def test_forget_allows_own_target_and_rejects_foreign_target(self):
+        class Manager:
+            def __init__(self):
+                self.calls = []
+
+            async def forget_memory_by_user(self, event, uri, target_user_id):
+                self.calls.append(("user", uri, target_user_id))
+                return 1
+
+            async def forget_memory_by_uri(self, uri):
+                self.calls.append(("all", uri))
+                return 2
+
+        plugin = SimpleNamespace(memory_mgr=Manager())
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_forget,
+            plugin,
+            _Event("memory forget facts://own --user test_42"),
+        )
+        self.assertEqual(result, ["已删除用户 test_42 的 1 条记忆: facts://own"])
+        self.assertEqual(
+            plugin.memory_mgr.calls,
+            [("user", "facts://own", "test_42")],
+        )
+
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_forget,
+            plugin,
+            _Event("memory forget facts://other --user test_99"),
+        )
+        self.assertEqual(result, ["普通用户只能修改自己的记忆"])
+        self.assertEqual(
+            plugin.memory_mgr.calls,
+            [("user", "facts://own", "test_42")],
+        )
+
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_forget,
+            plugin,
+            _Event("memory forget facts://any", admin=True),
+        )
+        self.assertEqual(result, ["已删除 2 条记忆: facts://any"])
+        self.assertEqual(
+            plugin.memory_mgr.calls,
+            [("user", "facts://own", "test_42"), ("all", "facts://any")],
+        )
+
+    async def test_memory_forget_tool_uses_admin_all_users_mode(self):
+        class Manager:
+            def __init__(self):
+                self.calls = []
+
+            async def forget_memory(self, event, uri, *, all_users=False):
+                self.calls.append((uri, all_users))
+                return 1
+
+        manager = Manager()
+        plugin = SimpleNamespace(memory_mgr=manager)
+        result = await plugin_main.MemoryPlugin.tool_forget(
+            plugin, _Event("", admin=False), "facts://own"
+        )
+        self.assertEqual(result, "Memory deleted: facts://own (1 record(s))")
+        self.assertEqual(manager.calls, [("facts://own", False)])
+
+        result = await plugin_main.MemoryPlugin.tool_forget(
+            plugin, _Event("", admin=True), "facts://any"
+        )
+        self.assertEqual(result, "Memory deleted: facts://any (1 record(s))")
+        self.assertEqual(
+            manager.calls,
+            [("facts://own", False), ("facts://any", True)],
+        )
+
     async def test_list_rejects_invalid_page(self):
         class Manager:
             called = False

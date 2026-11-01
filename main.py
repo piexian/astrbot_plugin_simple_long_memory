@@ -35,6 +35,7 @@ from .memory_protocol import (
     MemoryType,
     MemoryURI,
     UMOInfo,
+    build_user_id,
     format_memory_for_injection,
     format_memory_for_user,
     validate_owner_ids,
@@ -329,6 +330,23 @@ def _ensure_initialized(memory_mgr: MemoryManager | None) -> str | None:
     """检查记忆管理器是否就绪，返回错误消息或 None"""
     if not memory_mgr:
         return "长期记忆插件未正确初始化，请检查配置"
+    return None
+
+
+def authorize_memory_mutation(
+    event: AstrMessageEvent,
+    *,
+    target_user_id: str | None = None,
+    all_users: bool = False,
+) -> str | None:
+    """校验记忆修改目标，普通用户只能操作自己的记忆。"""
+    if all_users and not event.is_admin():
+        return "该操作需要管理员权限"
+    if event.is_admin() or not target_user_id:
+        return None
+    current_user_id = build_user_id(event.get_platform_id(), event.get_sender_id())
+    if target_user_id != current_user_id:
+        return "普通用户只能修改自己的记忆"
     return None
 
 
@@ -1348,8 +1366,8 @@ class MemoryPlugin(Star):
 
         is_admin = event.is_admin()
 
-        if target_user_id and not is_admin:
-            yield event.plain_result("--user 参数仅管理员可用")
+        if err := authorize_memory_mutation(event, target_user_id=target_user_id):
+            yield event.plain_result(err)
             return
 
         if target_user_id:
@@ -1380,7 +1398,7 @@ class MemoryPlugin(Star):
 
     @memory_group.command("clear")
     async def cmd_clear(self, event: AstrMessageEvent):
-        """清空记忆（管理员）/memory clear [--all] [--user <id>]"""
+        """清空当前用户记忆；管理员可指定用户或全部记忆。"""
         if err := _ensure_initialized(self.memory_mgr):
             yield event.plain_result(err)
             return
@@ -1389,7 +1407,6 @@ class MemoryPlugin(Star):
             event,
             args,
             cmd_name="clear",
-            require_admin=True,
             allow_all=True,
             allow_user=True,
             allow_confirm=True,
@@ -1400,12 +1417,20 @@ class MemoryPlugin(Star):
         if args["all"] and args["user"]:
             yield event.plain_result("--all 与 --user 不可同时使用")
             return
+
+        if err := authorize_memory_mutation(
+            event,
+            target_user_id=args["user"],
+            all_users=args["all"],
+        ):
+            yield event.plain_result(err)
+            return
         if args["all"]:
             target_label = "all"
         elif args["user"]:
             target_label = f"user:{args['user']}"
         else:
-            target_label = f"current:{event.get_sender_id()}"
+            target_label = f"current:{build_user_id(event.get_platform_id(), event.get_sender_id())}"
         confirm_code = _confirmation_code("clear", target_label)
         cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
         if args["confirm"] != confirm_code:
@@ -2067,18 +2092,21 @@ class MemoryPlugin(Star):
             return "Error: uri is required"
 
         # 查找旧记忆（按 user_id 隔离，找不到或不属于自己都报错）
-        old_memory = await self.memory_mgr.get_memory_by_uri(event, uri.strip())
+        old_memory = await self.memory_mgr.get_memory_by_uri(
+            event, uri.strip(), all_users=event.is_admin()
+        )
         if not old_memory:
             return f"Error: memory not found or not yours: {uri}"
 
         old_meta = old_memory.get("metadata", {})
 
-        # global 记忆不允许通过此工具修改，必须走管理员确认路径
-        if old_meta.get("memory_scope") == MemoryScope.GLOBAL:
-            return (
-                "Error: global memories cannot be updated via this tool. "
-                "Use /memory commands with admin confirmation instead."
-            )
+        target_user_id = old_meta.get("owner_user_id") or old_meta.get("user_id")
+        if err := authorize_memory_mutation(event, target_user_id=target_user_id):
+            return f"Error: {err}"
+
+        # global 记忆仅允许管理员通过此工具修改
+        if old_meta.get("memory_scope") == MemoryScope.GLOBAL and not event.is_admin():
+            return "Error: global memories can only be updated by administrators."
 
         content = _sanitize_memory_content(content)
         if not content:
@@ -2093,7 +2121,7 @@ class MemoryPlugin(Star):
                 old_metadata=old_meta,
                 new_content=content,
                 new_disclosure=new_disclosure,
-                updated_by="user",
+                updated_by="admin" if event.is_admin() else "user",
             )
         except Exception as e:
             return f"Error: failed to update memory: {e}"
@@ -2326,7 +2354,9 @@ class MemoryPlugin(Star):
         if not self.memory_mgr:
             return "Memory plugin not initialized"
 
-        deleted = await self.memory_mgr.forget_memory(event, uri)
+        deleted = await self.memory_mgr.forget_memory(
+            event, uri, all_users=event.is_admin()
+        )
         if deleted == 0:
             return f"Memory not found or not permitted: {uri}"
         return f"Memory deleted: {uri} ({deleted} record(s))"
