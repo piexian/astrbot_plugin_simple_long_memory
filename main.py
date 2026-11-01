@@ -16,12 +16,14 @@ import json
 import re
 import shlex
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.api.util import SessionController, SessionWaiter
 
 from .maintenance.scheduler import MaintenanceScheduler
 from .memory_manager import (
@@ -198,6 +200,73 @@ def _confirmation_code(action: str, target: str = "") -> str:
     return f"{action}-{digest}"
 
 
+CONFIRMATION_TIMEOUT_SECONDS = 60
+CONFIRMATION_WORD = "确认"
+CONFIRMATION_CANCEL_WORDS = frozenset({"取消", "退出"})
+
+
+@dataclass(frozen=True)
+class ConfirmationResult:
+    status: str
+    event: AstrMessageEvent | None = None
+
+
+class _ConfirmationSessionFilter:
+    """Bind a confirmation session to one UMO and its original sender."""
+
+    def __init__(self, event: AstrMessageEvent):
+        self._umo = event.unified_msg_origin
+        self._sender_id = str(event.get_sender_id())
+        self.session_id = (
+            f"simple_long_memory:confirmation:{self._umo}:{self._sender_id}"
+        )
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        if (
+            event.unified_msg_origin == self._umo
+            and str(event.get_sender_id()) == self._sender_id
+        ):
+            return self.session_id
+        return f"{self.session_id}:unmatched:{id(self)}"
+
+
+async def _wait_for_confirmation(
+    event: AstrMessageEvent,
+    waiters: set[SessionWaiter],
+    *,
+    timeout: int = CONFIRMATION_TIMEOUT_SECONDS,
+) -> ConfirmationResult:
+    """Wait for an exact confirmation message from the original sender."""
+    session_filter = _ConfirmationSessionFilter(event)
+    if any(waiter.session_id == session_filter.session_id for waiter in waiters):
+        return ConfirmationResult("busy")
+
+    waiter = SessionWaiter(session_filter, session_filter.session_id, False)
+    waiters.add(waiter)
+    result: ConfirmationResult | None = None
+
+    async def handle(controller: SessionController, incoming: AstrMessageEvent) -> None:
+        nonlocal result
+        text = (incoming.message_str or "").strip()
+        if text == CONFIRMATION_WORD:
+            result = ConfirmationResult("confirmed", incoming)
+            controller.stop()
+            return
+        if text in CONFIRMATION_CANCEL_WORDS:
+            result = ConfirmationResult("cancelled", incoming)
+            controller.stop()
+            return
+        await incoming.send(incoming.plain_result("请输入“确认”执行，发送“取消”放弃。"))
+
+    try:
+        await waiter.register_wait(handle, timeout=timeout)
+    except TimeoutError:
+        return ConfirmationResult("timeout")
+    finally:
+        waiters.discard(waiter)
+    return result or ConfirmationResult("cancelled")
+
+
 ADMIN_MANAGED_SCOPES = {
     MemoryScope.GLOBAL,
     MemoryScope.PERSONAL,
@@ -265,24 +334,21 @@ def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
 
 
 def _parse_memory_flags(args_text: str) -> dict[str, Any]:
-    """解析 --all / --user <id> / --to <name> / --clear-cache / --confirm 标志
+    """解析 --all / --user <id> / --to <name> / --clear-cache 标志
 
     Returns:
         {"all": bool, "user": str, "to": str, "clear_cache": bool,
-         "confirm": str, "positional": str,
-         "user_missing_value": bool, "to_missing_value": bool,
-         "unknown_flags": list[str]}
+         "positional": str, "user_missing_value": bool,
+         "to_missing_value": bool, "unknown_flags": list[str]}
     """
     result: dict[str, Any] = {
         "all": False,
         "user": "",
         "to": "",
         "clear_cache": False,
-        "confirm": "",
         "positional": "",
         "user_missing_value": False,
         "to_missing_value": False,
-        "confirm_missing_value": False,
         "parse_error": "",
         "unknown_flags": [],
     }
@@ -311,12 +377,6 @@ def _parse_memory_flags(args_text: str) -> dict[str, Any]:
                 result["to_missing_value"] = True
         elif token == "--clear-cache":
             result["clear_cache"] = True
-        elif token == "--confirm":
-            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
-                i += 1
-                result["confirm"] = tokens[i]
-            else:
-                result["confirm_missing_value"] = True
         elif token.startswith("--"):
             result["unknown_flags"].append(token)
         else:
@@ -331,6 +391,14 @@ def _ensure_initialized(memory_mgr: MemoryManager | None) -> str | None:
     if not memory_mgr:
         return "长期记忆插件未正确初始化，请检查配置"
     return None
+
+
+def _get_confirmation_waiters(plugin: Any) -> set[SessionWaiter]:
+    waiters = getattr(plugin, "_confirmation_waiters", None)
+    if waiters is None:
+        waiters = set()
+        setattr(plugin, "_confirmation_waiters", waiters)
+    return waiters
 
 
 def authorize_memory_mutation(
@@ -360,7 +428,6 @@ def _validate_command(
     allow_user: bool = False,
     allow_to: bool = False,
     allow_clear_cache: bool = False,
-    allow_confirm: bool = False,
     allow_positional: bool = True,
 ) -> str | None:
     """统一的命令参数校验，返回首个错误消息或 None。
@@ -378,18 +445,12 @@ def _validate_command(
         if not allow_to:
             return f"{cmd_name} 命令不支持 --to 参数"
         return "需要指定知识库名称，用法: /memory rebuild --to <知识库名>"
-    if args["confirm_missing_value"]:
-        if not allow_confirm:
-            return f"{cmd_name} 命令不支持 --confirm 参数"
-        return "--confirm 需要指定确认码"
     if not allow_user and args["user"]:
         return f"{cmd_name} 命令不支持 --user 参数"
     if not allow_to and args["to"]:
         return f"{cmd_name} 命令不支持 --to 参数"
     if not allow_clear_cache and args["clear_cache"]:
         return f"{cmd_name} 命令不支持 --clear-cache 参数"
-    if not allow_confirm and args["confirm"]:
-        return f"{cmd_name} 命令不支持 --confirm 参数"
     if not allow_all and args["all"]:
         return f"{cmd_name} 命令不支持 --all 参数"
     if not allow_positional and args["positional"]:
@@ -426,6 +487,7 @@ class MemoryPlugin(Star):
         self._last_ttl_expire = 0.0
         self._last_consolidation = 0.0
         self._background_tasks: set[asyncio.Task] = set()
+        self._confirmation_waiters: set[SessionWaiter] = set()
         self._scheduler: MaintenanceScheduler | None = None
 
     async def initialize(self):
@@ -558,6 +620,9 @@ class MemoryPlugin(Star):
 
     async def terminate(self):
         """插件销毁"""
+        for waiter in tuple(self._confirmation_waiters):
+            waiter.session_controller.stop()
+        self._confirmation_waiters.clear()
         if self._scheduler:
             await self._scheduler.stop()
             self._scheduler = None
@@ -1409,7 +1474,6 @@ class MemoryPlugin(Star):
             cmd_name="clear",
             allow_all=True,
             allow_user=True,
-            allow_confirm=True,
             allow_positional=False,
         ):
             yield event.plain_result(err)
@@ -1426,36 +1490,56 @@ class MemoryPlugin(Star):
             yield event.plain_result(err)
             return
         if args["all"]:
-            target_label = "all"
+            preview = await self.memory_mgr.count_clear_memories(event, all_users=True)
+            scope = "全部记忆"
         elif args["user"]:
-            target_label = f"user:{args['user']}"
-        else:
-            target_label = f"current:{build_user_id(event.get_platform_id(), event.get_sender_id())}"
-        confirm_code = _confirmation_code("clear", target_label)
-        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
-        if args["confirm"] != confirm_code:
-            if args["all"]:
-                preview = await self.memory_mgr.count_clear_memories(
-                    event, all_users=True
-                )
-                scope = "全部记忆"
-            elif args["user"]:
-                preview = await self.memory_mgr.count_clear_memories_by_user(
-                    event, args["user"]
-                )
-                scope = f"用户 {args['user']} 的记忆"
-            else:
-                preview = await self.memory_mgr.count_clear_memories(event)
-                scope = "当前用户记忆"
-            yield event.plain_result(
-                "[清空确认]\n"
-                f"  范围: {scope}\n"
-                f"  预计影响: {preview} 条\n"
-                f"  确认执行: {cmd_prefix}memory clear --confirm {confirm_code}"
-                + (" --all" if args["all"] else "")
-                + (f" --user {args['user']}" if args["user"] else "")
+            preview = await self.memory_mgr.count_clear_memories_by_user(
+                event, args["user"]
             )
+            scope = f"用户 {args['user']} 的记忆"
+        else:
+            preview = await self.memory_mgr.count_clear_memories(event)
+            scope = "当前用户记忆"
+        yield event.plain_result(
+            "[清空确认]\n"
+            f"  范围: {scope}\n"
+            f"  预计影响: {preview} 条\n"
+            "  请在本会话发送“确认”执行，发送“取消”放弃"
+        )
+        confirmation = await _wait_for_confirmation(
+            event, _get_confirmation_waiters(self)
+        )
+        if confirmation.status == "timeout":
+            yield event.plain_result("确认超时，操作未执行")
             return
+        if confirmation.status == "busy":
+            yield event.plain_result("已有待确认操作，请先发送“确认”或“取消”")
+            return
+        if confirmation.status != "confirmed":
+            yield event.plain_result("操作已取消，未删除任何记忆")
+            return
+        event = confirmation.event or event
+        if err := authorize_memory_mutation(
+            event,
+            target_user_id=args["user"],
+            all_users=args["all"],
+        ):
+            yield event.plain_result(err)
+            return
+        if args["all"]:
+            current_preview = await self.memory_mgr.count_clear_memories(
+                event, all_users=True
+            )
+        elif args["user"]:
+            current_preview = await self.memory_mgr.count_clear_memories_by_user(
+                event, args["user"]
+            )
+        else:
+            current_preview = await self.memory_mgr.count_clear_memories(event)
+        if current_preview != preview:
+            yield event.plain_result("确认期间目标数量已变化，请重新预览确认")
+            return
+
         if args["all"]:
             count = await self.memory_mgr.clear_memories(event, all_users=True)
             yield event.plain_result(f"已清空全部 {count} 条记忆")
@@ -1481,7 +1565,6 @@ class MemoryPlugin(Star):
             require_admin=True,
             allow_to=True,
             allow_clear_cache=True,
-            allow_confirm=True,
             allow_positional=False,
         ):
             yield event.plain_result(err)
@@ -1500,18 +1583,30 @@ class MemoryPlugin(Star):
                 yield event.plain_result("重建/迁移正在进行中，不能清理缓存")
                 return
             cache_fingerprint = self.memory_mgr.rebuild_cache_fingerprint(cache_status)
-            confirm_code = _confirmation_code("clear-cache", cache_fingerprint)
-            cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
-            if args["confirm"] != confirm_code:
-                yield event.plain_result(
-                    "[清理重建缓存确认]\n"
-                    f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
-                    f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
-                    f"  上次状态: {cache_status.get('status', '无')}\n"
-                    f"  源知识库: {cache_status.get('source_kb', '无')}\n"
-                    f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
-                    f"  确认执行: {cmd_prefix}memory rebuild --clear-cache --confirm {confirm_code}"
-                )
+            yield event.plain_result(
+                "[清理重建缓存确认]\n"
+                f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
+                f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
+                f"  上次状态: {cache_status.get('status', '无')}\n"
+                f"  源知识库: {cache_status.get('source_kb', '无')}\n"
+                f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
+                "  请在本会话发送“确认”执行，发送“取消”放弃"
+            )
+            confirmation = await _wait_for_confirmation(
+                event, _get_confirmation_waiters(self)
+            )
+            if confirmation.status == "timeout":
+                yield event.plain_result("确认超时，操作未执行")
+                return
+            if confirmation.status == "busy":
+                yield event.plain_result("已有待确认操作，请先发送“确认”或“取消”")
+                return
+            if confirmation.status != "confirmed":
+                yield event.plain_result("操作已取消，未清理重建缓存")
+                return
+            event = confirmation.event or event
+            if not event.is_admin():
+                yield event.plain_result("该操作需要管理员权限")
                 return
             current_status = await self.memory_mgr.get_rebuild_cache_status()
             if (
@@ -1536,10 +1631,9 @@ class MemoryPlugin(Star):
         target_kb_name = args["to"] or None
         logger.debug(
             "[简单长期记忆] rebuild 命令开始: target_kb=%s, clear_cache=%s, "
-            "confirm_provided=%s, current_kb=%s",
+            "current_kb=%s",
             target_kb_name or "(current)",
             args["clear_cache"],
-            bool(args["confirm"]),
             self.memory_mgr.current_kb_name,
         )
 
@@ -1547,7 +1641,6 @@ class MemoryPlugin(Star):
         if target_kb_name and self.memory_mgr.current_kb_name == target_kb_name:
             target_kb_name = None
 
-        action_target = target_kb_name or self.memory_mgr.current_kb_name
         source_kb_id = await self.memory_mgr.get_kb_id_by_name(
             self.memory_mgr.current_kb_name
         )
@@ -1556,48 +1649,70 @@ class MemoryPlugin(Star):
             if target_kb_name
             else source_kb_id
         )
-        action_fingerprint = f"{action_target}:{source_kb_id}:{target_kb_id}"
-        confirm_code = _confirmation_code("rebuild", action_fingerprint)
         cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
-        if args["confirm"] != confirm_code:
-            source_count = await self.memory_mgr.count_kb_memory_records_by_name(
-                self.memory_mgr.current_kb_name
-            )
-            target_count = (
-                await self.memory_mgr.count_kb_memory_records_by_name(target_kb_name)
-                if target_kb_name
-                else source_count
-            )
-            target_missing = target_kb_name is not None and not target_kb_id
-            mode = "迁移" if target_kb_name else "重建"
-            report = (
-                f"[{mode}确认]\n"
-                f"  当前知识库: {self.memory_mgr.current_kb_name}\n"
-                f"  目标知识库: {target_kb_name or self.memory_mgr.current_kb_name}\n"
-                f"  当前记忆数: {source_count}\n"
-            )
-            if target_kb_name:
-                if target_missing:
-                    report += "  目标知识库不存在，请检查名称\n"
-                    yield event.plain_result(report)
-                    return
-                report += f"  目标已有记忆数: {target_count}\n"
-                if target_count > 0:
-                    report += "  目标知识库已有记忆，执行前需要先清空或更换目标\n"
-            report += (
-                f"  确认执行: {cmd_prefix}memory rebuild --confirm {confirm_code}"
-                + (f" --to {shlex.quote(target_kb_name)}" if target_kb_name else "")
-            )
-            yield event.plain_result(report)
-            logger.debug(
-                "[简单长期记忆] rebuild 确认预览: mode=%s, source_count=%s, "
-                "target_count=%s, target_missing=%s, confirm_code_generated=%s",
-                mode,
-                source_count,
-                target_count,
-                target_missing,
-                True,
-            )
+        source_count = await self.memory_mgr.count_kb_memory_records_by_name(
+            self.memory_mgr.current_kb_name
+        )
+        target_count = (
+            await self.memory_mgr.count_kb_memory_records_by_name(target_kb_name)
+            if target_kb_name
+            else source_count
+        )
+        target_missing = target_kb_name is not None and not target_kb_id
+        mode = "迁移" if target_kb_name else "重建"
+        report = (
+            f"[{mode}确认]\n"
+            f"  当前知识库: {self.memory_mgr.current_kb_name}\n"
+            f"  目标知识库: {target_kb_name or self.memory_mgr.current_kb_name}\n"
+            f"  当前记忆数: {source_count}\n"
+        )
+        if target_kb_name:
+            if target_missing:
+                report += "  目标知识库不存在，请检查名称\n"
+                yield event.plain_result(report)
+                return
+            report += f"  目标已有记忆数: {target_count}\n"
+            if target_count > 0:
+                report += "  目标已有记忆，执行前需要先清空或更换目标\n"
+                yield event.plain_result(report)
+                return
+        report += "  请在本会话发送“确认”执行，发送“取消”放弃\n"
+        yield event.plain_result(report)
+        logger.debug(
+            "[简单长期记忆] rebuild 确认预览: mode=%s, source_count=%s, "
+            "target_count=%s, target_missing=%s, session_confirmation=%s",
+            mode,
+            source_count,
+            target_count,
+            target_missing,
+            True,
+        )
+        confirmation = await _wait_for_confirmation(
+            event, _get_confirmation_waiters(self)
+        )
+        if confirmation.status == "timeout":
+            yield event.plain_result("确认超时，操作未执行")
+            return
+        if confirmation.status == "busy":
+            yield event.plain_result("已有待确认操作，请先发送“确认”或“取消”")
+            return
+        if confirmation.status != "confirmed":
+            yield event.plain_result("操作已取消，未执行重建或迁移")
+            return
+        event = confirmation.event or event
+        if not event.is_admin():
+            yield event.plain_result("该操作需要管理员权限")
+            return
+        current_source_id = await self.memory_mgr.get_kb_id_by_name(
+            self.memory_mgr.current_kb_name
+        )
+        current_target_id = (
+            await self.memory_mgr.get_kb_id_by_name(target_kb_name)
+            if target_kb_name
+            else current_source_id
+        )
+        if current_source_id != source_kb_id or current_target_id != target_kb_id:
+            yield event.plain_result("知识库状态已变化，请重新预览确认")
             return
         if not source_kb_id:
             yield event.plain_result("当前知识库不存在，请检查配置")

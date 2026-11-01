@@ -38,6 +38,36 @@ class _Star:
     pass
 
 
+class _SessionController:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class _SessionWaiter:
+    def __init__(self, session_filter, session_id, record_history_chains):
+        self.session_filter = session_filter
+        self.session_id = session_id
+        self.record_history_chains = record_history_chains
+        self.session_controller = _SessionController()
+
+    async def register_wait(self, handler, timeout=30):
+        raise AssertionError("test must patch SessionWaiter before waiting")
+
+
+class _DrivenSessionWaiter(_SessionWaiter):
+    messages = []
+
+    async def register_wait(self, handler, timeout=30):
+        for incoming in self.messages:
+            await handler(self.session_controller, incoming)
+            if self.session_controller.stopped:
+                return
+        raise TimeoutError
+
+
 def _load_plugin_modules():
     project_parent = Path(__file__).resolve().parents[2]
     if str(project_parent) not in sys.path:
@@ -48,6 +78,9 @@ def _load_plugin_modules():
     event_module = types.ModuleType("astrbot.api.event")
     provider_module = types.ModuleType("astrbot.api.provider")
     star_module = types.ModuleType("astrbot.api.star")
+    api_util_module = types.ModuleType("astrbot.api.util")
+    api_util_module.SessionController = _SessionController
+    api_util_module.SessionWaiter = _SessionWaiter
 
     api_module.logger = _Logger()
     event_module.AstrMessageEvent = type("AstrMessageEvent", (), {})
@@ -63,6 +96,7 @@ def _load_plugin_modules():
         "astrbot.api.event": event_module,
         "astrbot.api.provider": provider_module,
         "astrbot.api.star": star_module,
+        "astrbot.api.util": api_util_module,
     }
     with patch.dict(sys.modules, modules):
         main_module = importlib.import_module("astrbot_plugin_simple_long_memory.main")
@@ -77,25 +111,41 @@ MemoryManager = memory_manager_module.MemoryManager
 
 
 class _Event:
-    def __init__(self, message_str: str, admin: bool = False):
+    def __init__(
+        self,
+        message_str: str,
+        admin: bool = False,
+        sender_id: str = "42",
+        umo: str = "test:FriendMessage:42",
+    ):
         self.message_str = message_str
         self._admin = admin
+        self._sender_id = sender_id
+        self.unified_msg_origin = umo
+        self.sent: list[str] = []
 
     def plain_result(self, text: str) -> str:
         return text
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
 
     def is_admin(self) -> bool:
         return self._admin
 
     def get_sender_id(self) -> str:
-        return "42"
+        return self._sender_id
 
     def get_platform_id(self) -> str:
         return "test"
 
 
-async def _collect(handler, plugin, event):
-    return [item async for item in handler(plugin, event)]
+async def _collect(handler, plugin, event, confirmation=None):
+    async def fake_wait(_event, _waiters):
+        return confirmation or plugin_main.ConfirmationResult("timeout")
+
+    with patch.object(plugin_main, "_wait_for_confirmation", fake_wait):
+        return [item async for item in handler(plugin, event)]
 
 
 def _memory(index: int) -> dict:
@@ -106,6 +156,85 @@ def _memory(index: int) -> dict:
             "created_at": "2026-07-10T00:00:00+00:00",
         },
     }
+
+
+class ConfirmationSessionTests(unittest.IsolatedAsyncioTestCase):
+    def test_confirmation_filter_binds_umo_and_sender(self):
+        original = _Event(
+            "",
+            sender_id="admin",
+            umo="test:GroupMessage:group-1",
+        )
+        session_filter = plugin_main._ConfirmationSessionFilter(original)
+
+        self.assertEqual(session_filter.filter(original), session_filter.session_id)
+        self.assertEqual(
+            session_filter.filter(
+                _Event(
+                    "",
+                    sender_id="admin",
+                    umo="test:GroupMessage:group-1",
+                )
+            ),
+            session_filter.session_id,
+        )
+        self.assertNotEqual(
+            session_filter.filter(
+                _Event(
+                    "",
+                    sender_id="member",
+                    umo="test:GroupMessage:group-1",
+                )
+            ),
+            session_filter.session_id,
+        )
+        self.assertNotEqual(
+            session_filter.filter(
+                _Event(
+                    "",
+                    sender_id="admin",
+                    umo="test:GroupMessage:group-2",
+                )
+            ),
+            session_filter.session_id,
+        )
+
+    async def test_confirmation_waiter_ignores_invalid_input(self):
+        _DrivenSessionWaiter.messages = [_Event("其他消息"), _Event("确认")]
+        waiters = set()
+        with patch.object(plugin_main, "SessionWaiter", _DrivenSessionWaiter):
+            result = await plugin_main._wait_for_confirmation(
+                _Event("memory clear"), waiters
+            )
+
+        self.assertEqual(result.status, "confirmed")
+        self.assertEqual(
+            _DrivenSessionWaiter.messages[0].sent,
+            ["请输入“确认”执行，发送“取消”放弃。"],
+        )
+        self.assertEqual(waiters, set())
+
+    async def test_confirmation_waiter_times_out_without_mutation(self):
+        _DrivenSessionWaiter.messages = []
+        waiters = set()
+        with patch.object(plugin_main, "SessionWaiter", _DrivenSessionWaiter):
+            result = await plugin_main._wait_for_confirmation(
+                _Event("memory clear"), waiters
+            )
+
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(waiters, set())
+
+    async def test_confirmation_waiter_can_cancel(self):
+        _DrivenSessionWaiter.messages = [_Event("取消")]
+        waiters = set()
+        with patch.object(plugin_main, "SessionWaiter", _DrivenSessionWaiter):
+            result = await plugin_main._wait_for_confirmation(
+                _Event("memory clear"), waiters
+            )
+
+        self.assertEqual(result.status, "cancelled")
+        self.assertEqual(waiters, set())
 
 
 class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -155,19 +284,8 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
             _Event("memory clear --user test_42"),
         )
         self.assertIn("预计影响: 2 条", result[0])
+        self.assertEqual(result[-1], "确认超时，操作未执行")
         self.assertEqual(manager.calls, [("count", "test_42")])
-
-        confirm = plugin_main._confirmation_code("clear", "user:test_42")
-        result = await _collect(
-            plugin_main.MemoryPlugin.cmd_clear,
-            plugin,
-            _Event(f"memory clear --user test_42 --confirm {confirm}"),
-        )
-        self.assertEqual(result, ["已清空用户 test_42 的 2 条记忆"])
-        self.assertEqual(
-            manager.calls,
-            [("count", "test_42"), ("clear", "test_42")],
-        )
 
         result = await _collect(
             plugin_main.MemoryPlugin.cmd_clear,
@@ -175,10 +293,53 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
             _Event("memory clear --user test_99"),
         )
         self.assertEqual(result, ["普通用户只能修改自己的记忆"])
-        self.assertEqual(
-            manager.calls,
-            [("count", "test_42"), ("clear", "test_42")],
+        self.assertEqual(manager.calls, [("count", "test_42")])
+
+    async def test_clear_executes_after_session_confirmation(self):
+        class Manager:
+            def __init__(self):
+                self.calls = []
+
+            async def count_clear_memories(self, event):
+                self.calls.append("count")
+                return 2
+
+            async def clear_memories(self, event):
+                self.calls.append("clear")
+                return 2
+
+        manager = Manager()
+        plugin = SimpleNamespace(
+            memory_mgr=manager,
+            _get_cmd_prefix=lambda: "/",
         )
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event("memory clear"),
+            plugin_main.ConfirmationResult("confirmed", _Event("确认")),
+        )
+        self.assertIn("请在本会话发送", result[0])
+        self.assertEqual(result[-1], "已清空 2 条记忆")
+        self.assertEqual(manager.calls, ["count", "count", "clear"])
+
+    async def test_legacy_confirm_parameter_is_rejected(self):
+        plugin = SimpleNamespace(memory_mgr=object())
+        commands = (
+            "memory clear --confirm clear-old",
+            "memory rebuild --confirm rebuild-old",
+            "memory rebuild --clear-cache --confirm cache-old",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                result = await _collect(
+                    plugin_main.MemoryPlugin.cmd_clear
+                    if command.startswith("memory clear")
+                    else plugin_main.MemoryPlugin.cmd_rebuild,
+                    plugin,
+                    _Event(command, admin=True),
+                )
+                self.assertEqual(result, ["未知参数: --confirm"])
 
     async def test_admin_can_clear_all_users(self):
         class Manager:
@@ -187,7 +348,6 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
                 return 4
 
             async def clear_memories(self, event, all_users=False):
-                self.cleared = all_users
                 return 4
 
         manager = Manager()
@@ -202,15 +362,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("预计影响: 4 条", result[0])
         self.assertTrue(manager.preview)
-
-        confirm = plugin_main._confirmation_code("clear", "all")
-        result = await _collect(
-            plugin_main.MemoryPlugin.cmd_clear,
-            plugin,
-            _Event(f"memory clear --all --confirm {confirm}", admin=True),
-        )
-        self.assertEqual(result, ["已清空全部 4 条记忆"])
-        self.assertTrue(manager.cleared)
+        self.assertEqual(result[-1], "确认超时，操作未执行")
 
     async def test_memory_update_uses_owner_authorization(self):
         class Manager:
@@ -467,6 +619,9 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
             async def get_kb_id_by_name(self, name):
                 return "source-id"
 
+            async def count_kb_memory_records_by_name(self, name):
+                return 2
+
             async def rebuild_memories(self, target_kb_name=None):
                 return {
                     "status": "completed",
@@ -480,9 +635,6 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
                     "migration_committed": False,
                 }
 
-        confirm_code = plugin_main._confirmation_code(
-            "rebuild", "source:source-id:source-id"
-        )
         for verification in (
             {"passed": True, "expected": 2, "actual": 2},
             {"passed": False, "expected": 2, "actual": 1, "diff": -1},
@@ -495,7 +647,10 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
                 result = await _collect(
                     plugin_main.MemoryPlugin.cmd_rebuild,
                     plugin,
-                    _Event(f"memory rebuild --confirm {confirm_code}", admin=True),
+                    _Event("memory rebuild", admin=True),
+                    plugin_main.ConfirmationResult(
+                        "confirmed", _Event("确认", admin=True)
+                    ),
                 )
 
                 self.assertIn("!memory rebuild --clear-cache", result[-1])

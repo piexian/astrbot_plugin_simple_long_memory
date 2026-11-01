@@ -84,9 +84,9 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 /memory stats [--all]                                      - 查看记忆统计
 /memory test [purge|extract|organizer|analyst|reviewer|cycle]     - 管理员测试（后台项固定 dry-run）
 /memory forget <URI> [--user <用户ID>]                    - 删除指定记忆
-/memory clear [--all|--user <用户ID>] [--confirm <确认码>]  - 清空记忆（默认本人；管理员可指定用户或全部）
-/memory rebuild [--to <知识库名>] [--confirm <确认码>]     - 重建或迁移记忆（管理员）
-/memory rebuild --clear-cache [--confirm <确认码>]        - 清理重建缓存（管理员）
+/memory clear [--all|--user <用户ID>]                     - 清空记忆（默认本人；管理员可指定用户或全部）
+/memory rebuild [--to <知识库名>]                          - 重建或迁移记忆（管理员）
+/memory rebuild --clear-cache                           - 清理重建缓存（管理员）
 /memory review [list|approve <ID>|reject <ID>|clear]       - 处理后台待审队列（管理员）
 ```
 
@@ -105,9 +105,9 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | `stats` | `[--all]` | 无参数时统计当前用户；`--all` 统计全部用户，管理员专用；不接受位置参数。 |
 | `test` | `[purge\|extract\|organizer\|analyst\|reviewer\|cycle]` | 无子参数执行真实记忆写入、召回、删除测试；指定后台阶段时固定 dry-run；管理员专用。 |
 | `forget` | `<URI>`、`[--user <用户ID>]` | URI 必填；普通用户只能删除自己的 URI；管理员不带 `--user` 按 URI 删除全部匹配记录，带 `--user` 只删除指定用户记录。 |
-| `clear` | `[--all\|--user <用户ID>]`、`[--confirm <确认码>]` | 默认清空当前用户；普通用户仅能清空自己的记忆（`--user` 只能填本人 ID）；`--all` 清空全部用户、`--user` 指定他人仅管理员可用；两者互斥。首次执行不带确认码只显示影响数量和确认命令。 |
-| `rebuild` | `[--to <知识库名>]`、`[--confirm <确认码>]` | 不带 `--to` 原地重建当前知识库；带 `--to` 迁移到目标知识库；首次执行不带确认码只预览，不会执行。 |
-| `rebuild --clear-cache` | `[--confirm <确认码>]` | 清理中断重建的 KV 缓存；不能与 `--to` 同时使用；重建进行中禁止清理。 |
+| `clear` | `[--all\|--user <用户ID>]` | 默认清空当前用户；普通用户仅能清空自己的记忆（`--user` 只能填本人 ID）；`--all` 清空全部用户、`--user` 指定他人仅管理员可用；两者互斥。执行后先预览影响数量，在本会话回复“确认”执行、“取消”放弃，60 秒内有效；确认时复核数量，变化则需重新预览。 |
+| `rebuild` | `[--to <知识库名>]` | 不带 `--to` 原地重建当前知识库；带 `--to` 迁移到目标知识库；目标已有记忆时直接拒绝。执行前预览，在本会话回复“确认”执行；确认时复核知识库状态，变化则需重新预览。 |
+| `rebuild --clear-cache` | 无 | 清理中断重建的 KV 缓存；不能与 `--to` 同时使用；重建进行中禁止清理。 |
 | `review` | `[list\|approve <ID>\|reject <ID>\|clear]` | 不带参数等同 `list`；`approve` 执行对应操作后标记已批准；`reject` 标记废案；`clear` 清空待审队列；管理员专用。 |
 
 #### 命令示例
@@ -128,8 +128,8 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 /memory review clear
 ```
 
-#### 确认码
-`clear`、`rebuild` 和 `rebuild --clear-cache` 的确认码不是固定文本。先执行不带 `--confirm` 的命令，插件会根据当前操作目标生成确认命令；只有复制该次预览中的确认码，且预览状态未变化时才会执行。
+#### 会话内确认
+`clear`、`rebuild` 和 `rebuild --clear-cache` 执行前先输出预览，随后在原会话等待原发送者回复：60 秒内发送“确认”执行，发送“取消”放弃，其他输入会收到重发提示；超时或取消均不执行。预览到确认之间目标数量或知识库状态变化时，需重新预览。同一会话同一时间只保留一个待确认操作。
 
 
 ### 群聊场景
