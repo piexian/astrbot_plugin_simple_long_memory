@@ -156,13 +156,16 @@ async def _noop(*args, **kwargs):
 
 
 class InjectShortCircuitTests(unittest.IsolatedAsyncioTestCase):
-    def _plugin(self, has_any: bool):
+    def _plugin(self, has_any: bool, contact_summary=""):
         optimize_calls = []
         recall_calls = []
 
         class Manager:
             async def has_any_active_memory(self):
                 return has_any
+
+            async def get_contact_summary(self, event):
+                return contact_summary
 
             async def recall_memories(self, **kwargs):
                 recall_calls.append(kwargs)
@@ -180,6 +183,7 @@ class InjectShortCircuitTests(unittest.IsolatedAsyncioTestCase):
             _maybe_consolidate_memories=_noop,
             _accumulate_request_snapshot=lambda event, request: None,
             _optimize_recall_query=optimize,
+            _maybe_observe_contact=_noop,
         )
         return plugin, optimize_calls, recall_calls
 
@@ -189,6 +193,19 @@ class InjectShortCircuitTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin_main.MemoryPlugin.inject_memories(plugin, _Event("你好"), request)
 
+        self.assertEqual(optimize_calls, [])
+        self.assertEqual(recall_calls, [])
+
+    async def test_contact_summary_is_injected_when_memory_pool_is_empty(self):
+        summary = "<contact_history_info>曾在 1 群见过</contact_history_info>"
+        plugin, optimize_calls, recall_calls = self._plugin(
+            has_any=False, contact_summary=summary
+        )
+        request = SimpleNamespace(prompt="还记得我吗", contexts=[])
+
+        await plugin_main.MemoryPlugin.inject_memories(plugin, _Event("你好"), request)
+
+        self.assertEqual(request.contexts[0]["content"], summary)
         self.assertEqual(optimize_calls, [])
         self.assertEqual(recall_calls, [])
 

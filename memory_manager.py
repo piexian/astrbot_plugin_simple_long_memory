@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import math
 import time
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
 
+from .contact_index import ContactIndex, ContactObservation
 from .maintenance.links import MemoryLinkManager
 from .memory_protocol import (
     MemoryMetadata,
@@ -232,6 +234,7 @@ class MemoryManager:
         self._kv_delete = kv_delete
         # 关联表管理器（connect_kb 后初始化）
         self._link_manager: MemoryLinkManager | None = None
+        self._contact_index: ContactIndex | None = None
         self._last_active_memory_stats: dict[str, Any] = {}
 
     # ---------- public state accessors ----------
@@ -254,6 +257,128 @@ class MemoryManager:
     def link_manager(self) -> MemoryLinkManager | None:
         """关联表管理器（KB 连接后可用）"""
         return self._link_manager
+
+    async def observe_contact(self, event: AstrMessageEvent) -> bool:
+        """从当前消息事件写入一条结构化接触事实。"""
+        if not self._contact_index:
+            return False
+        try:
+            parsed = UMOInfo.parse(event.unified_msg_origin)
+            sender_id = str(event.get_sender_id() or "").strip()
+            platform_id = parsed.platform_id or str(event.get_platform_id() or "")
+            bot_id = str(event.get_self_id() or "").strip()
+            if not parsed.is_valid or not sender_id or not platform_id:
+                return False
+            if bot_id and sender_id == bot_id:
+                return False
+            group = getattr(getattr(event, "message_obj", None), "group", None)
+            group_id = str(event.get_group_id() or "").strip()
+            item = ContactObservation(
+                platform_id=platform_id,
+                bot_id=bot_id[:128],
+                user_id=build_user_id(platform_id, sender_id),
+                umo=event.unified_msg_origin,
+                session_type=parsed.session_type,
+                group_id=group_id[:128],
+                group_name=" ".join(
+                    str(getattr(group, "group_name", "") or "").split()
+                )[:120],
+                sender_name=" ".join(str(event.get_sender_name() or "").split())[:120],
+            )
+            return await self._contact_index.observe(item)
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 接触事件记录失败: {e}")
+            return False
+
+    async def get_contact_summary(self, event: AstrMessageEvent) -> str:
+        """返回当前用户的简短已知接触摘要。"""
+        if not self._contact_index or not self.config.get("global_memory", True):
+            return ""
+        try:
+            parsed = UMOInfo.parse(event.unified_msg_origin)
+            sender_id = str(event.get_sender_id() or "").strip()
+            if not parsed.is_valid or not sender_id:
+                return ""
+            records = await self._contact_index.list_user_records(
+                platform_id=parsed.platform_id,
+                bot_id=str(event.get_self_id() or ""),
+                user_id=build_user_id(parsed.platform_id, sender_id),
+                include_other_bots=bool(
+                    self.config.get("share_contacts_across_bots", False)
+                ),
+                limit=4,
+            )
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 接触摘要查询失败: {e}")
+            return ""
+        labels = []
+        for record in records:
+            if record["session_type"] == "group":
+                label = record["group_name"] or record["group_id"] or "群聊"
+            elif record["session_type"] == "private":
+                label = "私聊"
+            else:
+                label = record["session_type"] or "其他会话"
+            labels.append(html.escape(str(label)[:32], quote=False))
+        labels = list(dict.fromkeys(labels))[:3]
+        if not labels:
+            return ""
+        return (
+            "<contact_history_info>\n"
+            f"[接触记录] 当前用户曾在 {'、'.join(labels)} 与 Bot 有过对话。"
+            "仅表示历史接触，不代表完整群成员关系；仅在相关时参考，不要主动复述。\n"
+            "</contact_history_info>"
+        )
+
+    async def list_contact_records(
+        self,
+        event: AstrMessageEvent,
+        *,
+        scope: str,
+        user_id: str = "",
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """按已授权范围读取接触记录。"""
+        if not self._contact_index:
+            return []
+        parsed = UMOInfo.parse(event.unified_msg_origin)
+        if not parsed.is_valid:
+            return []
+        include_other_bots = bool(self.config.get("share_contacts_across_bots", False))
+        bot_id = str(event.get_self_id() or "")
+        if scope == "current_group":
+            if not parsed.is_group:
+                return []
+            return await self._contact_index.list_group_records(
+                platform_id=parsed.platform_id,
+                bot_id=bot_id,
+                umo=event.unified_msg_origin,
+                include_other_bots=include_other_bots,
+                limit=limit,
+            )
+        if scope == "self":
+            sender_id = str(event.get_sender_id() or "").strip()
+            target_user_id = build_user_id(parsed.platform_id, sender_id)
+            umo = (
+                ""
+                if self.config.get("global_memory", True)
+                else event.unified_msg_origin
+            )
+        elif scope == "user":
+            target_user_id = user_id.strip()
+            umo = ""
+        else:
+            raise ValueError(f"未知联系人范围: {scope}")
+        if not target_user_id:
+            return []
+        return await self._contact_index.list_user_records(
+            platform_id=parsed.platform_id,
+            bot_id=bot_id,
+            user_id=target_user_id,
+            include_other_bots=include_other_bots,
+            umo=umo,
+            limit=limit,
+        )
 
     @property
     def last_active_memory_stats(self) -> dict[str, Any]:
@@ -319,6 +444,9 @@ class MemoryManager:
         # 初始化关联表
         self._link_manager = MemoryLinkManager(self.vec_db)
         await self._link_manager.ensure_table()
+
+        self._contact_index = ContactIndex(self.vec_db)
+        await self._contact_index.ensure_table()
 
     async def _migrate_patch_chunk_index(self) -> None:
         """迁移补丁：为缺少 chunk_index 字段的旧记忆条目写入默认值 0。
@@ -2609,7 +2737,13 @@ class MemoryManager:
             include_deprecated=True,
         )
         scope = "全部" if all_users else filters.get("user_id", "unknown")
-        return await self._clear_by_filters(filters, scope_label=scope)
+        count = await self._clear_by_filters(filters, scope_label=scope)
+        if domain is None and self._contact_index:
+            if all_users:
+                await self._contact_index.clear_all()
+            else:
+                await self._contact_index.clear_user(str(filters.get("user_id") or ""))
+        return count
 
     async def count_clear_memories(
         self,
@@ -3383,9 +3517,12 @@ class MemoryManager:
         }
         if domain:
             filters["domain"] = domain
-        return await self._clear_by_filters(
+        count = await self._clear_by_filters(
             filters, scope_label=f"管理员清空用户 {target_user_id}"
         )
+        if domain is None and self._contact_index:
+            await self._contact_index.clear_user(target_user_id)
+        return count
 
     async def count_clear_memories_by_user(
         self,
