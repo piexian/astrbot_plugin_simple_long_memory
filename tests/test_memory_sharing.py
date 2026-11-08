@@ -211,6 +211,37 @@ class SharingReadTests(unittest.IsolatedAsyncioTestCase):
                 await mgr._inject_linked_memories([memory(scope="global")], Event()), []
             )
 
+    async def test_shared_personal_forget_requires_primary_owner(self):
+        shared = memory(
+            owner="sl_alice",
+            visibility="group",
+            owner_user_ids=["sl_alice", "sl_bob"],
+            kb_doc_id="doc-shared",
+        )
+        mgr = MemoryManager(None, {"global_memory": True})
+        mgr._kb_helper = SimpleNamespace(
+            vec_db=SimpleNamespace(
+                document_storage=SimpleNamespace(
+                    get_documents=AsyncMock(return_value=[shared])
+                )
+            )
+        )
+        mgr._delete_by_filters = AsyncMock(return_value=0)
+
+        secondary_result = await mgr.forget_memory(Event(), "facts://coffee")
+
+        self.assertEqual(secondary_result, 0)
+        self.assertEqual(mgr._delete_by_filters.await_count, 1)
+
+        mgr._delete_by_filters.reset_mock()
+        mgr._delete_by_filters.side_effect = [0, 1]
+        primary_result = await mgr.forget_memory(
+            Event(sender="alice"), "facts://coffee"
+        )
+
+        self.assertEqual(primary_result, 1)
+        self.assertEqual(mgr._delete_by_filters.await_count, 2)
+
     async def test_membership_query_filters_before_limit_and_rechecks_switches(self):
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine

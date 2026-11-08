@@ -19,6 +19,7 @@ import math
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -209,6 +210,14 @@ def _debug_memory_summary(memory: dict[str, Any]) -> dict[str, Any]:
         "relation_types": metadata.get("_linked_relation_types", []),
         **_debug_content_summary(body),
     }
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryClearResult:
+    """全量清空结果，区分记忆删除与接触记录清理失败。"""
+
+    memory_count: int
+    contact_cleanup_failed: bool = False
 
 
 class MemoryManager:
@@ -447,6 +456,15 @@ class MemoryManager:
 
         self._contact_index = ContactIndex(self.vec_db)
         await self._contact_index.ensure_table()
+
+    async def cleanup_orphan_links(self) -> int:
+        """在中断重建恢复完成后清理真正缺失端点的关联。"""
+        if not self._link_manager:
+            return 0
+        removed = await self._link_manager.cleanup_orphan_links()
+        if removed:
+            logger.info(f"[简单长期记忆] 已清理 {removed} 条孤儿关联")
+        return removed
 
     async def _migrate_patch_chunk_index(self) -> None:
         """迁移补丁：为缺少 chunk_index 字段的旧记忆条目写入默认值 0。
@@ -2478,13 +2496,15 @@ class MemoryManager:
             },
             limit=20,
         )
+        current_user = self._current_owner_user_id(event)
         for doc in shared_docs:
             metadata = _safe_parse_metadata(doc.get("metadata", {}))
-            if self._is_visible_shared_personal(event, metadata):
-                return await self._delete_by_filters(
-                    {"uri": uri, "kb_doc_id": metadata.get("kb_doc_id", "")},
-                    uri,
-                )
+            if metadata.get("owner_user_id") != current_user:
+                continue
+            return await self._delete_by_filters(
+                {"uri": uri, "kb_doc_id": metadata.get("kb_doc_id", "")},
+                uri,
+            )
         return 0
 
     async def forget_memory_by_uri(self, uri: str) -> int:
@@ -2719,7 +2739,7 @@ class MemoryManager:
         event: AstrMessageEvent,
         domain: str | None = None,
         all_users: bool = False,
-    ) -> int:
+    ) -> MemoryClearResult:
         """清空记忆
 
         Args:
@@ -2728,7 +2748,7 @@ class MemoryManager:
             all_users: 为 True 时清空所有用户记忆
 
         Returns:
-            删除的记忆数量
+            记忆清空结果
         """
         filters = self._build_query_filter(
             event,
@@ -2738,12 +2758,16 @@ class MemoryManager:
         )
         scope = "全部" if all_users else filters.get("user_id", "unknown")
         count = await self._clear_by_filters(filters, scope_label=scope)
+        contact_cleanup_failed = False
         if domain is None and self._contact_index:
             if all_users:
-                await self._contact_index.clear_all()
+                contact_count = await self._contact_index.clear_all()
             else:
-                await self._contact_index.clear_user(str(filters.get("user_id") or ""))
-        return count
+                contact_count = await self._contact_index.clear_user(
+                    str(filters.get("user_id") or "")
+                )
+            contact_cleanup_failed = contact_count is None
+        return MemoryClearResult(count, contact_cleanup_failed)
 
     async def count_clear_memories(
         self,
@@ -3500,7 +3524,7 @@ class MemoryManager:
         event: AstrMessageEvent,
         target_user_id: str,
         domain: str | None = None,
-    ) -> int:
+    ) -> MemoryClearResult:
         """按 user_id 清空指定用户全部记忆
 
         Args:
@@ -3509,7 +3533,7 @@ class MemoryManager:
             domain: 仅清空指定域的记忆（可选）
 
         Returns:
-            删除的记忆数量
+            记忆清空结果
         """
         filters: dict[str, Any] = {
             "user_id": target_user_id,
@@ -3520,9 +3544,11 @@ class MemoryManager:
         count = await self._clear_by_filters(
             filters, scope_label=f"管理员清空用户 {target_user_id}"
         )
+        contact_cleanup_failed = False
         if domain is None and self._contact_index:
-            await self._contact_index.clear_user(target_user_id)
-        return count
+            contact_count = await self._contact_index.clear_user(target_user_id)
+            contact_cleanup_failed = contact_count is None
+        return MemoryClearResult(count, contact_cleanup_failed)
 
     async def count_clear_memories_by_user(
         self,

@@ -1,5 +1,6 @@
 """接触记录存储与隔离测试。"""
 
+import asyncio
 import importlib
 import unittest
 from types import SimpleNamespace
@@ -23,6 +24,43 @@ class _DocumentStorage:
 
     def get_session(self):
         return AsyncSession(self.engine, expire_on_commit=False)
+
+
+class _PausingStorage:
+    """在首个事务语句后暂停，制造观察与清空交错。"""
+
+    def __init__(self, storage, entered, release):
+        self.storage = storage
+        self.entered = entered
+        self.release = release
+        self.paused = False
+
+    def get_session(self):
+        return _PausingSession(self)
+
+
+class _PausingSession:
+    def __init__(self, storage):
+        self.storage = storage
+        self.session = storage.storage.get_session()
+
+    async def __aenter__(self):
+        await self.session.__aenter__()
+        return self
+
+    async def __aexit__(self, *args):
+        return await self.session.__aexit__(*args)
+
+    def begin(self):
+        return self.session.begin()
+
+    async def execute(self, *args):
+        result = await self.session.execute(*args)
+        if not self.storage.paused:
+            self.storage.paused = True
+            self.storage.entered.set()
+            await self.storage.release.wait()
+        return result
 
 
 def _observation(
@@ -234,13 +272,14 @@ class ContactIndexTests(unittest.IsolatedAsyncioTestCase):
         retained = await self.index.list_user_records(
             platform_id="test", bot_id="bot-a", user_id="test_42"
         )
-        await manager.clear_memories(event)
+        clear_result = await manager.clear_memories(event)
         cleared = await self.index.list_user_records(
             platform_id="test", bot_id="bot-a", user_id="test_42"
         )
 
         self.assertEqual(len(retained), 1)
         self.assertEqual(cleared, [])
+        self.assertFalse(clear_result.contact_cleanup_failed)
 
     async def test_admin_target_clear_uses_canonical_user_id(self):
         manager = MemoryManager(kb_mgr=None, config={})
@@ -376,6 +415,44 @@ class ContactIndexTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.observe_contact.await_count, 2)
 
+    async def test_clear_reports_contact_cleanup_failure(self):
+        manager = MemoryManager(kb_mgr=None, config={})
+        manager._contact_index = SimpleNamespace(
+            clear_user=AsyncMock(return_value=None)
+        )
+        manager._clear_by_filters = AsyncMock(return_value=1)
+
+        result = await manager.clear_memories(_ContactEvent())
+
+        self.assertEqual(result.memory_count, 1)
+        self.assertTrue(result.contact_cleanup_failed)
+
+    async def test_clear_waits_for_in_flight_observation(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_storage = self.index._vec_db.document_storage
+        self.index._vec_db.document_storage = _PausingStorage(
+            original_storage, entered, release
+        )
+        observe_task = asyncio.create_task(self.index.observe(_observation()))
+        clear_task = None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            clear_task = asyncio.create_task(self.index.clear_user("test_42"))
+            await asyncio.sleep(0)
+            self.assertFalse(clear_task.done())
+        finally:
+            release.set()
+
+        self.assertTrue(await asyncio.wait_for(observe_task, timeout=2))
+        self.assertEqual(await asyncio.wait_for(clear_task, timeout=2), 1)
+        self.assertEqual(
+            await self.index.list_user_records(
+                platform_id="test", bot_id="bot-a", user_id="test_42"
+            ),
+            [],
+        )
+
     async def test_storage_failures_degrade_to_empty_results(self):
         class BrokenStorage:
             def get_session(self):
@@ -390,7 +467,7 @@ class ContactIndexTests(unittest.IsolatedAsyncioTestCase):
             ),
             [],
         )
-        self.assertEqual(await broken.clear_all(), 0)
+        self.assertIsNone(await broken.clear_all())
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -59,6 +60,7 @@ class ContactIndex:
     def __init__(self, vec_db: Any) -> None:
         self._vec_db = vec_db
         self._initialized = False
+        self._write_lock = asyncio.Lock()
 
     async def ensure_table(self) -> bool:
         """幂等创建接触表与索引。"""
@@ -100,7 +102,11 @@ class ContactIndex:
         }
         try:
             doc_storage = self._vec_db.document_storage
-            async with doc_storage.get_session() as session, session.begin():
+            async with (
+                self._write_lock,
+                doc_storage.get_session() as session,
+                session.begin(),
+            ):
                 from sqlalchemy import text as sa_text
 
                 await session.execute(
@@ -225,29 +231,35 @@ class ContactIndex:
             logger.debug(f"[简单长期记忆] 接触记录查询失败: {e}")
             return []
 
-    async def clear_user(self, user_id: str) -> int:
-        """删除指定用户在全部会话和 Bot 下的接触记录。"""
-        if not self._initialized or not user_id:
+    async def clear_user(self, user_id: str) -> int | None:
+        """删除用户接触记录；失败或存储不可用时返回 None。"""
+        if not self._initialized:
+            return None
+        if not user_id:
             return 0
         return await self._delete(
             "DELETE FROM contact_observations WHERE user_id = :user_id",
             {"user_id": user_id},
         )
 
-    async def clear_all(self) -> int:
-        """删除全部接触记录。"""
+    async def clear_all(self) -> int | None:
+        """删除全部接触记录；失败或存储不可用时返回 None。"""
         if not self._initialized:
-            return 0
+            return None
         return await self._delete("DELETE FROM contact_observations", {})
 
-    async def _delete(self, statement: str, params: dict[str, Any]) -> int:
+    async def _delete(self, statement: str, params: dict[str, Any]) -> int | None:
         try:
             doc_storage = self._vec_db.document_storage
-            async with doc_storage.get_session() as session, session.begin():
+            async with (
+                self._write_lock,
+                doc_storage.get_session() as session,
+                session.begin(),
+            ):
                 from sqlalchemy import text as sa_text
 
                 result = await session.execute(sa_text(statement), params)
                 return max(0, result.rowcount or 0)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 接触记录清理失败: {e}")
-            return 0
+            return None

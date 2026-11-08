@@ -2,6 +2,8 @@
 
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from maintenance.agents.analyst import AnalystAgent
 from maintenance.agents.reviewer import ReviewerAgent
@@ -277,6 +279,129 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
         await runner._flush_pending_review([(op, {"reason": "x"})], "s2")
         queue = kv.store["maintenance_pending_review"]
         self.assertEqual(len(queue), 1)
+
+    async def test_pending_review_log_omits_reason_and_operation_content(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        report = MaintenanceReport(
+            session_id="sensitive-log-test",
+            extract_manifest=AgentManifest(
+                agent_type="extract",
+                parsed=True,
+                operations=[
+                    {
+                        "type": "create",
+                        "content": "private-memory-body",
+                    }
+                ],
+            ),
+            reviewer_verdicts=[
+                {
+                    "index": 0,
+                    "verdict": "reject",
+                    "needs_human_review": True,
+                    "reason": "sensitive-review-reason",
+                }
+            ],
+        )
+
+        with self.assertLogs(level="INFO") as captured:
+            await runner._execute_operations(report)
+
+        output = "\n".join(captured.output)
+        self.assertNotIn("private-memory-body", output)
+        self.assertNotIn("sensitive-review-reason", output)
+        self.assertIn("index=0", output)
+        self.assertIn("type=create", output)
+        self.assertEqual(len(kv.store["maintenance_pending_review"]), 1)
+        self.assertEqual(
+            kv.store["maintenance_pending_review"][0]["verdict_reason"],
+            "sensitive-review-reason",
+        )
+
+    async def test_execution_error_log_omits_content_and_exception_message(self):
+        runner = self._runner(_FakeKV())
+        runner._execute_create = AsyncMock(
+            side_effect=RuntimeError("sensitive-database-details")
+        )
+
+        with self.assertLogs(level="WARNING") as captured:
+            result = await runner._execute_operation(
+                {"type": "create", "content": "private-memory-body"}
+            )
+
+        output = "\n".join(captured.output)
+        self.assertFalse(result)
+        self.assertNotIn("private-memory-body", output)
+        self.assertNotIn("sensitive-database-details", output)
+        self.assertIn("type=create", output)
+        self.assertIn("error_type=RuntimeError", output)
+
+    async def test_reviewer_disabled_ack_error_is_sanitized_in_report(self):
+        runner = self._runner(_FakeKV(), {"maintenance_reviewer_enabled": False})
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock(
+            side_effect=RuntimeError("sensitive-ack-details")
+        )
+        report = MaintenanceReport(
+            session_id="ack-log-test",
+            extract_manifest=AgentManifest(
+                agent_type="extract",
+                parsed=True,
+                operations=[{"type": "create", "content": "private-memory-body"}],
+            ),
+        )
+
+        await runner._execute_operations(report)
+
+        self.assertEqual(report.errors, ["op[0] create: RuntimeError"])
+        self.assertNotIn("sensitive-ack-details", str(report.to_dict()))
+
+    async def test_create_error_log_omits_exception_details(self):
+        runner = self._runner(_FakeKV())
+        runner._memory_mgr.store_memory = AsyncMock(
+            side_effect=RuntimeError("sensitive-create-details")
+        )
+        op = {
+            "type": "create",
+            "content": "private-memory-body",
+            "umo": "qq:FriendMessage:u1",
+            "sender_ids": ["u1"],
+            "subject": "u1",
+        }
+
+        with self.assertLogs(level="WARNING") as captured:
+            result = await runner._execute_create(op)
+
+        output = "\n".join(captured.output)
+        self.assertFalse(result)
+        self.assertNotIn("sensitive-create-details", output)
+        self.assertNotIn("private-memory-body", output)
+        self.assertIn("error_type=RuntimeError", output)
+
+    async def test_update_error_log_omits_exception_details(self):
+        runner = self._runner(_FakeKV())
+        runner._memory_mgr.vec_db = SimpleNamespace(
+            document_storage=SimpleNamespace(
+                get_documents=AsyncMock(
+                    return_value=[{"metadata": {"uri": "facts://one"}}]
+                )
+            )
+        )
+        runner._memory_mgr.replace_memory = AsyncMock(
+            side_effect=RuntimeError("sensitive-update-details")
+        )
+
+        with self.assertLogs(level="WARNING") as captured:
+            result = await runner._execute_update(
+                {"uri": "facts://one", "new_content": "private-memory-body"}
+            )
+
+        output = "\n".join(captured.output)
+        self.assertFalse(result)
+        self.assertNotIn("sensitive-update-details", output)
+        self.assertNotIn("private-memory-body", output)
+        self.assertIn("error_type=RuntimeError", output)
 
     async def test_queue_max_drops_overflow(self):
         kv = _FakeKV()
