@@ -50,7 +50,7 @@
     "description": "按人跨会话共享",
     "type": "bool",
     "default": true,
-    "hint": "同一平台实例内，个人记忆跟随本人跨群聊和私聊召回；关闭后仅本会话可见。保留旧配置键，不控制群公共记忆或 global 记忆"
+    "hint": "同一平台实例内，个人记忆跟随本人跨群聊和私聊召回，并允许注入跨会话接触摘要；关闭后仅本会话可见且不注入接触摘要。保留旧配置键，不控制群公共记忆或 global 记忆"
   },
   "share_contacts_across_bots": {
     "description": "跨 Bot 共享接触记录",

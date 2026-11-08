@@ -7,8 +7,9 @@
 - **自动记忆提取**：每隔 N 轮对话自动调用 LLM 从对话中提取值得记忆的信息
 - **记忆注入**：在每次 LLM 请求前，自动召回相关记忆并注入到对话上下文
 - **用户隔离**：通过 `user_id` 实现用户级记忆隔离，互不干扰
+- **跨会话接触记录**：从消息事件记录 Bot 在哪些会话见过用户，辅助跨群聊和私聊巩固印象，不保存消息正文
 - **群聊记忆作用域**：支持群聊场景下的记忆归属区分（个人记忆 vs 群共享记忆）
-- **LLM 工具**：提供 `memory_recall`、`memory_store`、`memory_update`、`memory_forget` 工具供 AI 主动操作
+- **LLM 工具**：提供 `memory_recall`、`memory_store`、`memory_update`、`memory_forget`、`memory_contacts` 工具供 AI 主动操作
 - **用户命令**：通过 `/memory` 指令组管理记忆
 - **知识库管理**：记忆直接存储在 AstrBot 内置知识库中，可在知识库管理界面直接查看、检索、删除记忆
 
@@ -33,7 +34,8 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | auto_memorize | 自动记忆模式开关 | `true` |
 | extraction_interval | 每 N 轮对话触发一次记忆提取 | `20` |
 | extraction_min_content_length | 对话总长度低于此值时跳过提取 | `150` |
-| global_memory | 按人跨会话共享（沿用旧键，仅影响 personal） | `true` |
+| global_memory | 按人跨会话共享 personal 记忆与当前用户接触摘要（沿用旧键） | `true` |
+| share_contacts_across_bots | 同一平台实例内跨 Bot 共享接触记录，仅影响接触索引 | `false` |
 | share_group_across_groups | 同一平台实例内跨群共用 group 记忆，不进入私聊 | `false` |
 | recall_query_max_chars | 召回查询字符上限（128–2048，当前提问优先） | `1200` |
 | recall_timeout_seconds | 召回总预算，含自动注入的查询优化（2–30 秒） | `12` |
@@ -74,6 +76,13 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | context_max_age_days | 对话最大回溯天数 | `7` |
 | persona_mode | 人格加载模式 | `auto` |
 | review_notify_enabled | 待审通知开关 | `true` |
+
+## 接触记录
+
+自动记忆开启时，插件记录 Bot 在哪些会话见过用户，每个用户每个 Bot 最多保留 20 个会话，不保存消息正文。`global_memory` 开启时注入当前发送者的简短接触摘要；`share_contacts_across_bots` 控制同一平台实例内是否跨 Bot 读取。
+
+`memory_contacts` 支持查询本人、当前群已知联系人，或在管理员全局工具开启后由管理员查询指定用户。结果只表示历史接触，不是完整平台通讯录；全量清空记忆时同步清理对应接触记录。
+
 ## 使用方法
 
 ### 用户命令
@@ -105,7 +114,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 | `stats` | `[--all]` | 无参数时统计当前用户；`--all` 统计全部用户，管理员专用；不接受位置参数。 |
 | `test` | `[purge\|extract\|organizer\|analyst\|reviewer\|cycle]` | 无子参数执行真实记忆写入、召回、删除测试；指定后台阶段时固定 dry-run；管理员专用。 |
 | `forget` | `<URI>`、`[--user <用户ID>]` | URI 必填；普通用户只能删除自己的 URI；管理员不带 `--user` 按 URI 删除全部匹配记录，带 `--user` 只删除指定用户记录。 |
-| `clear` | `[--all\|--user <用户ID>]` | 默认清空当前用户；普通用户仅能清空自己的记忆（`--user` 只能填本人 ID）；`--all` 清空全部用户、`--user` 指定他人仅管理员可用；两者互斥。执行后先预览影响数量，在本会话回复“确认”执行、“取消”放弃，60 秒内有效；确认时复核数量，变化则需重新预览。 |
+| `clear` | `[--all\|--user <用户ID>]` | 默认清空当前用户；普通用户仅能清空自己的记忆（`--user` 只能填本人 ID）；`--all` 清空全部用户、`--user` 指定他人仅管理员可用；两者互斥。执行后先预览影响数量，在本会话回复“确认”执行、“取消”放弃，60 秒内有效；确认时复核数量，变化则需重新预览。全量清空会同步删除对应接触记录。 |
 | `rebuild` | `[--to <知识库名>]` | 不带 `--to` 原地重建当前知识库；带 `--to` 迁移到目标知识库；目标已有记忆时直接拒绝。执行前预览，在本会话回复“确认”执行；确认时复核知识库状态，变化则需重新预览。 |
 | `rebuild --clear-cache` | 无 | 清理中断重建的 KV 缓存；不能与 `--to` 同时使用；重建进行中禁止清理。 |
 | `review` | `[list\|approve <ID>\|reject <ID>\|clear]` | 不带参数等同 `list`；`approve` 执行对应操作后标记已批准；`reject` 标记废案；`clear` 清空待审队列；管理员专用。 |
@@ -134,7 +143,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 
 ### 群聊场景
 
-记忆分为以下四种作用域，两个共享开关只改变读取范围，不改变记录归属：
+记忆分为以下四种作用域，记忆的两个共享开关只改变读取范围，不改变记录归属：
 
 | 作用域 | 说明 | 日常例子 |
 |--------|------|----------|
@@ -145,7 +154,7 @@ https://github.com/piexian/astrbot_plugin_simple_long_memory
 
 私聊可召回 global、本人的 personal 和当前私聊的 conversation；group 记忆不进入私聊。
 
-两个共享开关独立，旧 `global_memory=false` 不会因升级被改成开启：
+个人记忆与群公共记忆的共享开关独立，旧 `global_memory=false` 不会因升级被改成开启：
 
 | 按人共享 | 跨群共用 | 可见范围（global 始终保持管理员显式共享语义） |
 |---|---|---|
@@ -195,6 +204,7 @@ AI 可以通过以下工具主动操作记忆：
 
 - `memory_recall(query)` — 搜索长期记忆
 - `memory_store(content, memory_type, disclosure)` — 存储记忆
+- `memory_contacts(user_id, scope, limit)` — 查询已知接触会话或当前群联系人（`scope=self/current_group/user`，跨用户仅管理员）
 - `memory_update(uri, content, disclosure)` — 按 URI 更新记忆内容与触发条件（普通用户仅限自己的记忆；global 记忆仅管理员可改，管理员可跨用户更新）
 - `memory_store_global(content, memory_type, disclosure)` — 存储全局记忆（需开启 `enable_admin_global_memory_tool`，仅管理员可用）
 - `memory_search_admin(query, domain, scope, top_k)` — 搜索所有活跃记忆并返回精确管理目标（需开启 `enable_admin_global_memory_tool`，仅管理员；`domain`、`scope` 可选，`top_k` 为 1-20）
