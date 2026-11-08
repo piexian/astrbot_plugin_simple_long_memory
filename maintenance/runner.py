@@ -505,7 +505,9 @@ class MaintenanceRunner:
                                 )
                         except Exception as e:
                             failed += 1
-                            report.errors.append(f"op[{i}] {op.get('type')}: {e}")
+                            report.errors.append(
+                                f"op[{i}] {op.get('type')}: {type(e).__name__}"
+                            )
                         continue
                     # 其余情况（破坏性操作，或审核员启用但裁决缺失）→ 转待审队列
                     reason = (
@@ -1173,7 +1175,9 @@ class MaintenanceRunner:
             )
             return bool(uri)
         except Exception as e:
-            logger.warning(f"[简单长期记忆] create 写入失败: {e}")
+            logger.warning(
+                "[简单长期记忆] create 写入失败: error_type=%s", type(e).__name__
+            )
             return False
 
     async def _execute_merge(self, op: dict[str, Any]) -> bool:
@@ -1252,7 +1256,9 @@ class MaintenanceRunner:
             )
             return bool(new_uri)
         except Exception as e:
-            logger.warning(f"[简单长期记忆] update 失败: {uri}, {e}")
+            logger.warning(
+                "[简单长期记忆] update 失败: error_type=%s", type(e).__name__
+            )
             return False
 
     async def _execute_new_link(self, op: dict[str, Any]) -> bool:

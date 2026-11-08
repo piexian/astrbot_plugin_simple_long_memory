@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -59,6 +60,7 @@ class ContactIndex:
     def __init__(self, vec_db: Any) -> None:
         self._vec_db = vec_db
         self._initialized = False
+        self._write_lock = asyncio.Lock()
 
     async def ensure_table(self) -> bool:
         """幂等创建接触表与索引。"""
@@ -100,7 +102,11 @@ class ContactIndex:
         }
         try:
             doc_storage = self._vec_db.document_storage
-            async with doc_storage.get_session() as session, session.begin():
+            async with (
+                self._write_lock,
+                doc_storage.get_session() as session,
+                session.begin(),
+            ):
                 from sqlalchemy import text as sa_text
 
                 await session.execute(
@@ -245,7 +251,11 @@ class ContactIndex:
     async def _delete(self, statement: str, params: dict[str, Any]) -> int | None:
         try:
             doc_storage = self._vec_db.document_storage
-            async with doc_storage.get_session() as session, session.begin():
+            async with (
+                self._write_lock,
+                doc_storage.get_session() as session,
+                session.begin(),
+            ):
                 from sqlalchemy import text as sa_text
 
                 result = await session.execute(sa_text(statement), params)

@@ -525,6 +525,7 @@ class MemoryPlugin(Star):
             # KB 已连接（热重载场景），但仍需检查中断恢复
             if self.memory_mgr:
                 await self._recover_interrupted_rebuild()
+                await self.memory_mgr.cleanup_orphan_links()
             return
         connected = False
         try:
@@ -542,6 +543,7 @@ class MemoryPlugin(Star):
             self.memory_mgr = None
             return
 
+        await self.memory_mgr.cleanup_orphan_links()
         await self._start_scheduler()
 
     async def _recover_interrupted_rebuild(self) -> None:

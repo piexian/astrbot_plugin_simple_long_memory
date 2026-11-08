@@ -453,12 +453,18 @@ class MemoryManager:
         # 初始化关联表
         self._link_manager = MemoryLinkManager(self.vec_db)
         await self._link_manager.ensure_table()
-        orphan_links = await self._link_manager.cleanup_orphan_links()
-        if orphan_links:
-            logger.info(f"[简单长期记忆] 已清理 {orphan_links} 条孤儿关联")
 
         self._contact_index = ContactIndex(self.vec_db)
         await self._contact_index.ensure_table()
+
+    async def cleanup_orphan_links(self) -> int:
+        """在中断重建恢复完成后清理真正缺失端点的关联。"""
+        if not self._link_manager:
+            return 0
+        removed = await self._link_manager.cleanup_orphan_links()
+        if removed:
+            logger.info(f"[简单长期记忆] 已清理 {removed} 条孤儿关联")
+        return removed
 
     async def _migrate_patch_chunk_index(self) -> None:
         """迁移补丁：为缺少 chunk_index 字段的旧记忆条目写入默认值 0。
