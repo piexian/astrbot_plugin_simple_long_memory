@@ -225,22 +225,24 @@ class ContactIndex:
             logger.debug(f"[简单长期记忆] 接触记录查询失败: {e}")
             return []
 
-    async def clear_user(self, user_id: str) -> int:
-        """删除指定用户在全部会话和 Bot 下的接触记录。"""
-        if not self._initialized or not user_id:
+    async def clear_user(self, user_id: str) -> int | None:
+        """删除用户接触记录；失败或存储不可用时返回 None。"""
+        if not self._initialized:
+            return None
+        if not user_id:
             return 0
         return await self._delete(
             "DELETE FROM contact_observations WHERE user_id = :user_id",
             {"user_id": user_id},
         )
 
-    async def clear_all(self) -> int:
-        """删除全部接触记录。"""
+    async def clear_all(self) -> int | None:
+        """删除全部接触记录；失败或存储不可用时返回 None。"""
         if not self._initialized:
-            return 0
+            return None
         return await self._delete("DELETE FROM contact_observations", {})
 
-    async def _delete(self, statement: str, params: dict[str, Any]) -> int:
+    async def _delete(self, statement: str, params: dict[str, Any]) -> int | None:
         try:
             doc_storage = self._vec_db.document_storage
             async with doc_storage.get_session() as session, session.begin():
@@ -250,4 +252,4 @@ class ContactIndex:
                 return max(0, result.rowcount or 0)
         except Exception as e:
             logger.warning(f"[简单长期记忆] 接触记录清理失败: {e}")
-            return 0
+            return None

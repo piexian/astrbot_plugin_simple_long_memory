@@ -549,9 +549,17 @@ class MaintenanceRunner:
                                 f"op[{i}] {op.get('type')} 执行返回失败"
                             )
                     except Exception as e:
-                        logger.warning(f"[简单长期记忆] 执行操作失败: {op}, {e}")
+                        logger.warning(
+                            "[简单长期记忆] 执行操作失败: index=%s, type=%s, "
+                            "error_type=%s",
+                            i,
+                            op.get("type"),
+                            type(e).__name__,
+                        )
                         failed += 1
-                        report.errors.append(f"op[{i}] {op.get('type')}: {e}")
+                        report.errors.append(
+                            f"op[{i}] {op.get('type')}: {type(e).__name__}"
+                        )
                 else:
                     # 审核拒绝 → 跳过
                     skipped += 1
@@ -559,8 +567,9 @@ class MaintenanceRunner:
                         # 争议项 → 写入 KV 待审队列
                         pending_items.append((op, verdict))
                         logger.info(
-                            f"[简单长期记忆] 争议项待人工审核: {op.get('type')}, "
-                            f"理由: {verdict.get('reason', '')}"
+                            "[简单长期记忆] 争议项待人工审核: index=%s, type=%s",
+                            i,
+                            op.get("type"),
                         )
                     elif verdict.get("verdict") == "reject":
                         await self._extract_journal.acknowledge(op)
@@ -1088,7 +1097,11 @@ class MaintenanceRunner:
                 logger.warning(f"[简单长期记忆] 未知操作类型: {op_type}")
                 return False
         except Exception as e:
-            logger.warning(f"[简单长期记忆] 执行操作失败: {op_type}, {e}")
+            logger.warning(
+                "[简单长期记忆] 执行操作失败: type=%s, error_type=%s",
+                op_type,
+                type(e).__name__,
+            )
             return False
 
     async def _execute_create(self, op: dict[str, Any]) -> bool:

@@ -234,13 +234,14 @@ class ContactIndexTests(unittest.IsolatedAsyncioTestCase):
         retained = await self.index.list_user_records(
             platform_id="test", bot_id="bot-a", user_id="test_42"
         )
-        await manager.clear_memories(event)
+        clear_result = await manager.clear_memories(event)
         cleared = await self.index.list_user_records(
             platform_id="test", bot_id="bot-a", user_id="test_42"
         )
 
         self.assertEqual(len(retained), 1)
         self.assertEqual(cleared, [])
+        self.assertFalse(clear_result.contact_cleanup_failed)
 
     async def test_admin_target_clear_uses_canonical_user_id(self):
         manager = MemoryManager(kb_mgr=None, config={})
@@ -376,6 +377,18 @@ class ContactIndexTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.observe_contact.await_count, 2)
 
+    async def test_clear_reports_contact_cleanup_failure(self):
+        manager = MemoryManager(kb_mgr=None, config={})
+        manager._contact_index = SimpleNamespace(
+            clear_user=AsyncMock(return_value=None)
+        )
+        manager._clear_by_filters = AsyncMock(return_value=1)
+
+        result = await manager.clear_memories(_ContactEvent())
+
+        self.assertEqual(result.memory_count, 1)
+        self.assertTrue(result.contact_cleanup_failed)
+
     async def test_storage_failures_degrade_to_empty_results(self):
         class BrokenStorage:
             def get_session(self):
@@ -390,7 +403,7 @@ class ContactIndexTests(unittest.IsolatedAsyncioTestCase):
             ),
             [],
         )
-        self.assertEqual(await broken.clear_all(), 0)
+        self.assertIsNone(await broken.clear_all())
 
 
 if __name__ == "__main__":

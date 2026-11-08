@@ -1578,15 +1578,18 @@ class MemoryPlugin(Star):
             return
 
         if args["all"]:
-            count = await self.memory_mgr.clear_memories(event, all_users=True)
-            yield event.plain_result(f"已清空全部 {count} 条记忆")
+            result = await self.memory_mgr.clear_memories(event, all_users=True)
+            message = f"已清空全部 {result.memory_count} 条记忆"
         elif args["user"]:
             target_user_id = args["user"]
-            count = await self.memory_mgr.clear_memories_by_user(event, target_user_id)
-            yield event.plain_result(f"已清空用户 {target_user_id} 的 {count} 条记忆")
+            result = await self.memory_mgr.clear_memories_by_user(event, target_user_id)
+            message = f"已清空用户 {target_user_id} 的 {result.memory_count} 条记忆"
         else:
-            count = await self.memory_mgr.clear_memories(event)
-            yield event.plain_result(f"已清空 {count} 条记忆")
+            result = await self.memory_mgr.clear_memories(event)
+            message = f"已清空 {result.memory_count} 条记忆"
+        if result.contact_cleanup_failed:
+            message += "\n接触记录清理失败；记忆已清空，请查看日志后重试"
+        yield event.plain_result(message)
 
     @memory_group.command("rebuild")
     async def cmd_rebuild(self, event: AstrMessageEvent):

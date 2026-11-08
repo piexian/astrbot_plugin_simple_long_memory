@@ -271,7 +271,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
 
             async def clear_memories_by_user(self, event, target_user_id):
                 self.calls.append(("clear", target_user_id))
-                return 2
+                return memory_manager_module.MemoryClearResult(2)
 
         manager = Manager()
         plugin = SimpleNamespace(
@@ -306,7 +306,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
 
             async def clear_memories(self, event):
                 self.calls.append("clear")
-                return 2
+                return memory_manager_module.MemoryClearResult(2)
 
         manager = Manager()
         plugin = SimpleNamespace(
@@ -322,6 +322,29 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("请在本会话发送", result[0])
         self.assertEqual(result[-1], "已清空 2 条记忆")
         self.assertEqual(manager.calls, ["count", "count", "clear"])
+
+    async def test_clear_command_reports_contact_cleanup_failure(self):
+        class Manager:
+            async def count_clear_memories(self, event):
+                return 2
+
+            async def clear_memories(self, event):
+                return memory_manager_module.MemoryClearResult(
+                    2, contact_cleanup_failed=True
+                )
+
+        plugin = SimpleNamespace(memory_mgr=Manager(), _get_cmd_prefix=lambda: "/")
+        result = await _collect(
+            plugin_main.MemoryPlugin.cmd_clear,
+            plugin,
+            _Event("memory clear"),
+            plugin_main.ConfirmationResult("confirmed", _Event("确认")),
+        )
+
+        self.assertEqual(
+            result[-1],
+            "已清空 2 条记忆\n接触记录清理失败；记忆已清空，请查看日志后重试",
+        )
 
     async def test_legacy_confirm_parameter_is_rejected(self):
         plugin = SimpleNamespace(memory_mgr=object())
@@ -348,7 +371,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
                 return 4
 
             async def clear_memories(self, event, all_users=False):
-                return 4
+                return memory_manager_module.MemoryClearResult(4)
 
         manager = Manager()
         plugin = SimpleNamespace(

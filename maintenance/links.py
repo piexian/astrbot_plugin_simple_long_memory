@@ -251,6 +251,35 @@ class MemoryLinkManager:
             logger.warning(f"[简单长期记忆] 级联删除关联失败: {e}")
             return 0
 
+    async def cleanup_orphan_links(self) -> int:
+        """删除端点文档已不存在的关联，保留指向废弃记忆的关联。"""
+        if not self._initialized:
+            return 0
+        try:
+            doc_storage = self._vec_db.document_storage
+            async with doc_storage.get_session() as session, session.begin():
+                from sqlalchemy import text as sa_text
+
+                result = await session.execute(
+                    sa_text(
+                        """
+                        DELETE FROM memory_links
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM documents
+                            WHERE json_extract(metadata, '$.uri') = memory_links.source_uri
+                        )
+                        OR NOT EXISTS (
+                            SELECT 1 FROM documents
+                            WHERE json_extract(metadata, '$.uri') = memory_links.target_uri
+                        )
+                        """
+                    )
+                )
+                return max(0, result.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 孤儿关联清理失败: {e}")
+            return 0
+
     async def count_links(self) -> int:
         """统计关联总数。"""
         try:
