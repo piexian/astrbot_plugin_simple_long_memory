@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import re
 import shlex
@@ -470,6 +471,8 @@ class MemoryPlugin(Star):
     SNAPSHOT_CLEANUP_INTERVAL = 60
     TTL_EXPIRE_INTERVAL = 3600  # TTL 过期扫描间隔（秒）
     CONSOLIDATION_INTERVAL = 7200  # 记忆巩固扫描间隔（秒）
+    CONTACT_WRITE_INTERVAL = 60
+    CONTACT_WRITE_CACHE_MAX = 10000
     MAX_SESSION_SNAPSHOTS = DEFAULT_MAX_SESSION_SNAPSHOTS
     MAX_SNAPSHOT_CHARS = DEFAULT_MAX_SNAPSHOT_CHARS
 
@@ -483,6 +486,7 @@ class MemoryPlugin(Star):
         self._request_snapshots: dict[str, dict[str, Any]] = {}
         # 每个会话的对话计数器
         self._session_counters: dict[str, int] = {}
+        self._contact_write_times: dict[tuple[str, ...], float] = {}
         self._last_snapshot_cleanup = 0.0
         self._last_ttl_expire = 0.0
         self._last_consolidation = 0.0
@@ -979,6 +983,30 @@ class MemoryPlugin(Star):
 
     # ==================== LLM 钩子 ====================
 
+    async def _maybe_observe_contact(self, event: AstrMessageEvent) -> None:
+        """节流记录当前发送者的接触事实。"""
+        if not self.memory_mgr:
+            return
+        try:
+            key = (
+                str(event.get_platform_id() or ""),
+                str(event.get_self_id() or ""),
+                str(event.get_sender_id() or ""),
+                event.unified_msg_origin,
+            )
+            now = time.monotonic()
+            if (
+                now - self._contact_write_times.get(key, 0.0)
+                < self.CONTACT_WRITE_INTERVAL
+            ):
+                return
+            if len(self._contact_write_times) >= self.CONTACT_WRITE_CACHE_MAX:
+                self._contact_write_times.clear()
+            if await self.memory_mgr.observe_contact(event):
+                self._contact_write_times[key] = now
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 接触记录节流处理失败: {e}")
+
     @filter.on_llm_request()
     async def inject_memories(self, event: AstrMessageEvent, request: ProviderRequest):
         if not self.memory_mgr:
@@ -987,6 +1015,7 @@ class MemoryPlugin(Star):
         if not self.config.get("auto_memorize", True):
             return
 
+        await self._maybe_observe_contact(event)
         # P1 生命周期维护（节流；expire 轻量同步，consolidate 含 LLM 调用后台化以免阻塞用户首轮）
         await self._maybe_expire_stale_memories()
         task = asyncio.create_task(self._maybe_consolidate_memories(event))
@@ -1004,6 +1033,7 @@ class MemoryPlugin(Star):
                 request.prompt or "", contexts, query_max_chars(self.config)
             )
 
+            contact_summary = await self.memory_mgr.get_contact_summary(event)
             logger.debug(
                 "[简单长期记忆] 自动注入查询已构建: contexts=%s, query=%s",
                 len(contexts),
@@ -1016,6 +1046,8 @@ class MemoryPlugin(Star):
                 timeout=max(0.001, deadline - time.monotonic()),
             ):
                 logger.debug("[简单长期记忆] 召回短路: 无活跃记忆, source=auto_inject")
+                if contact_summary:
+                    _inject_memory_context(request, contact_summary)
                 return
 
             # 检索优化：调用 LLM 提炼关键词
@@ -1043,6 +1075,7 @@ class MemoryPlugin(Star):
                 deadline=deadline,
             )
 
+            safe_memory_context = ""
             if memories:
                 # format_memory_for_injection 已返回含 <user_context_reference> 包装的完整字符串
                 safe_memory_context = format_memory_for_injection(
@@ -1050,17 +1083,20 @@ class MemoryPlugin(Star):
                     timezone_name=self._get_display_timezone(),
                     viewer_user_id=self._get_viewer_user_id(event),
                 )
-                if safe_memory_context:
-                    inject_target = _inject_memory_context(request, safe_memory_context)
-                    logger.debug(
-                        "[简单长期记忆] 自动注入完成: target=%s, memory_count=%s, "
-                        "context_len=%s, memories=%s",
-                        inject_target,
-                        len(memories),
-                        len(safe_memory_context),
-                        [_debug_memory_summary(memory) for memory in memories],
-                    )
-
+            injection_content = "\n".join(
+                part for part in (safe_memory_context, contact_summary) if part
+            )
+            if injection_content:
+                inject_target = _inject_memory_context(request, injection_content)
+                logger.debug(
+                    "[简单长期记忆] 自动注入完成: target=%s, memory_count=%s, "
+                    "has_contact_summary=%s, context_len=%s, memories=%s",
+                    inject_target,
+                    len(memories),
+                    bool(contact_summary),
+                    len(injection_content),
+                    [_debug_memory_summary(memory) for memory in memories],
+                )
         except Exception as e:
             logger.warning(f"[简单长期记忆] 注入记忆失败: {e}")
 
@@ -1504,6 +1540,7 @@ class MemoryPlugin(Star):
             "[清空确认]\n"
             f"  范围: {scope}\n"
             f"  预计影响: {preview} 条\n"
+            "  接触记录: 同范围一并清空\n"
             "  请在本会话发送“确认”执行，发送“取消”放弃"
         )
         confirmation = await _wait_for_confirmation(
@@ -2062,6 +2099,92 @@ class MemoryPlugin(Star):
         return "\n".join(report)
 
     # ==================== LLM 工具 ====================
+
+    def _format_contact_records(self, records: list[dict[str, Any]], scope: str) -> str:
+        """格式化已知接触记录，不包含消息正文。"""
+        titles = {
+            "self": "当前用户的已知会话",
+            "current_group": "当前群的已知联系人",
+            "user": "指定用户的已知会话",
+        }
+        lines = [f"[{titles[scope]}；仅为历史接触，不是完整平台通讯录]"]
+        show_bot = bool(self.config.get("share_contacts_across_bots", False))
+        for record in records:
+            user_id = html.escape(str(record["user_id"]), quote=False)
+            sender_name = html.escape(str(record["sender_name"] or ""), quote=False)
+            date = str(record["last_seen_at"] or "")[:10] or "未知"
+            bot_suffix = (
+                f"；bot_id={html.escape(str(record['bot_id']), quote=False)}"
+                if show_bot
+                else ""
+            )
+            if scope == "current_group":
+                display_name = sender_name or user_id
+                lines.append(
+                    f"- {display_name}（{user_id}）；最近接触 {date}{bot_suffix}"
+                )
+                continue
+            if record["session_type"] == "group":
+                label = record["group_name"] or record["group_id"] or "群聊"
+            elif record["session_type"] == "private":
+                label = "私聊"
+            else:
+                label = record["session_type"] or "其他会话"
+            label = html.escape(str(label), quote=False)
+            lines.append(f"- {label}；最近接触 {date}{bot_suffix}")
+        return "<user_history_info>\n" + "\n".join(lines) + "\n</user_history_info>"
+
+    @filter.llm_tool(name="memory_contacts")
+    async def tool_contacts(
+        self,
+        event: AstrMessageEvent,
+        user_id: str = "",
+        scope: str = "self",
+        limit: int = 10,
+    ) -> str:
+        """Query known contact/session observations, not complete platform membership
+
+        Args:
+            user_id(string): canonical user ID, required only when scope is user
+            scope(string): self, current_group, or user
+            limit(int): maximum records to return, from 1 to 20
+        """
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        scope = (scope or "self").lower().strip()
+        valid_scopes = ("current_group", "self", "user")
+        if scope not in valid_scopes:
+            valid = ", ".join(valid_scopes)
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError):
+            return f"Error: limit must be an integer between 1 and 20, got '{limit}'"
+        if not 1 <= limit_value <= 20:
+            return f"Error: limit must be between 1 and 20, got {limit_value}"
+        user_id = (user_id or "").strip()
+        if scope != "user" and user_id:
+            return "Error: user_id is only allowed when scope='user'"
+        if scope == "user":
+            if not self.config.get("enable_admin_global_memory_tool", False):
+                return (
+                    "Administrator memory management tool is disabled in plugin config"
+                )
+            if not event.is_admin():
+                return "Only administrators can query other users' contact records"
+            if not user_id:
+                return "Error: user_id is required when scope='user'"
+        if (
+            scope == "current_group"
+            and not UMOInfo.parse(event.unified_msg_origin).is_group
+        ):
+            return "Error: scope='current_group' requires a group conversation"
+        records = await self.memory_mgr.list_contact_records(
+            event, scope=scope, user_id=user_id, limit=limit_value
+        )
+        if not records:
+            return "No known contact records"
+        return self._format_contact_records(records, scope)
 
     @filter.llm_tool(name="memory_recall")
     async def tool_recall(
