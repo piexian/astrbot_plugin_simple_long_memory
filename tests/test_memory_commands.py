@@ -1,43 +1,9 @@
 import importlib
 import sys
-import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-
-
-class _Logger:
-    def __getattr__(self, name):
-        return lambda *args, **kwargs: None
-
-
-def _identity_decorator(*args, **kwargs):
-    def decorator(func):
-        return func
-
-    return decorator
-
-
-class _Filter:
-    on_astrbot_loaded = staticmethod(_identity_decorator)
-    on_llm_request = staticmethod(_identity_decorator)
-    on_llm_response = staticmethod(_identity_decorator)
-    on_agent_begin = staticmethod(_identity_decorator)
-    on_agent_done = staticmethod(_identity_decorator)
-    llm_tool = staticmethod(_identity_decorator)
-
-    @staticmethod
-    def command_group(*args, **kwargs):
-        def decorator(func):
-            func.command = _identity_decorator
-            return func
-
-        return decorator
-
-
-class _Star:
-    pass
 
 
 class _SessionController:
@@ -70,45 +36,14 @@ class _DrivenSessionWaiter(_SessionWaiter):
         raise TimeoutError
 
 
-def _load_plugin_modules():
-    project_parent = Path(__file__).resolve().parents[2]
-    if str(project_parent) not in sys.path:
-        sys.path.insert(0, str(project_parent))
+_PROJECT_PARENT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_PARENT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_PARENT))
 
-    astrbot_module = types.ModuleType("astrbot")
-    api_module = types.ModuleType("astrbot.api")
-    event_module = types.ModuleType("astrbot.api.event")
-    provider_module = types.ModuleType("astrbot.api.provider")
-    star_module = types.ModuleType("astrbot.api.star")
-    api_util_module = types.ModuleType("astrbot.api.util")
-    api_util_module.SessionController = _SessionController
-    api_util_module.SessionWaiter = _SessionWaiter
-
-    api_module.logger = _Logger()
-    event_module.AstrMessageEvent = type("AstrMessageEvent", (), {})
-    event_module.filter = _Filter()
-    provider_module.LLMResponse = type("LLMResponse", (), {})
-    provider_module.ProviderRequest = type("ProviderRequest", (), {})
-    star_module.Context = type("Context", (), {})
-    star_module.Star = _Star
-
-    modules = {
-        "astrbot": astrbot_module,
-        "astrbot.api": api_module,
-        "astrbot.api.event": event_module,
-        "astrbot.api.provider": provider_module,
-        "astrbot.api.star": star_module,
-        "astrbot.api.util": api_util_module,
-    }
-    with patch.dict(sys.modules, modules):
-        main_module = importlib.import_module("astrbot_plugin_simple_long_memory.main")
-        manager_module = importlib.import_module(
-            "astrbot_plugin_simple_long_memory.memory_manager"
-        )
-    return main_module, manager_module
-
-
-plugin_main, memory_manager_module = _load_plugin_modules()
+plugin_main = importlib.import_module("astrbot_plugin_simple_long_memory.main")
+memory_manager_module = importlib.import_module(
+    "astrbot_plugin_simple_long_memory.memory_manager"
+)
 MemoryManager = memory_manager_module.MemoryManager
 
 
