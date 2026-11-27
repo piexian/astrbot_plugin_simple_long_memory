@@ -1,0 +1,192 @@
+name: Release
+
+# master 检测到 metadata.yaml 新版本时，先校验版本与更新日志，再运行完整 CI 检查，
+# 全部通过后才打包插件 ZIP、创建标签并发布 GitHub Release；任意前置步骤失败即中止发布。
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "metadata.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: 校验版本与更新日志
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      should_release: ${{ steps.ver.outputs.should_release }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: 读取版本并检查是否已发布
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(awk -F': *' '$1 == "version" { gsub(/["'\''[:space:]]/, "", $2); print $2; exit }' metadata.yaml)
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::metadata.yaml 中的 version 格式无效：${TAG:-<空>}"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，跳过自动发布。"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 校验对应版本更新日志存在且非空
+        if: steps.ver.outputs.should_release == 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v tag="${TAG}" -v ver="${VERSION}" '
+            function is_target(line) {
+              sub(/\r$/, "", line)
+              return (line == "## " tag || index(line, "## " tag " ") == 1 || index(line, "## " tag "(") == 1 \
+                   || index(line, "## [" ver "]") == 1 || index(line, "## [" tag "]") == 1)
+            }
+            is_target($0) { found = 1 }
+            found && /^## / && !is_target($0) { exit }
+            found { print }
+          ' CHANGELOG.md > section.md
+          awk -v tag="${TAG}" -v ver="${VERSION}" '
+            function is_target(line) {
+              sub(/\r$/, "", line)
+              return (line == "## " tag || index(line, "## " tag " ") == 1 || index(line, "## " tag "(") == 1 \
+                   || index(line, "## [" ver "]") == 1 || index(line, "## [" tag "]") == 1)
+            }
+            is_target($0) { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > section-body.md
+          if ! test -s section.md || ! grep -q '[^[:space:]]' section-body.md; then
+            echo "::error::CHANGELOG.md 缺少 ${TAG}（或 ${VERSION}）一节或内容为空"
+            exit 1
+          fi
+
+  ci:
+    name: 运行前置检查与测试
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    uses: ./.github/workflows/code-quality.yml
+
+  release:
+    name: 打包、打标签并发布
+    needs:
+      - prepare
+      - ci
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: 提取对应版本更新日志
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v tag="${TAG}" -v ver="${VERSION}" '
+            function is_target(line) {
+              sub(/\r$/, "", line)
+              return (line == "## " tag || index(line, "## " tag " ") == 1 || index(line, "## " tag "(") == 1 \
+                   || index(line, "## [" ver "]") == 1 || index(line, "## [" tag "]") == 1)
+            }
+            is_target($0) { found = 1 }
+            found && /^## / && !is_target($0) { exit }
+            found { print }
+          ' CHANGELOG.md > section.md
+          test -s section.md
+
+      - name: 打包插件 ZIP
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          STAGE=astrbot_plugin_simple_long_memory
+          ZIP_NAME="${STAGE}-${TAG}.zip"
+          rm -rf "$STAGE" "$ZIP_NAME"
+          mkdir -p "$STAGE"
+          cp -r .astrbot-plugin maintenance skills "$STAGE"/
+          find "$STAGE" -type d -name '__pycache__' -exec rm -rf {} +
+          find "$STAGE" -type f -name '*.pyc' -delete
+          cp CHANGELOG.md LICENSE README.md _conf_schema.json logo.png metadata.yaml ./*.py "$STAGE"/
+          zip -qr "$ZIP_NAME" "$STAGE"
+          test -s "$ZIP_NAME"
+
+      - name: 创建并推送版本标签
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TARGET_SHA="${GITHUB_SHA}"
+          REMOTE_SHA=$(git ls-remote origin "refs/tags/${TAG}^{}" "refs/tags/${TAG}" | awk 'NR==1 { first=$1 } /\^\{\}$/ { peeled=$1 } END { print (peeled != "" ? peeled : first) }')
+          if [ -z "$REMOTE_SHA" ]; then
+            git tag "${TAG}" "${TARGET_SHA}"
+            git push origin "refs/tags/${TAG}"
+          elif [ "$REMOTE_SHA" != "$TARGET_SHA" ]; then
+            echo "::error::远程标签 ${TAG} 已存在且指向 ${REMOTE_SHA}，与当前提交 ${TARGET_SHA} 不一致"
+            exit 1
+          else
+            echo "标签 ${TAG} 已指向当前提交 ${TARGET_SHA}，继续发布。"
+          fi
+
+      - name: 生成 PR 与贡献者说明
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/releases/generate-notes" \
+            -f tag_name="${TAG}" \
+            --jq '.body' > whats-new.md
+
+      - name: 组装 Release 正文
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          {
+            cat section.md
+            printf '\n完整记录见 [CHANGELOG](https://github.com/%s/blob/%s/CHANGELOG.md)。\n' "${REPO}" "${TAG}"
+            if grep -q '[^[:space:]]' whats-new.md; then
+              printf '\n'
+              cat whats-new.md
+            fi
+          } > body.md
+
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            "astrbot_plugin_simple_long_memory-${TAG}.zip" \
+            --title "${TAG}" \
+            --notes-file body.md \
+            --verify-tag
