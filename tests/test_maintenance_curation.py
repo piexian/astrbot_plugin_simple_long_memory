@@ -313,7 +313,11 @@ class OrganizerInspectionTests(_RealStackCase):
         )
 
         manifest = await self._organizer(
-            llm, {"maintenance_organizer_batch_size": 1}
+            llm,
+            {
+                "maintenance_organizer_batch_size": 1,
+                "maintenance_organizer_merge_batch_size": 1,
+            },
         ).run()
 
         self.assertEqual(manifest["inspected"], 1)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from pathlib import Path
@@ -91,6 +92,9 @@ def _make_plugin(*, config: dict | None = None, context=None, memory_mgr=None):
     plugin._background_tasks = set()
     plugin._confirmation_waiters = set()
     plugin._scheduler = None
+    plugin._review_lock = asyncio.Lock()
+    plugin.config = plugin_main.build_flat_config_view(plugin.config)
+    plugin._flat_config = plugin.config
     return plugin
 
 
@@ -861,7 +865,15 @@ class MetadataAndI18nSchemaTests(unittest.TestCase):
         self.assertEqual(meta["astrbot_version"], ">=4.29.4")
 
         schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
-        self.assertEqual(schema["review_notify_umo"]["_special"], "umo")
+        maintenance = schema["maintenance"]
+        self.assertEqual(maintenance["type"], "object")
+        self.assertTrue(maintenance["collapsed"])
+        self.assertEqual(maintenance["items"]["review_notify_umo"]["_special"], "umo")
+        visible = {
+            key
+            for key, item in schema.items()
+            if not item.get("invisible") and key != "maintenance"
+        }
 
         for locale in ("zh-CN", "en-US"):
             i18n = json.loads(
@@ -870,10 +882,23 @@ class MetadataAndI18nSchemaTests(unittest.TestCase):
                 )
             )
             cfg = i18n["config"]
-            self.assertEqual(set(cfg.keys()), set(schema.keys()), locale)
-            for key, entry in cfg.items():
-                self.assertTrue(entry.get("description"), f"{locale}:{key}")
-                self.assertTrue(entry.get("hint"), f"{locale}:{key}")
+            self.assertEqual(set(cfg.keys()), visible | {"maintenance"}, locale)
+            group = cfg["maintenance"]
+            self.assertTrue(group.get("description"), locale)
+            self.assertTrue(group.get("hint"), locale)
+            self.assertEqual(
+                set(group.keys()) - {"description", "hint"},
+                set(maintenance["items"].keys()),
+                locale,
+            )
+            for key in visible:
+                self.assertTrue(cfg[key].get("description"), f"{locale}:{key}")
+                self.assertTrue(cfg[key].get("hint"), f"{locale}:{key}")
+            for key, entry in maintenance["items"].items():
+                self.assertTrue(group[key].get("description"), f"{locale}:{key}")
+                self.assertTrue(group[key].get("hint"), f"{locale}:{key}")
+                if "options" in entry:
+                    self.assertEqual(len(entry["options"]), len(group[key]["labels"]))
 
 
 if __name__ == "__main__":

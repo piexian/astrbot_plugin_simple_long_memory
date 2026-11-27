@@ -117,155 +117,193 @@
       "description": "Consolidation Batch Size",
       "hint": "Maximum number of memories processed per consolidation run"
     },
-    "maintenance_enabled": {
-      "description": "Enable Background Maintenance",
-      "hint": "Run scheduled memory maintenance tasks on a cron schedule (uses the maintenance model or default chat model)"
-    },
-    "maintenance_model_id": {
-      "description": "Maintenance Model",
-      "hint": "LLM used by background maintenance agents. A lightweight model is recommended; leave empty to use the default chat LLM"
-    },
-    "maintenance_window": {
-      "description": "Maintenance Time Window",
-      "hint": "Single time such as 03:00 or range such as 02:00-06:00; cron triggers outside this window are skipped with a DEBUG log"
-    },
-    "maintenance_cron": {
-      "description": "Maintenance Cron Expression",
-      "hint": "Standard 5-field cron expression; defaults to 03:00 daily to run the full maintenance pipeline (purge, extract, organizer, analyst, reviewer)"
-    },
-    "maintenance_max_llm_calls": {
-      "description": "Max LLM Calls per Cycle",
-      "hint": "Hard cap on total LLM calls across all agents within a single maintenance cycle"
-    },
-    "maintenance_max_ops_per_cycle": {
-      "description": "Max Operations per Cycle",
-      "hint": "Hard cap on total operations proposed by the organizer and analyst per cycle; excess items are deferred to the next cycle"
-    },
-    "maintenance_analyst_max_new_links": {
-      "description": "Max New Links per Analyst Run",
-      "hint": "Maximum number of new memory links the analyst may propose in one maintenance cycle"
-    },
-    "maintenance_analyst_detect_contradiction": {
-      "description": "Detect Contradictions in Analyst",
-      "hint": "Enable contradiction detection for pairs of conflicting memories during analyst runs"
-    },
-    "maintenance_analyst_max_contradictions": {
-      "description": "Max Contradictions Reported",
-      "hint": "Maximum number of contradictory memory pairs reported by the analyst per cycle"
-    },
-    "maintenance_reviewer_enabled": {
-      "description": "Enable Reviewer",
-      "hint": "Review proposed changes from extraction, organizer, and analyst before execution to prevent accidental deletions or edits"
-    },
-    "maintenance_reviewer_model_id": {
-      "description": "Reviewer Model",
-      "hint": "LLM used to review proposed operations; leave empty to use the global maintenance model"
-    },
-    "maintenance_organizer_enabled": {
-      "description": "Enable Organizer",
-      "hint": "Deduplicate and merge similar memories, refine phrasing, and archive low-value entries"
-    },
-    "maintenance_analyst_enabled": {
-      "description": "Enable Analyst",
-      "hint": "Read recent conversation history to discover implicit links and detect contradictions between memories"
-    },
-    "maintenance_extract_enabled": {
-      "description": "Enable Conversation Extraction",
-      "hint": "During maintenance cycles, segment conversation history into blocks and extract new memories; when off, only existing memories are curated"
-    },
-    "maintenance_segmenter_model_id": {
-      "description": "Segmenter Model",
-      "hint": "LLM used to judge whether a conversation block is complete; falls back to the global maintenance model when empty"
-    },
-    "maintenance_curator_model_id": {
-      "description": "Curator Model",
-      "hint": "LLM used to extract memories from conversation blocks; falls back to the global maintenance model when empty"
-    },
-    "maintenance_segment_time_gap_minutes": {
-      "description": "Segment Time Gap (minutes)",
-      "hint": "Adjacent messages separated by more than this gap are pre-split into different conversation blocks"
-    },
-    "maintenance_segment_max_chars": {
-      "description": "Max Block Characters",
-      "hint": "Maximum characters of a flattened conversation block; beyond this the block rolls into the next segment for re-judgement"
-    },
-    "maintenance_segment_max_extensions": {
-      "description": "Max Segment Extensions",
-      "hint": "Maximum times an incomplete block may absorb following segments before being carried over to the next cycle"
-    },
-    "maintenance_extract_max_blocks_per_cycle": {
-      "description": "Max Blocks per Cycle",
-      "hint": "Maximum conversation blocks the segmenter may emit in one maintenance cycle; the rest is deferred to the next cycle"
-    },
-    "maintenance_extract_llm_budget_ratio": {
-      "description": "Extraction LLM Budget Ratio",
-      "hint": "Share of the per-cycle LLM call limit reserved for conversation extraction (segment + extract); the rest goes to existing-memory curation"
-    },
-    "maintenance_extract_conv2_enabled": {
-      "description": "ConversationV2 Fallback Extraction",
-      "hint": "Conversations without platform message history (e.g. private chats) fall back to LLM conversation records for extraction"
-    },
-    "maintenance_extract_conv2_chunk_messages": {
-      "description": "ConversationV2 Chunk Size",
-      "hint": "ConversationV2 records carry no timestamps; every N messages are cut into one candidate block"
-    },
-    "review_notify_enabled": {
-      "description": "Enable Review Notifications",
-      "hint": "Proactively notify administrators when controversial maintenance operations await approval"
-    },
-    "review_notify_umo": {
-      "description": "Notification Target UMO",
-      "hint": "Select or enter the group or private chat unified_msg_origin for review notifications; leave empty to disable proactive notifications"
-    },
-    "review_notify_schedule": {
-      "description": "Notification Schedule (Reserved)",
-      "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than on a schedule",
-      "labels": ["Daily", "Weekly", "Monthly"]
-    },
-    "review_notify_time": {
-      "description": "Notification Time (Reserved)",
-      "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than at a fixed time"
-    },
-    "maintenance_pending_queue_max": {
-      "description": "Pending Review Queue Limit",
-      "hint": "Maximum pending items kept in the manual review queue; excess items are dropped and logged"
-    },
-    "auto_purge_enabled": {
-      "description": "Auto Purge Deprecated Memories",
-      "hint": "Periodically hard-delete memories marked deprecated past the retention window"
-    },
-    "auto_purge_after_days": {
-      "description": "Purge Grace Period (days)",
-      "hint": "Hard-delete memories marked deprecated for longer than this many days"
-    },
-    "auto_purge_cron": {
-      "description": "Purge Cron Expression",
-      "hint": "Standard 5-field cron expression; defaults to 05:00 daily"
-    },
-    "maintenance_tasks": {
-      "description": "Maintenance Team Orchestration",
-      "hint": "Configure background maintenance roles (organizer, analyst, reviewer) with schedule and behavior"
-    },
-    "context_max_rounds": {
-      "description": "Max Context Rounds",
-      "hint": "Maximum number of conversation turns fetched by the analyst"
-    },
-    "context_max_chars": {
-      "description": "Max Context Characters",
-      "hint": "Maximum total characters of conversation history fetched by the analyst"
-    },
-    "context_max_age_days": {
-      "description": "Max Context Lookback (days)",
-      "hint": "Only fetch conversations from the past N days in the analyst"
-    },
-    "persona_mode": {
-      "description": "Persona Loading Mode",
-      "hint": "auto = extract from default persona, manual = use custom summary below, off = disabled",
-      "labels": ["Auto", "Manual", "Off"]
-    },
-    "persona_summary": {
-      "description": "Custom Persona Summary",
-      "hint": "Used in manual mode to provide conversational context to maintenance agents"
+    "maintenance": {
+      "description": "Background Memory Maintenance",
+      "hint": "Collapsed group: background extraction, existing-memory inspection, relation analysis, review, auto purge, and review notifications. Legacy top-level maintenance_* keys migrate here automatically on first load",
+      "enabled": {
+        "description": "Background Maintenance Switch",
+        "hint": "Run scheduled memory maintenance via cron (requires AstrBot 4.30+ and a maintenance model)"
+      },
+      "model_id": {
+        "description": "Maintenance Model",
+        "hint": "LLM used by background maintenance agents. A lightweight model is recommended; leave empty to use the default chat LLM"
+      },
+      "window": {
+        "description": "Maintenance Time Window",
+        "hint": "Single time such as 03:00 or range such as 02:00-06:00; cron triggers outside this window are skipped with a DEBUG log"
+      },
+      "cron": {
+        "description": "Maintenance Cron Expression",
+        "hint": "Standard 5-field cron expression; defaults to 03:00 daily to run the full maintenance pipeline (purge, extract, organizer, analyst, reviewer)"
+      },
+      "max_llm_calls": {
+        "description": "Max LLM Calls per Cycle",
+        "hint": "Hard cap on total LLM calls across all agents within a single maintenance cycle"
+      },
+      "max_ops_per_cycle": {
+        "description": "Max Operations per Cycle",
+        "hint": "Hard cap on total operations proposed by the organizer and analyst per cycle; excess items are deferred to the next cycle"
+      },
+      "llm_timeout": {
+        "description": "LLM Call Timeout (seconds)",
+        "hint": "Maximum wait time for a single background LLM request"
+      },
+      "pending_queue_max": {
+        "description": "Pending Review Queue Limit",
+        "hint": "Maximum pending items kept in the manual review queue; excess items are dropped and logged"
+      },
+      "extract_enabled": {
+        "description": "Enable Conversation Extraction",
+        "hint": "Slice conversation blocks from the inbox buffer by time windows (pure rules) and extract new memories each cycle; disable to only reorganize existing memories"
+      },
+      "curator_model_id": {
+        "description": "Curator Model",
+        "hint": "LLM used to extract memories from conversation blocks; falls back to the global maintenance model when empty"
+      },
+      "segment_time_gap_minutes": {
+        "description": "Block Time Gap (minutes)",
+        "hint": "Adjacent buffered turns farther apart than this are split into different conversation blocks; pure rules without LLM calls"
+      },
+      "segment_max_chars": {
+        "description": "Block Max Characters",
+        "hint": "Maximum flattened text length of one conversation block before splitting into the next"
+      },
+      "extract_max_blocks_per_cycle": {
+        "description": "Max Blocks per Cycle",
+        "hint": "Maximum conversation blocks extracted in one maintenance cycle; the rest is deferred to the next cycle"
+      },
+      "extract_llm_budget_ratio": {
+        "description": "Extraction LLM Budget Ratio",
+        "hint": "Share of the per-cycle LLM call cap allocated to conversation extraction (gate + extraction); the rest is reserved for existing-memory maintenance"
+      },
+      "organizer_enabled": {
+        "description": "Enable Organizer",
+        "hint": "Merge duplicate memories, run single-item inspections, archive worthless entries, and rewrite them neutrally"
+      },
+      "organizer_model_id": {
+        "description": "Organizer Model",
+        "hint": "LLM used for single-item inspection and cleaning decisions; falls back to the global maintenance model when empty"
+      },
+      "organizer_batch_size": {
+        "description": "Organizer Inspection Batch",
+        "hint": "Maximum memories sampled per cycle for single-item inspection"
+      },
+      "organizer_merge_batch_size": {
+        "description": "Organizer Merge Sampling Limit",
+        "hint": "Maximum memories sampled in the merge similarity pre-screen, independent of the inspection batch"
+      },
+      "analyst_enabled": {
+        "description": "Enable Analyst",
+        "hint": "Classify same-scope memory pairs into merge/link/conflict/none to discover implicit links and contradictions"
+      },
+      "analyst_max_new_links": {
+        "description": "Max New Links per Analyst Run",
+        "hint": "Maximum number of new memory links the analyst may propose in one maintenance cycle"
+      },
+      "analyst_detect_contradiction": {
+        "description": "Detect Contradictions in Analyst",
+        "hint": "Enable contradiction detection for pairs of conflicting memories during analyst runs"
+      },
+      "analyst_max_contradictions": {
+        "description": "Max Contradictions Reported",
+        "hint": "Maximum number of contradictory memory pairs reported by the analyst per cycle"
+      },
+      "analyst_max_merges": {
+        "description": "Max Merges per Analyst Run",
+        "hint": "Maximum number of merge operations the analyst may propose in one maintenance cycle"
+      },
+      "analyst_batch_size": {
+        "description": "Analyst Sampling Limit",
+        "hint": "Maximum memories sampled in the analyst's similarity pre-screen to avoid huge similarity matrices on large knowledge bases"
+      },
+      "reviewer_enabled": {
+        "description": "Enable Reviewer",
+        "hint": "Review proposed changes from the organizer and analyst before execution to prevent accidental deletions or edits"
+      },
+      "reviewer_model_id": {
+        "description": "Reviewer Model",
+        "hint": "LLM used to review proposed operations; leave empty to use the global maintenance model"
+      },
+      "reviewer_prompt_extra": {
+        "description": "Reviewer Extra Prompt",
+        "hint": "Extra rules appended to the reviewer prompt; leave empty to omit"
+      },
+      "verification_max_per_cycle": {
+        "description": "Max Verifications per Cycle",
+        "hint": "Maximum low-confidence operations verified by the controlled verification agent per cycle"
+      },
+      "verification_confidence_threshold": {
+        "description": "Verification Confidence Threshold",
+        "hint": "Operations whose cleaning/classification confidence falls below this go to controlled verification before review"
+      },
+      "auto_purge_enabled": {
+        "description": "Auto Purge Deprecated Memories",
+        "hint": "Periodically hard-delete memories marked deprecated past the retention window"
+      },
+      "auto_purge_after_days": {
+        "description": "Purge Grace Period (days)",
+        "hint": "Hard-delete memories marked deprecated for longer than this many days"
+      },
+      "auto_purge_cron": {
+        "description": "Purge Cron Expression",
+        "hint": "Standard 5-field cron expression; defaults to 05:00 daily"
+      },
+      "review_notify_enabled": {
+        "description": "Enable Review Notifications",
+        "hint": "Proactively notify administrators when controversial maintenance operations await approval"
+      },
+      "review_notify_umo": {
+        "description": "Notification Target UMO",
+        "hint": "Select or enter the group or private chat unified_msg_origin for review notifications; leave empty to disable proactive notifications"
+      },
+      "review_notify_schedule": {
+        "description": "Notification Schedule (Reserved)",
+        "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than on a schedule",
+        "labels": [
+          "Daily",
+          "Weekly",
+          "Monthly"
+        ]
+      },
+      "review_notify_time": {
+        "description": "Notification Time (Reserved)",
+        "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than at a fixed time"
+      },
+      "context_max_rounds": {
+        "description": "Max Conversation Rounds (Reserved)",
+        "hint": "Reserved for compatibility: the pipeline now extracts incrementally from the inbox buffer instead of pulling platform history by rounds"
+      },
+      "context_max_chars": {
+        "description": "Max Characters (Reserved)",
+        "hint": "Reserved for compatibility: the pipeline now extracts incrementally from the inbox buffer instead of pulling platform history by characters"
+      },
+      "context_max_age_days": {
+        "description": "Max Conversation Lookback Days (Reserved)",
+        "hint": "Reserved for compatibility: expired inbox rows are cleaned by the lifecycle instead of looking back through platform history"
+      },
+      "persona_mode": {
+        "description": "Persona Loading Mode",
+        "hint": "auto = extract from default persona, manual = use custom summary below, off = disabled",
+        "labels": [
+          "Auto",
+          "Manual",
+          "Off"
+        ]
+      },
+      "persona_summary": {
+        "description": "Custom Persona Summary",
+        "hint": "Used in manual mode to provide conversational context to maintenance agents"
+      }
+    }
+  },
+  "views": {
+    "memory_review": {
+      "title": "Pending Memory Reviews",
+      "description": "Approve or reject controversial operations from background memory maintenance",
+      "button_approve": "Approve",
+      "button_reject": "Reject",
+      "empty": "No pending review items",
+      "action_failed": "Action failed, please retry"
     }
   }
 }

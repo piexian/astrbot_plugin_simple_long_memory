@@ -18,6 +18,7 @@ import re
 import shlex
 import time
 import weakref
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.api.util import SessionController, SessionWaiter
 
+from .config_compat import build_flat_config_view, migrate_maintenance_config
 from .maintenance.inbox import (
     INBOX_ASSISTANT_BRIEF_MAX_CHARS,
     INBOX_USER_TEXT_MAX_CHARS,
@@ -870,6 +872,73 @@ def _validate_command(
     return None
 
 
+REVIEW_VIEW_NAME = "memory_review"
+"""ChatUI 审核卡片视图名，入口为 views/memory_review/index.html。"""
+
+REVIEW_CARD_SUMMARY_MAX_CHARS = 120
+"""卡片与文本回退中单条待审摘要的截断长度。"""
+
+_UI_ACTION_FILTER = getattr(filter, "ui_action", None)
+"""4.30 的 ui_action 装饰器；4.29 无此 API 时回退为不注册。"""
+
+
+def _ui_action(action_id: str):
+    """按宿主能力注册视图动作回调，低版本直接保留原函数。"""
+    if _UI_ACTION_FILTER is not None:
+        return _UI_ACTION_FILTER(action_id)
+    return lambda awaitable: awaitable
+
+
+def _chatui_view_supported(event: AstrMessageEvent) -> bool:
+    """当前平台是否支持 ChatUI 卡片，且事件带 4.30 的 view_result 方法。"""
+    return callable(getattr(event, "view_result", None)) and bool(
+        getattr(event.platform_meta, "support_ui_interaction", False)
+    )
+
+
+def _review_item_summary(op: dict[str, Any]) -> str:
+    """从待审操作提取一句安全摘要，覆盖 create/update/merge/link 等操作字段。"""
+    for key in ("content", "new_content", "merged_content"):
+        value = str(op.get(key) or "").strip()
+        if value:
+            return value[:REVIEW_CARD_SUMMARY_MAX_CHARS]
+    parts = [
+        str(op.get(key) or "").strip()
+        for key in ("uri", "old_uri", "new_uri", "source", "target")
+    ]
+    uris = op.get("uris")
+    if isinstance(uris, list):
+        parts.extend(str(uri).strip() for uri in uris if str(uri).strip())
+    parts.append(str(op.get("reason") or "").strip()[:60])
+    return " ".join(part for part in parts if part)[:REVIEW_CARD_SUMMARY_MAX_CHARS]
+
+
+def _review_card_data(
+    pending: list[dict[str, Any]],
+    *,
+    notice: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    """构造审核卡片数据：待审条目列表加可选反馈信息。"""
+    data: dict[str, Any] = {
+        "items": [
+            {
+                "id": item.get("id", 0),
+                "op_type": str(item.get("op_type", "")),
+                "reason": str(item.get("verdict_reason", "")),
+                "summary": _review_item_summary(item.get("op") or {}),
+                "created_at": str(item.get("created_at", "")),
+            }
+            for item in pending
+        ]
+    }
+    if notice:
+        data["notice"] = notice
+    if error:
+        data["error"] = error
+    return data
+
+
 class MemoryPlugin(Star):
     """长期记忆插件"""
 
@@ -886,7 +955,13 @@ class MemoryPlugin(Star):
 
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
-        self.config = config or {}
+        raw_config = config or {}
+        migrate_maintenance_config(raw_config)
+        # 迁移后 self.config 即单一平面视图，卡片/命令/后台与 MemoryManager 读取同一来源
+        self.config = build_flat_config_view(raw_config)
+        self._flat_config = self.config
+        # 命令与审核卡片的待审裁决互斥锁，覆盖读队列→执行→写回
+        self._review_lock = asyncio.Lock()
         self.memory_mgr: MemoryManager | None = None
         # 实例级请求快照字典，按 session_key 键控，避免跨用户污染
         # 结构: {session_key: {"snapshots": [...], "timestamp": float}}
@@ -2789,7 +2864,7 @@ class MemoryPlugin(Star):
 
     @memory_group.command("review")
     async def cmd_review(self, event: AstrMessageEvent):
-        """争议审查 /memory review [approve|reject|clear] [id]"""
+        """争议审查 /memory review [list|approve|reject|clear] [id]"""
         if not event.is_admin():
             yield event.plain_result("仅管理员可用")
             return
@@ -2812,10 +2887,21 @@ class MemoryPlugin(Star):
             lines.append("\n/memory review approve <id> 批准")
             lines.append("/memory review reject <id> 废案")
             lines.append("/memory review clear 清空")
-            yield event.plain_result("\n".join(lines))
+            text = "\n".join(lines)
+            if _chatui_view_supported(event):
+                # ChatUI 平台发交互卡片，text 同时作为非 ChatUI 平台的文字回退
+                yield event.view_result(
+                    name=REVIEW_VIEW_NAME,
+                    data=_review_card_data(pending),
+                    text=text,
+                    title="记忆待审列表",
+                )
+            else:
+                yield event.plain_result(text)
 
         elif action == "clear":
-            await self.put_kv_data("maintenance_pending_review", [])
+            async with self._review_lock:
+                await self.put_kv_data("maintenance_pending_review", [])
             yield event.plain_result("✅ 待审队列已清空")
 
         elif action in ("approve", "reject"):
@@ -2827,44 +2913,81 @@ class MemoryPlugin(Star):
             except ValueError:
                 yield event.plain_result("id 必须是数字")
                 return
-            queue = await self.get_kv_data("maintenance_pending_review", None) or []
-            found = None
-            for item in queue:
-                if item.get("id") == target_id and item.get("status") == "pending":
-                    found = item
-                    break
-            if not found:
-                yield event.plain_result(f"未找到待审项 #{target_id}")
-                return
-            if action == "reject":
-                found["status"] = "rejected"
-                await self.put_kv_data("maintenance_pending_review", queue)
-                yield event.plain_result(f"🚫 #{target_id} 已废案")
-            elif action == "approve":
-                # 先执行，成功后才标记 approved（失败保留可重试）
-                # execute_approved 与后台周期阶段 4 互斥，避免并发写竞态
-                runner = self._scheduler.runner if self._scheduler else None
-                if not runner:
-                    yield event.plain_result(f"⚠️ #{target_id} 调度器未运行，无法执行")
-                    return
-                try:
-                    ok = await runner.execute_approved(found.get("op", {}))
-                    if ok:
-                        found["status"] = "approved"
-                        await self.put_kv_data("maintenance_pending_review", queue)
-                        yield event.plain_result(f"✅ #{target_id} 已批准并执行")
-                    else:
-                        found["status"] = "failed"
-                        await self.put_kv_data("maintenance_pending_review", queue)
-                        yield event.plain_result(
-                            f"⚠️ #{target_id} 执行失败，已标记 failed"
-                        )
-                except Exception as e:
-                    yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
+            feedback, _pending = await self._decide_review_item(action, target_id)
+            yield event.plain_result(feedback)
         else:
             yield event.plain_result(
                 "用法: /memory review [list|approve <id>|reject <id>|clear]"
             )
+
+    async def _decide_review_item(
+        self, action: str, target_id: int
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """裁决一条待审项，返回 (反馈文本, 最新待审列表)。
+
+        approve 复用 runner.execute_approved，与后台周期阶段互斥；
+        成功才标记 approved，执行失败保留 pending 可重试。
+        """
+        async with self._review_lock:
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            pending = [q for q in queue if q.get("status") == "pending"]
+            found = next((q for q in pending if q.get("id") == target_id), None)
+            if found is None:
+                return f"未找到待审项 #{target_id}（可能已被处理）", pending
+
+            if action == "reject":
+                found["status"] = "rejected"
+                await self.put_kv_data("maintenance_pending_review", queue)
+                return f"🚫 #{target_id} 已废案", [
+                    q for q in queue if q.get("status") == "pending"
+                ]
+
+            runner = self._scheduler.runner if self._scheduler else None
+            if not runner:
+                return f"⚠️ #{target_id} 调度器未运行，无法执行", pending
+            try:
+                ok = await runner.execute_approved(found.get("op", {}))
+            except Exception as e:
+                return f"⚠️ #{target_id} 执行异常: {e}", pending
+            if not ok:
+                return f"⚠️ #{target_id} 执行失败，条目保留待审可重试", pending
+            found["status"] = "approved"
+            await self.put_kv_data("maintenance_pending_review", queue)
+            return f"✅ #{target_id} 已批准并执行", [
+                q for q in queue if q.get("status") == "pending"
+            ]
+
+    async def _handle_review_action(
+        self, event: AstrMessageEvent, action: str
+    ) -> AsyncGenerator[Any, None]:
+        """处理审核卡片的通过/驳回回调，成功后用最新队列刷新卡片。"""
+        if not event.is_admin():
+            raise PermissionError("仅管理员可操作待审队列")
+        interaction = event.get_ui_interaction()
+        if interaction is None:
+            return
+        data = interaction.data if isinstance(interaction.data, dict) else None
+        target_id = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(target_id, int) or isinstance(target_id, bool):
+            raise ValueError("卡片操作缺少有效的待审 id")
+        feedback, pending = await self._decide_review_item(action, target_id)
+        error = feedback if feedback.startswith("⚠️") else ""
+        notice = "" if error else feedback
+        yield event.view_result(
+            data=_review_card_data(pending, notice=notice, error=error)
+        )
+
+    @_ui_action("approve")
+    async def review_approve_action(self, event: AstrMessageEvent):
+        """审核卡片回调：通过一条待审操作。"""
+        async for result in self._handle_review_action(event, "approve"):
+            yield result
+
+    @_ui_action("reject")
+    async def review_reject_action(self, event: AstrMessageEvent):
+        """审核卡片回调：驳回一条待审操作。"""
+        async for result in self._handle_review_action(event, "reject"):
+            yield result
 
     async def _run_memory_test(self, event: AstrMessageEvent) -> str:
         """执行一次记忆写入-读取测试并返回报告"""

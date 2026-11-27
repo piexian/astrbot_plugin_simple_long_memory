@@ -449,8 +449,8 @@ class OrganizerAgent:
         """
         candidates: list[tuple[dict[str, Any], dict[str, Any], float]] = []
 
-        # 按 batch_size 截断，避免大 KB 分配巨大相似度矩阵
-        batch_size = self._config.get("maintenance_organizer_batch_size", 200)
+        # 按 merge 采样上限截断，避免大 KB 分配巨大相似度矩阵；巡检批量走独立的另一个键
+        batch_size = self._config.get("maintenance_organizer_merge_batch_size", 200)
         if len(memories) > batch_size:
             import random
 

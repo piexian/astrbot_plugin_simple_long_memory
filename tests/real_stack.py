@@ -322,6 +322,7 @@ def real_message_event(
     sender_id="tester",
     sender_name="测试用户",
     message_str="今天聊点什么",
+    support_ui_interaction=False,
 ):
     """构造真实 AstrMessageEvent（与 AgentWakeupEvent 同一构造面）。"""
     from astrbot.core.platform.astr_message_event import AstrMessageEvent
@@ -339,6 +340,7 @@ def real_message_event(
         name=platform_id,
         description="test platform",
         id=platform_id,
+        support_ui_interaction=support_ui_interaction,
     )
     event = AstrMessageEvent(
         message_str=message_str,

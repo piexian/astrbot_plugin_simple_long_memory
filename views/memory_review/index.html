@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>记忆待审列表</title>
+    <style>
+      body {
+        color: var(--astrbot-color-text);
+        background: transparent;
+        font: 14px/1.5 system-ui, sans-serif;
+        margin: 8px;
+      }
+      #notice {
+        color: var(--astrbot-color-primary);
+        margin: 4px 0;
+      }
+      #error {
+        color: var(--astrbot-color-error);
+        margin: 4px 0;
+      }
+      #empty {
+        color: var(--astrbot-color-text-secondary);
+      }
+      .item {
+        border: 1px solid var(--astrbot-color-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin: 8px 0;
+        background: var(--astrbot-color-surface);
+      }
+      .item-head {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+      }
+      .item-id {
+        font-weight: 600;
+        color: var(--astrbot-color-primary);
+      }
+      .op-type {
+        font-size: 12px;
+        color: var(--astrbot-color-text-secondary);
+        border: 1px solid var(--astrbot-color-border);
+        border-radius: 4px;
+        padding: 0 4px;
+      }
+      .reason {
+        margin: 4px 0 0;
+      }
+      .summary {
+        margin: 2px 0 0;
+        color: var(--astrbot-color-text-secondary);
+      }
+      .created-at {
+        margin: 2px 0 0;
+        font-size: 12px;
+        color: var(--astrbot-color-text-secondary);
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 6px;
+      }
+      button {
+        font: inherit;
+        padding: 4px 14px;
+        border-radius: 6px;
+        border: 1px solid var(--astrbot-color-primary);
+        color: var(--astrbot-color-primary);
+        background: transparent;
+        cursor: pointer;
+      }
+      button.approve {
+        background: var(--astrbot-color-primary);
+        color: var(--astrbot-color-on-primary);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <p id="notice" role="status"></p>
+    <p id="error" role="alert"></p>
+    <p id="empty" hidden></p>
+    <div id="items"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
