@@ -15,7 +15,7 @@ def _row(
     sender_id="u1",
     sender_name="甲",
     platform="qq",
-    umo="g1",
+    umo="qq:group:g1",
     content=None,
 ):
     if content is None:
@@ -118,17 +118,17 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
             _row(3, "聊" * 120, now - timedelta(hours=2)),
         ]
         llm = _FakeLLM()
-        agent = self._agent(rows, [("qq", "g1")], llm)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], llm)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         self.assertEqual(len(result["blocks"]), 2)
         b1, b2 = result["blocks"]
         self.assertEqual((b1.first_id, b1.last_id), (1, 2))
         self.assertEqual((b2.first_id, b2.last_id), (3, 3))
-        self.assertEqual(b1.conv_key, "qq:g1")
-        self.assertEqual(b1.umo, "g1")
+        self.assertEqual(b1.conv_key, "qq:qq:group:g1")
+        self.assertEqual(b1.umo, "qq:group:g1")
         self.assertFalse(b1.truncated)
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 3})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 3})
         self.assertEqual(result["carry_updates"], {})
         self.assertEqual(llm.calls, 2)
         self.assertEqual(result["stats"]["blocks_emitted"], 2)
@@ -141,7 +141,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
             _row(2, "聊" * 120, now - timedelta(hours=2)),
         ]
         llm = _FakeLLM(responses=[INCOMPLETE, {"complete": True, "reason": "闭环"}])
-        agent = self._agent(rows, [("qq", "g1")], llm)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], llm)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         self.assertEqual(len(result["blocks"]), 1)
@@ -149,7 +149,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((block.first_id, block.last_id), (1, 2))
         self.assertEqual(block.message_count, 2)
         self.assertIn("聊", block.text)
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 2})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 2})
         self.assertEqual(llm.calls, 2)
 
     async def test_extension_limit_carries(self):
@@ -162,7 +162,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         llm = _FakeLLM(responses=[INCOMPLETE, INCOMPLETE])
         agent = self._agent(
             rows,
-            [("qq", "g1")],
+            [("qq", "qq:group:g1")],
             llm,
             config=_config(maintenance_segment_max_extensions=1),
         )
@@ -173,7 +173,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["cursor_updates"], {})
         self.assertEqual(
             result["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
         )
         self.assertEqual(llm.calls, 2)
         self.assertEqual(result["stats"]["blocks_carried"], 1)
@@ -188,7 +188,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         cfg = _config(
             extraction_min_content_length=10, maintenance_segment_max_chars=120
         )
-        convs = [("qq", "g1")]
+        convs = [("qq", "qq:group:g1")]
 
         # 周期 1：撞字符上限 → carry cycles=1，游标不动
         llm = _FakeLLM(responses=[INCOMPLETE])
@@ -198,7 +198,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r1["cursor_updates"], {})
         self.assertEqual(
             r1["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
         )
 
         # 周期 2：cycles=1 → 仍挂起，cycles=2
@@ -209,7 +209,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r2["blocks"], [])
         self.assertEqual(
             r2["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 2, "fail_count": 0}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 2, "fail_count": 0}},
         )
 
         # 周期 3：cycles 已 >= 2 → 强制截断产出第一块，随后第二块自然闭环
@@ -222,8 +222,8 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((forced.first_id, forced.last_id), (1, 1))
         self.assertEqual(forced.message_count, 1)
         self.assertFalse(r3["blocks"][1].truncated)
-        self.assertEqual(r3["cursor_updates"], {"qq:g1": 2})
-        self.assertEqual(r3["carry_updates"], {"qq:g1": None})
+        self.assertEqual(r3["cursor_updates"], {"qq:qq:group:g1": 2})
+        self.assertEqual(r3["carry_updates"], {"qq:qq:group:g1": None})
         self.assertEqual(r3["stats"]["blocks_truncated"], 1)
         self.assertEqual(r3["stats"]["blocks_emitted"], 1)
 
@@ -231,13 +231,13 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         now = datetime.now(timezone.utc)
         rows = [_row(1, "聊" * 120, now - timedelta(hours=3))]
         llm = _FakeLLM(responses=[INCOMPLETE])
-        agent = self._agent(rows, [("qq", "g1")], llm)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], llm)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         # 块尾距今 3h 已超 gap → 视为自然结束按 complete 处理
         self.assertEqual(len(result["blocks"]), 1)
         self.assertFalse(result["blocks"][0].truncated)
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 1})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 1})
         self.assertEqual(result["carry_updates"], {})
         self.assertEqual(result["stats"]["blocks_emitted"], 1)
 
@@ -245,7 +245,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         now = datetime.now(timezone.utc)
         rows = [_row(1, "聊" * 120, now - timedelta(minutes=5))]
         llm = _FakeLLM(responses=[INCOMPLETE])
-        agent = self._agent(rows, [("qq", "g1")], llm)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], llm)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         # 块尾距今 5 分钟未超 gap → 游标停块首 + carry
@@ -253,14 +253,14 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["cursor_updates"], {})
         self.assertEqual(
             result["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
         )
         self.assertEqual(result["stats"]["blocks_carried"], 1)
 
     async def test_llm_failure_twice_skips_block(self):
         now = datetime.now(timezone.utc)
         rows = [_row(1, "聊" * 120, now - timedelta(hours=3))]
-        convs = [("qq", "g1")]
+        convs = [("qq", "qq:group:g1")]
 
         # 周期 1：LLM 失败 → fail_count=1，游标停块首
         kv = _KV()
@@ -271,7 +271,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r1["cursor_updates"], {})
         self.assertEqual(
             r1["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 0, "fail_count": 1}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 0, "fail_count": 1}},
         )
 
         # 周期 2：再失败 → 跳过该块，游标推进，carry 清除
@@ -280,26 +280,26 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
             rows, convs, _FakeLLM(responses=[None]), kv=kv
         ).collect_blocks(10)
         self.assertEqual(r2["blocks"], [])
-        self.assertEqual(r2["cursor_updates"], {"qq:g1": 1})
-        self.assertEqual(r2["carry_updates"], {"qq:g1": None})
+        self.assertEqual(r2["cursor_updates"], {"qq:qq:group:g1": 1})
+        self.assertEqual(r2["carry_updates"], {"qq:qq:group:g1": None})
         self.assertEqual(r2["stats"]["poison_skipped"], 1)
 
     async def test_budget_exhausted_stops_and_keeps_cursor(self):
         now = datetime.now(timezone.utc)
         rows = [
-            _row(1, "聊" * 120, now - timedelta(hours=3), umo="g1"),
-            _row(2, "聊" * 120, now - timedelta(hours=2), umo="g1"),
-            _row(3, "聊" * 120, now - timedelta(hours=3), umo="g2"),
+            _row(1, "聊" * 120, now - timedelta(hours=3), umo="qq:group:g1"),
+            _row(2, "聊" * 120, now - timedelta(hours=2), umo="qq:group:g1"),
+            _row(3, "聊" * 120, now - timedelta(hours=3), umo="qq:group:g2"),
         ]
         llm = _FakeLLM()  # 默认 complete
-        agent = self._agent(rows, [("qq", "g1"), ("qq", "g2")], llm)
+        agent = self._agent(rows, [("qq", "qq:group:g1"), ("qq", "qq:group:g2")], llm)
         result = await agent.collect_blocks(max_llm_calls=1)
 
         # g1 第一块判定完成后预算耗尽：第二块与 g2 不再处理，游标不动
         self.assertTrue(result["stats"]["budget_exhausted"])
         self.assertEqual(len(result["blocks"]), 1)
         self.assertEqual(result["blocks"][0].last_id, 1)
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 1})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 1})
         self.assertEqual(result["carry_updates"], {})
         self.assertEqual(result["stats"]["llm_calls"], 1)
         self.assertEqual(result["stats"]["conversations_scanned"], 1)
@@ -314,7 +314,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
             _row(4, "聊" * 60, now - timedelta(hours=2) + timedelta(minutes=2)),
         ]
         llm = _FakeLLM()
-        agent = self._agent(rows, [("qq", "g1")], llm)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], llm)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         # 短闲聊块被预过滤，不消耗 LLM，游标照常推进
@@ -323,19 +323,19 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (result["blocks"][0].first_id, result["blocks"][0].last_id), (3, 4)
         )
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 4})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 4})
         self.assertEqual(result["stats"]["blocks_skipped_short"], 1)
 
     async def test_block_cap_stops_emission(self):
         now = datetime.now(timezone.utc)
         rows = [
-            _row(1, "聊" * 120, now - timedelta(hours=5), umo="g1"),
-            _row(2, "聊" * 120, now - timedelta(hours=4), umo="g1"),
-            _row(3, "聊" * 120, now - timedelta(hours=3), umo="g2"),
+            _row(1, "聊" * 120, now - timedelta(hours=5), umo="qq:group:g1"),
+            _row(2, "聊" * 120, now - timedelta(hours=4), umo="qq:group:g1"),
+            _row(3, "聊" * 120, now - timedelta(hours=3), umo="qq:group:g2"),
         ]
         agent = self._agent(
             rows,
-            [("qq", "g1"), ("qq", "g2")],
+            [("qq", "qq:group:g1"), ("qq", "qq:group:g2")],
             _FakeLLM(),
             config=_config(maintenance_extract_max_blocks_per_cycle=1),
         )
@@ -343,7 +343,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
 
         # 产出达上限：后续块不产出、游标不推进
         self.assertEqual(len(result["blocks"]), 1)
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 1})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 1})
         self.assertTrue(result["stats"]["block_cap_reached"])
 
     async def test_legacy_int_cursor_and_since_from_earliest_cursor(self):
@@ -353,19 +353,19 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         kv = _KV(
             {
                 "maintenance_extract_cursors": {
-                    "qq:g1": 5,  # 旧格式纯 int
+                    "qq:qq:group:g1": 5,  # 旧格式纯 int
                     "qq:g9": {"id": 10, "ts": old_ts.isoformat()},
                 }
             }
         )
-        agent = self._agent(rows, [("qq", "g1")], _FakeLLM(), kv=kv)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], _FakeLLM(), kv=kv)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         # 旧格式游标=5 → 只处理 id>5
         self.assertEqual(len(result["blocks"]), 1)
         block = result["blocks"][0]
         self.assertEqual((block.first_id, block.last_id), (6, 7))
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 7})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 7})
         # since 取最早游标 ts（48h 前）而非默认 24h
         self.assertIsNotNone(agent.seen_since)
         self.assertLess(
@@ -403,7 +403,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
             _row(4, "聊" * 40, now - timedelta(hours=3) + timedelta(minutes=3)),
         ]
         cfg = _config(extraction_min_content_length=10)
-        agent = self._agent(rows, [("qq", "g1")], _FakeLLM(), config=cfg)
+        agent = self._agent(rows, [("qq", "qq:group:g1")], _FakeLLM(), config=cfg)
         result = await agent.collect_blocks(max_llm_calls=10)
 
         self.assertEqual(len(result["blocks"]), 1)
@@ -416,7 +416,7 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("] bot: 在的", block.text)
         self.assertEqual(block.char_count, len(block.text))
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 4})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 4})
 
     async def test_no_message_history_manager_returns_empty(self):
         llm = _FakeLLM()
@@ -433,6 +433,29 @@ class SegmenterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["carry_updates"], {})
         self.assertEqual(result["stats"]["conversations_scanned"], 0)
         self.assertEqual(llm.calls, 0)
+
+
+class InvalidUmoSkipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_umo_conversation_skipped_without_llm(self):
+        now = datetime.now(timezone.utc)
+        rows = [
+            _row(1, "聊" * 120, now - timedelta(hours=3), umo="legacy-no-umo"),
+            _row(2, "聊" * 120, now - timedelta(hours=3), umo="qq:group:g1"),
+        ]
+        llm = _FakeLLM()
+        agent = _StubSegmenter(
+            rows,
+            [("qq", "legacy-no-umo"), ("qq", "qq:group:g1")],
+            llm,
+            _config(),
+            _KV(),
+        )
+        result = await agent.collect_blocks(max_llm_calls=10)
+        # 无效 UMO 会话不消耗 LLM、不推进游标；有效会话不受影响
+        self.assertEqual(result["stats"]["invalid_umo_skipped"], 1)
+        self.assertEqual([b.conv_key for b in result["blocks"]], ["qq:qq:group:g1"])
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 2})
+        self.assertEqual(llm.calls, 1)
 
 
 class ChatJsonTests(unittest.IsolatedAsyncioTestCase):

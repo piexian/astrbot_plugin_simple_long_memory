@@ -18,7 +18,7 @@ from test_maintenance_segmenter import (
 from test_memory_commands import plugin_main
 
 import maintenance.runner as runner_module
-from maintenance.agents.curator import CuratorAgent
+from maintenance.agents.curator import SOURCE_EXCERPT_MAX_CHARS, CuratorAgent
 from maintenance.agents.reviewer import ReviewerAgent
 from maintenance.agents.segmenter import ConversationBlock
 from maintenance.runner import MaintenanceRunner
@@ -178,7 +178,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create["importance"], 4)
         self.assertEqual(create["umo"], "qq:private:u1")
         self.assertFalse(create["truncated_block"])
-        self.assertLessEqual(len(create["source_excerpt"]), 200)
+        self.assertLessEqual(len(create["source_excerpt"]), 2000)
 
         update = result["update"][0]
         self.assertEqual(
@@ -280,7 +280,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([o for _, o in result["outcomes"]], ["nothing"])
 
     async def test_source_excerpt_collapsed_and_capped(self):
-        text = ("  多  空   格\n换行\t" + "聊" * 400) * 2
+        text = ("  多  空   格\n换行\t" + "聊" * 1500) * 2
         llm = _CuratorLLM(
             responses=[
                 {
@@ -299,7 +299,8 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         curator = _curator(llm)
         result = await curator.run([_block(text=text)], 5)
         excerpt = result["create"][0]["source_excerpt"]
-        self.assertLessEqual(len(excerpt), 200)
+        self.assertGreater(len(" ".join(text.split())), SOURCE_EXCERPT_MAX_CHARS)
+        self.assertEqual(len(excerpt), SOURCE_EXCERPT_MAX_CHARS)
         self.assertNotIn("\n", excerpt)
         self.assertNotIn("  ", excerpt)
 
@@ -715,14 +716,16 @@ class SegmenterStaleCarryTests(unittest.IsolatedAsyncioTestCase):
         kv = _KV(
             {
                 "maintenance_extract_carry": {
-                    "qq:g1": {"start_id": 99, "cycles": 2, "fail_count": 0}
+                    "qq:qq:group:g1": {"start_id": 99, "cycles": 2, "fail_count": 0}
                 }
             }
         )
-        agent = _StubSegmenter(rows, [("qq", "g1")], _SegFakeLLM(), _config(), kv)
+        agent = _StubSegmenter(
+            rows, [("qq", "qq:group:g1")], _SegFakeLLM(), _config(), kv
+        )
         result = await agent.collect_blocks(10)
         # 过期 carry（start_id=99 ≠ 候选块 first_id=1）被丢弃并清除
-        self.assertEqual(result["carry_updates"], {"qq:g1": None})
+        self.assertEqual(result["carry_updates"], {"qq:qq:group:g1": None})
         self.assertEqual(len(result["blocks"]), 1)
 
     async def test_stale_carry_cycles_not_inherited(self):
@@ -732,18 +735,22 @@ class SegmenterStaleCarryTests(unittest.IsolatedAsyncioTestCase):
         kv = _KV(
             {
                 "maintenance_extract_carry": {
-                    "qq:g1": {"start_id": 99, "cycles": 2, "fail_count": 0}
+                    "qq:qq:group:g1": {"start_id": 99, "cycles": 2, "fail_count": 0}
                 }
             }
         )
         agent = _StubSegmenter(
-            rows, [("qq", "g1")], _SegFakeLLM(responses=[INCOMPLETE]), _config(), kv
+            rows,
+            [("qq", "qq:group:g1")],
+            _SegFakeLLM(responses=[INCOMPLETE]),
+            _config(),
+            kv,
         )
         result = await agent.collect_blocks(10)
         # cycles 从 0 重计为 1，而非继承过期的 2（否则将立刻触发强制截断）
         self.assertEqual(
             result["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
         )
 
     async def test_matching_carry_still_inherited(self):
@@ -752,18 +759,22 @@ class SegmenterStaleCarryTests(unittest.IsolatedAsyncioTestCase):
         kv = _KV(
             {
                 "maintenance_extract_carry": {
-                    "qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}
+                    "qq:qq:group:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}
                 }
             }
         )
         agent = _StubSegmenter(
-            rows, [("qq", "g1")], _SegFakeLLM(responses=[INCOMPLETE]), _config(), kv
+            rows,
+            [("qq", "qq:group:g1")],
+            _SegFakeLLM(responses=[INCOMPLETE]),
+            _config(),
+            kv,
         )
         result = await agent.collect_blocks(10)
         # start_id 匹配时正常继承 cycles
         self.assertEqual(
             result["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 2, "fail_count": 0}},
+            {"qq:qq:group:g1": {"start_id": 1, "cycles": 2, "fail_count": 0}},
         )
 
 

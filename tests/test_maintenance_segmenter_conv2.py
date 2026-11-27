@@ -105,9 +105,9 @@ class Conv2SourceSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_pmh_covered_conversation_skips_conv2(self):
         now = datetime.now(timezone.utc)
         rows = [_row(1, "聊" * 120, now)]
-        conv2 = [_conv2_conv("qq", "g1", _msgs(4), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:group:g1", _msgs(4), _now_epoch())]
         llm = _FakeLLM()
-        agent = _agent(rows, [("qq", "g1")], conv2, llm)
+        agent = _agent(rows, [("qq", "qq:group:g1")], conv2, llm)
         result = await agent.collect_blocks(10)
 
         # pmh 窗口内已有该会话 → conv2 不重复提取
@@ -116,10 +116,10 @@ class Conv2SourceSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["blocks"][0].end_anchor, "")
         self.assertEqual(result["stats"]["conv2_conversations"], 0)
         self.assertEqual(result["stats"]["conv2_blocks_emitted"], 0)
-        self.assertEqual(result["cursor_updates"], {"qq:g1": 1})
+        self.assertEqual(result["cursor_updates"], {"qq:qq:group:g1": 1})
 
     async def test_conv2_disabled_closes_path(self):
-        conv2 = [_conv2_conv("qq", "u1", _msgs(4), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(4), _now_epoch())]
         llm = _FakeLLM()
         agent = _agent(
             [], [], conv2, llm, config=_c2cfg(maintenance_extract_conv2_enabled=False)
@@ -137,17 +137,17 @@ class Conv2SourceSelectionTests(unittest.IsolatedAsyncioTestCase):
             _conv2_conv("qq", "old", _msgs(4), now_epoch - 3 * 86400),  # 超出窗口
             _conv2_conv("qq", "", _msgs(4), now_epoch),  # user_id 为空
             _conv2_conv("qq", "zero", _msgs(4), 0),  # updated_at 为 0 无法判断新鲜度
-            _conv2_conv("qq", "u1", _msgs(4), now_epoch),
+            _conv2_conv("qq", "qq:private:u1", _msgs(4), now_epoch),
         ]
         agent = _agent([], [], conv2, _FakeLLM())
         result = await agent.collect_blocks(10)
 
         self.assertEqual(result["stats"]["conv2_conversations"], 1)
         self.assertEqual(len(result["blocks"]), 1)
-        self.assertEqual(result["blocks"][0].conv_key, "qq:u1")
+        self.assertEqual(result["blocks"][0].conv_key, "qq:qq:private:u1")
 
     async def test_conv2_works_without_message_history_db(self):
-        conv2 = [_conv2_conv("qq", "u1", _msgs(3), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(3), _now_epoch())]
         agent = SegmenterAgent(
             context=SimpleNamespace(  # 无 message_history_manager
                 conversation_manager=_FakeConversationManager(conv2)
@@ -164,10 +164,20 @@ class Conv2SourceSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["blocks"]), 1)
         self.assertEqual(result["blocks"][0].source, "conv2")
 
+    async def test_conv2_invalid_umo_skipped_without_llm(self):
+        conv2 = [_conv2_conv("qq", "legacy-no-umo", _msgs(4), _now_epoch())]
+        llm = _FakeLLM()
+        agent = _agent([], [], conv2, llm)
+        result = await agent.collect_blocks(10)
+        self.assertEqual(result["stats"]["invalid_umo_skipped"], 1)
+        self.assertEqual(result["stats"]["conv2_conversations"], 0)
+        self.assertEqual(result["blocks"], [])
+        self.assertEqual(llm.calls, 0)
+
 
 class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
     async def test_first_seen_only_latest_chunk(self):
-        conv2 = [_conv2_conv("qq", "u1", _msgs(10), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(10), _now_epoch())]
         llm = _FakeLLM()
         agent = _agent([], [], conv2, llm)
         result = await agent.collect_blocks(10)
@@ -186,12 +196,14 @@ class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["stats"]["conv2_blocks_emitted"], 1)
         self.assertEqual(result["stats"]["blocks_emitted"], 0)
         # 游标为内容锚点 + 下标
-        cur = result["cursor_updates"]["qq:u1"]
+        cur = result["cursor_updates"]["qq:qq:private:u1"]
         self.assertEqual(cur, {"source": "conv2", "anchor": _msg_anchor(9), "idx": 9})
 
     async def test_anchor_resume_chunks_and_close(self):
-        kv = _KV({CURSOR_KV_KEY: {"qq:u1": _conv2_cursor(_msg_anchor(1), 1)}})
-        conv2 = [_conv2_conv("qq", "u1", _msgs(7), _now_epoch())]
+        kv = _KV(
+            {CURSOR_KV_KEY: {"qq:qq:private:u1": _conv2_cursor(_msg_anchor(1), 1)}}
+        )
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(7), _now_epoch())]
         llm = _FakeLLM()
         agent = _agent([], [], conv2, llm, kv=kv)
         result = await agent.collect_blocks(10)
@@ -204,7 +216,7 @@ class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["blocks"][0].end_anchor, _msg_anchor(5))
         self.assertEqual(result["blocks"][1].end_anchor, _msg_anchor(6))
         self.assertEqual(
-            result["cursor_updates"]["qq:u1"],
+            result["cursor_updates"]["qq:qq:private:u1"],
             {"source": "conv2", "anchor": _msg_anchor(6), "idx": 6},
         )
         self.assertEqual(llm.calls, 2)
@@ -212,8 +224,10 @@ class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["stats"]["anchor_miss"], 0)
 
     async def test_anchor_resume_incomplete_rolls_into_next_chunk(self):
-        kv = _KV({CURSOR_KV_KEY: {"qq:u1": _conv2_cursor(_msg_anchor(0), 0)}})
-        conv2 = [_conv2_conv("qq", "u1", _msgs(6), _now_epoch())]
+        kv = _KV(
+            {CURSOR_KV_KEY: {"qq:qq:private:u1": _conv2_cursor(_msg_anchor(0), 0)}}
+        )
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(6), _now_epoch())]
         llm = _FakeLLM(responses=[INCOMPLETE, {"complete": True, "reason": "闭环"}])
         agent = _agent([], [], conv2, llm, kv=kv)
         result = await agent.collect_blocks(10)
@@ -227,8 +241,8 @@ class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm.calls, 2)
 
     async def test_anchor_miss_only_latest_chunk_and_reanchor(self):
-        kv = _KV({CURSOR_KV_KEY: {"qq:u1": _conv2_cursor("f" * 16, 30)}})
-        conv2 = [_conv2_conv("qq", "u1", _msgs(10), _now_epoch())]
+        kv = _KV({CURSOR_KV_KEY: {"qq:qq:private:u1": _conv2_cursor("f" * 16, 30)}})
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(10), _now_epoch())]
         agent = _agent([], [], conv2, _FakeLLM(), kv=kv)
         result = await agent.collect_blocks(10)
 
@@ -238,13 +252,15 @@ class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
         block = result["blocks"][0]
         self.assertEqual((block.first_id, block.last_id), (6, 9))
         self.assertEqual(
-            result["cursor_updates"]["qq:u1"],
+            result["cursor_updates"]["qq:qq:private:u1"],
             {"source": "conv2", "anchor": _msg_anchor(9), "idx": 9},
         )
 
     async def test_anchor_resume_no_new_messages_noop(self):
-        kv = _KV({CURSOR_KV_KEY: {"qq:u1": _conv2_cursor(_msg_anchor(9), 9)}})
-        conv2 = [_conv2_conv("qq", "u1", _msgs(10), _now_epoch())]
+        kv = _KV(
+            {CURSOR_KV_KEY: {"qq:qq:private:u1": _conv2_cursor(_msg_anchor(9), 9)}}
+        )
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(10), _now_epoch())]
         llm = _FakeLLM()
         agent = _agent([], [], conv2, llm, kv=kv)
         result = await agent.collect_blocks(10)
@@ -259,7 +275,7 @@ class Conv2SegmentationTests(unittest.IsolatedAsyncioTestCase):
 class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
     async def test_conv2_carry_format_and_cycle_inherit(self):
         # 块尾（会话 updated_at）在间隙内 + 判不完整 → carry 挂起
-        conv2 = [_conv2_conv("qq", "u1", _msgs(3), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(3), _now_epoch())]
         llm = _FakeLLM(responses=[INCOMPLETE])
         agent = _agent([], [], conv2, llm)
         r1 = await agent.collect_blocks(10)
@@ -269,7 +285,7 @@ class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             r1["carry_updates"],
             {
-                "qq:u1": {
+                "qq:qq:private:u1": {
                     "start_id": 0,
                     "cycles": 1,
                     "fail_count": 0,
@@ -286,7 +302,7 @@ class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             r2["carry_updates"],
             {
-                "qq:u1": {
+                "qq:qq:private:u1": {
                     "start_id": 0,
                     "cycles": 2,
                     "fail_count": 0,
@@ -299,7 +315,7 @@ class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
         kv = _KV(
             {
                 "maintenance_extract_carry": {
-                    "qq:u1": {
+                    "qq:qq:private:u1": {
                         "start_id": 0,
                         "cycles": 2,
                         "fail_count": 0,
@@ -308,17 +324,17 @@ class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
                 }
             }
         )
-        conv2 = [_conv2_conv("qq", "u1", _msgs(3), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(3), _now_epoch())]
         agent = _agent([], [], conv2, _FakeLLM(), kv=kv)
         result = await agent.collect_blocks(10)
 
         # 过期 carry 丢弃清除，cycles 不继承（否则立刻触发强制截断）
-        self.assertEqual(result["carry_updates"], {"qq:u1": None})
+        self.assertEqual(result["carry_updates"], {"qq:qq:private:u1": None})
         self.assertEqual(len(result["blocks"]), 1)
         self.assertFalse(result["blocks"][0].truncated)
 
     async def test_conv2_poison_skip_advances_anchor_cursor(self):
-        conv2 = [_conv2_conv("qq", "u1", _msgs(3), _now_epoch())]
+        conv2 = [_conv2_conv("qq", "qq:private:u1", _msgs(3), _now_epoch())]
 
         # 周期 1：LLM 失败 → fail_count=1 挂起，游标不动
         kv = _KV()
@@ -328,10 +344,12 @@ class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r1["blocks"], [])
         self.assertEqual(r1["cursor_updates"], {})
         self.assertEqual(
-            r1["carry_updates"]["qq:u1"]["fail_count"],
+            r1["carry_updates"]["qq:qq:private:u1"]["fail_count"],
             1,
         )
-        self.assertEqual(r1["carry_updates"]["qq:u1"]["start_anchor"], _msg_anchor(0))
+        self.assertEqual(
+            r1["carry_updates"]["qq:qq:private:u1"]["start_anchor"], _msg_anchor(0)
+        )
 
         # 周期 2：再失败 → 毒块跳过，锚点游标推进到块末，carry 清除
         kv = _KV({"maintenance_extract_carry": r1["carry_updates"]})
@@ -339,9 +357,9 @@ class Conv2CarryAndPoisonTests(unittest.IsolatedAsyncioTestCase):
             [], [], conv2, _FakeLLM(responses=[None]), kv=kv
         ).collect_blocks(10)
         self.assertEqual(r2["stats"]["poison_skipped"], 1)
-        self.assertEqual(r2["carry_updates"], {"qq:u1": None})
+        self.assertEqual(r2["carry_updates"], {"qq:qq:private:u1": None})
         self.assertEqual(
-            r2["cursor_updates"]["qq:u1"],
+            r2["cursor_updates"]["qq:qq:private:u1"],
             {"source": "conv2", "anchor": _msg_anchor(2), "idx": 2},
         )
 

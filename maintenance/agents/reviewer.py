@@ -56,7 +56,8 @@ class ReviewerAgent:
     ) -> list[dict[str, Any]]:
         """逐条复核操作建议，返回 verdicts。
 
-        LLM 预算耗尽时提前返回；未产出裁决的操作由宿主 fail closed 转待审。
+        LLM 预算耗尽时提前返回；预算耗尽而未审的操作由宿主留待下周期，
+        其余未产出裁决的操作由宿主 fail closed 转待审。
 
         Args:
             proposed_changes: 待审核的操作列表
@@ -100,7 +101,7 @@ class ReviewerAgent:
                 self.last_unresolved["budget_exhausted"] = len(proposed_changes) - index
                 logger.warning(
                     f"[简单长期记忆] 审核员 LLM 预算耗尽，剩余 "
-                    f"{len(proposed_changes) - index} 条操作未审，将 fail closed 转待审"
+                    f"{len(proposed_changes) - index} 条操作未审，留待下周期继续审核"
                 )
                 break
             verdict = await self._review_one(

@@ -814,6 +814,7 @@ class MemoryPlugin(Star):
     CONTACT_WRITE_CACHE_MAX = 10000
     MAX_SESSION_SNAPSHOTS = DEFAULT_MAX_SESSION_SNAPSHOTS
     MAX_SNAPSHOT_CHARS = DEFAULT_MAX_SNAPSHOT_CHARS
+    EXTRACTION_ASSISTANT_MAX_CHARS = 300  # 实时提取对话中助手回复的截断长度
 
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
@@ -1359,7 +1360,14 @@ class MemoryPlugin(Star):
     def _build_conversation_from_snapshots(
         self, snapshots: list[dict[str, Any]]
     ) -> str:
-        """从快照列表构建对话文本"""
+        """从快照列表构建对话文本（用户/助手标签隔离，助手长回复截断）"""
+        assistant_limit = self.EXTRACTION_ASSISTANT_MAX_CHARS
+
+        def _clip_assistant(text: str) -> str:
+            if len(text) <= assistant_limit:
+                return text
+            return text[:assistant_limit] + "…"
+
         lines = []
         for snapshot in snapshots:
             ordered_messages = snapshot.get("messages")
@@ -1374,7 +1382,7 @@ class MemoryPlugin(Star):
                         sender_label = f"用户:{sid}" if sid else "用户"
                         lines.append(f"[{sender_label}]: {text}")
                     elif role == "assistant":
-                        lines.append(f"[助手]: {text}")
+                        lines.append(f"[助手]: {_clip_assistant(text)}")
                 continue
             prompt = snapshot.get("prompt", "")
             response = snapshot.get("response", "")
@@ -1383,8 +1391,22 @@ class MemoryPlugin(Star):
                 sender_label = f"用户:{sender_id}" if sender_id else "用户"
                 lines.append(f"[{sender_label}]: {prompt}")
             if response:
-                lines.append(f"[助手]: {response}")
+                lines.append(f"[助手]: {_clip_assistant(response)}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _snapshot_user_text_length(snapshots: list[dict[str, Any]]) -> int:
+        """统计快照中的有效用户文本长度（不含角色标签与助手输出）。"""
+        total = 0
+        for snapshot in snapshots:
+            ordered_messages = snapshot.get("messages")
+            if isinstance(ordered_messages, list) and ordered_messages:
+                for item in ordered_messages:
+                    if item.get("role") == "user":
+                        total += len(item.get("text", "") or "")
+                continue
+            total += len(snapshot.get("prompt", "") or "")
+        return total
 
     # ==================== 检索优化 ====================
 
@@ -1703,11 +1725,12 @@ class MemoryPlugin(Star):
             # 构建对话文本（包含所有累积的对话）
             conversation = self._build_conversation_from_snapshots(snapshots)
 
-            # 检查最小内容长度
+            # 检查有效用户文本最小长度（不含角色标签与助手输出）
             min_length = self.config.get("extraction_min_content_length", 150)
-            if len(conversation) < min_length:
+            user_text_length = self._snapshot_user_text_length(snapshots)
+            if user_text_length < min_length:
                 logger.debug(
-                    f"[简单长期记忆] 对话总长度 {len(conversation)} < {min_length}，跳过提取"
+                    f"[简单长期记忆] 有效用户文本长度 {user_text_length} < {min_length}，跳过提取"
                 )
                 return
 
@@ -1778,6 +1801,7 @@ class MemoryPlugin(Star):
             # 存储提取的记忆
             stored_count = 0
             skipped_empty_count = 0
+            skipped_duplicate_count = 0
             store_failures = 0
             for mem in memories:
                 memory_domain = mem.get("type", "fact")
@@ -1807,6 +1831,24 @@ class MemoryPlugin(Star):
 
                 domain = normalize_domain(memory_domain)
 
+                duplicate_uri = await self.memory_mgr.find_scoped_duplicate(
+                    content=content,
+                    memory_scope=scope,
+                    platform_id=parsed_umo.platform_id,
+                    session_id=parsed_umo.session_id,
+                    umo=event.unified_msg_origin,
+                    owner_user_id=(
+                        build_user_id(parsed_umo.platform_id, subjects[0])
+                        if scope == MemoryScope.PERSONAL and subjects
+                        else ""
+                    ),
+                )
+                if duplicate_uri:
+                    skipped_duplicate_count += 1
+                    logger.debug(
+                        f"[简单长期记忆] 自动提取查重命中，跳过写入: {duplicate_uri}"
+                    )
+                    continue
                 try:
                     uri = await self.memory_mgr.store_memory(
                         event=event,
@@ -1845,11 +1887,13 @@ class MemoryPlugin(Star):
 
             logger.debug(
                 "[简单长期记忆] 自动提取完成: snapshots=%s, parsed=%s, "
-                "stored=%s, skipped_empty=%s, store_failures=%s, elapsed_ms=%s",
+                "stored=%s, skipped_empty=%s, skipped_duplicate=%s, "
+                "store_failures=%s, elapsed_ms=%s",
                 len(snapshots),
                 len(memories),
                 stored_count,
                 skipped_empty_count,
+                skipped_duplicate_count,
                 store_failures,
                 round((time.monotonic() - extraction_started_at) * 1000),
             )

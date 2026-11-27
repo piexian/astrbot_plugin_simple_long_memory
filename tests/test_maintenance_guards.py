@@ -689,5 +689,85 @@ class ContradictionExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mgr.deprecate_calls, [("u://old", "contradiction resolved")])
 
 
+class BudgetDeferredExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def _runner(self, kv: _FakeKV) -> MaintenanceRunner:
+        return MaintenanceRunner(
+            context=None,
+            memory_mgr=_FakeMemoryMgr(),
+            llm=_FakeLLM(),
+            config={},
+            kv_put=kv.put_kv_data,
+            kv_get=kv.get_kv_data,
+        )
+
+    @staticmethod
+    def _report(ops: list[dict], verdicts: list[dict]) -> MaintenanceReport:
+        report = MaintenanceReport(
+            session_id="s1",
+            extract_manifest=AgentManifest(
+                agent_type="extract", parsed=True, operations=ops
+            ),
+        )
+        report.reviewer_verdicts = verdicts
+        return report
+
+    async def test_budget_exhausted_ops_deferred_without_pending_or_ack(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 0}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        ops = [
+            {"type": "create", "content": "c0"},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+        ]
+        report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
+        await runner._execute_operations(report)
+        self.assertEqual(report.executed_ops, 1)
+        self.assertEqual(report.skipped_ops, 0)
+        self.assertNotIn("maintenance_pending_review", kv.store)
+        # 只有已执行的 op0 销账；预算耗尽项不执行、不入待审、不销账
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 1)
+
+    async def test_invalid_output_still_fails_closed_to_pending(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 0, "invalid_output": 2}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        ops = [
+            {"type": "create", "content": "c0"},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+        ]
+        report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
+        await runner._execute_operations(report)
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(len(queue), 2)
+        self.assertTrue(all(item["status"] == "pending" for item in queue))
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 3)
+
+    async def test_mixed_invalid_output_and_budget_tail_split(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 1}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        ops = [
+            {"type": "create", "content": "c0"},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+            {"type": "archive", "uri": "u://3"},
+        ]
+        report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
+        await runner._execute_operations(report)
+        # 中间缺失（输出无效）转待审，尾部预算耗尽留待下周期
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["op"]["uri"], "u://1")
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

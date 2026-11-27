@@ -23,6 +23,11 @@ from astrbot.api import logger
 
 from ..prompts import SEGMENT_BOUNDARY_PROMPT, build_prompt
 
+try:  # 正常插件加载（包内相对导入）
+    from ...memory_protocol import UMOInfo
+except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.path
+    from memory_protocol import UMOInfo
+
 SEGMENT_PAGE_SIZE = 100
 CURSOR_KV_KEY = "maintenance_extract_cursors"
 CARRY_KV_KEY = "maintenance_extract_carry"
@@ -265,6 +270,7 @@ class SegmenterAgent:
             "llm_calls": 0,
             "budget_exhausted": False,
             "block_cap_reached": False,
+            "invalid_umo_skipped": 0,
         }
         result: dict[str, Any] = {
             "blocks": [],
@@ -326,6 +332,13 @@ class SegmenterAgent:
                 break
             stats["conversations_scanned"] += 1
             conv_key = f"{platform_id}:{user_id}"
+            if not UMOInfo.parse(user_id).is_valid:
+                # 无效 UMO 不消耗分段 LLM 预算，游标保持不动
+                stats["invalid_umo_skipped"] += 1
+                logger.debug(
+                    "[简单长期记忆] 分段员跳过无效 UMO 会话: conv=%s", conv_key
+                )
+                continue
             cursor_id = cursors.get(conv_key, {}).get("id", 0)
             cursor_offset = cursors.get(conv_key, {}).get("offset", 0)
             try:
@@ -371,6 +384,12 @@ class SegmenterAgent:
                 conv_key = f"{platform_id}:{user_id}"
                 if conv_key in pmh_keys:
                     continue
+                if not UMOInfo.parse(user_id).is_valid:
+                    stats["invalid_umo_skipped"] += 1
+                    logger.debug(
+                        "[简单长期记忆] 分段员跳过无效 UMO 会话: conv=%s", conv_key
+                    )
+                    continue
                 stats["conv2_conversations"] += 1
                 try:
                     await self._collect_conv2_conversation(
@@ -393,7 +412,8 @@ class SegmenterAgent:
         logger.debug(
             "[简单长期记忆] 分段员完成: scanned=%s, emitted=%s, short=%s, "
             "carried=%s, truncated=%s, poison=%s, conv2_scanned=%s, "
-            "conv2_emitted=%s, anchor_miss=%s, llm=%s, budget_exhausted=%s",
+            "conv2_emitted=%s, anchor_miss=%s, llm=%s, budget_exhausted=%s, "
+            "invalid_umo=%s",
             stats["conversations_scanned"],
             stats["blocks_emitted"],
             stats["blocks_skipped_short"],
@@ -405,6 +425,7 @@ class SegmenterAgent:
             stats["anchor_miss"],
             stats["llm_calls"],
             stats["budget_exhausted"],
+            stats["invalid_umo_skipped"],
         )
         return result
 

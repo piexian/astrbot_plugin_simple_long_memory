@@ -428,6 +428,7 @@ class MaintenanceRunner:
             if report.analyst_manifest and report.analyst_manifest.parsed:
                 all_operations.extend(report.analyst_manifest.operations)
 
+            n_reviewed_ops = len(all_operations)
             # 周期操作总数硬上限：防异常放大，超出部分下周期重新评估
             max_ops = self._config.get("maintenance_max_ops_per_cycle", 100)
             if len(all_operations) > max_ops:
@@ -446,6 +447,13 @@ class MaintenanceRunner:
                 len(report.reviewer_verdicts),
                 max_ops,
             )
+            # 审核员按序审核、预算耗尽即中断：未裁决下标落在尾部即预算耗尽操作
+            budget_tail_start = max(
+                0,
+                n_reviewed_ops
+                - int(self._last_review_unresolved.get("budget_exhausted", 0) or 0),
+            )
+            budget_deferred = 0
             # reviewer 启用时校验裁决完整性：
             # 下标越界/重复 → 真正不一致（LLM 乱序/错号），告警；
             # 仅数量不足 → 有意的部分评审（预算耗尽/输出无效），info 级给出原因分布
@@ -473,7 +481,7 @@ class MaintenanceRunner:
                             f"[简单长期记忆] 审核员部分评审: {len(missing)}/{n_ops} 条未裁决"
                             f"（预算耗尽 {unresolved.get('budget_exhausted', 0)}, "
                             f"输出无效 {unresolved.get('invalid_output', 0)}），"
-                            f"fail closed 转待审"
+                            f"预算耗尽部分留待下周期，其余 fail closed 转待审"
                         )
 
             # 按审核结果执行操作
@@ -485,10 +493,11 @@ class MaintenanceRunner:
                         verdict = v
                         break
 
-                # 缺失裁决 → fail closed，拒绝执行（避免 reviewer 故障时放行破坏性操作）
+                # 缺失裁决 → 拒绝执行（避免 reviewer 故障时放行破坏性操作）
                 if verdict is None:
                     # additive 操作（new_link/create）仅在审核员整体禁用时直接放行；
-                    # 审核员启用却缺失裁决属于异常（LLM 漏判），同样 fail closed 转待审
+                    # 审核员启用时的缺失裁决需区分：预算耗尽的尾部操作留待下周期，
+                    # 输出无效等异常缺失才 fail closed 转待审
                     if (
                         op.get("type") in ("new_link", "create")
                         and not reviewer_enabled
@@ -508,6 +517,10 @@ class MaintenanceRunner:
                             report.errors.append(
                                 f"op[{i}] {op.get('type')}: {type(e).__name__}"
                             )
+                        continue
+                    # 预算耗尽而未轮到审核：不执行、不入待审、不销账，留待下周期
+                    if reviewer_enabled and i >= budget_tail_start:
+                        budget_deferred += 1
                         continue
                     # 其余情况（破坏性操作，或审核员启用但裁决缺失）→ 转待审队列
                     reason = (
@@ -591,11 +604,12 @@ class MaintenanceRunner:
             report.llm_stats = self._llm.stats()
             logger.debug(
                 "[简单长期记忆] 执行阶段完成: executed=%s, skipped=%s, failed=%s, "
-                "pending=%s, llm=%s",
+                "pending=%s, budget_deferred=%s, llm=%s",
                 executed,
                 skipped,
                 failed,
                 len(pending_items),
+                budget_deferred,
                 report.llm_stats,
             )
 
@@ -905,6 +919,7 @@ class MaintenanceRunner:
         )
 
         # 源记录由审核员按操作逐条拉取（见 ReviewerAgent._get_op_source_data）
+        self._last_review_unresolved = {}
         try:
             verdicts = await reviewer.review(proposed_changes)
             self._last_review_unresolved = dict(reviewer.last_unresolved)

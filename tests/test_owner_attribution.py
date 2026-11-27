@@ -193,7 +193,8 @@ class RealtimeIdentityTests(unittest.IsolatedAsyncioTestCase):
             "extraction_min_content_length": 1,
         }
         plugin.memory_mgr = SimpleNamespace(
-            store_memory=AsyncMock(return_value="facts://new")
+            store_memory=AsyncMock(return_value="facts://new"),
+            find_scoped_duplicate=AsyncMock(return_value=None),
         )
         plugin._complete_snapshot_with_response = lambda *args: None
         plugin._increment_session_counter = lambda *args: 1

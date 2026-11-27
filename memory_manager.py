@@ -58,7 +58,29 @@ KVGetFn = Callable[[str, Any], Any]
 KVDeleteFn = Callable[[str], Any]
 
 SIMILARITY_THRESHOLD = 0.85  # 相似度阈值，用于记忆合并
+SCOPED_DEDUP_SIMILARITY_THRESHOLD = (
+    0.9  # 自动提取落库前同归属查重阈值（与合并预筛一致）
+)
 
+
+# TTL 过期标记的 SQL 片段（单一来源，测试直接复用验证边界）
+TTL_EXPIRE_SET_CLAUSE = (
+    "json_set(metadata, '$.deprecated', 1, '$.deprecated_at', :now_iso)"
+)
+TTL_EXPIRE_WHERE_CLAUSE = (
+    "json_extract(metadata,'$.is_memory_record') = 1 "
+    "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
+    "AND json_extract(metadata,'$.kb_id') = :kb_id "
+    "AND COALESCE(NULLIF(json_extract(metadata,'$.last_recalled_at'), ''), "
+    "json_extract(metadata,'$.created_at')) < :cutoff "
+    "AND json_extract(metadata,'$.memory_type') != 'permanent' "
+    "AND json_extract(metadata,'$.memory_scope') != 'global' "
+    "AND NOT ("
+    "CAST(COALESCE(json_extract(metadata,'$.recall_count'),0) AS INTEGER) >= 5 "
+    "AND COALESCE(json_extract(metadata,'$.domain'), '') IN "
+    "('fact','facts','preference','preferences')"
+    ")"
+)
 # 允许的记忆域
 _ALLOWED_DOMAINS = frozenset(
     [
@@ -597,25 +619,18 @@ class MemoryManager:
         return updated
 
     async def expire_stale_memories(self, ttl_days: int) -> int:
-        """TTL 过期：把超过 ttl_days 且未废弃的记忆标记 deprecated=True（P1.1）。
+        """TTL 过期：把超过 ttl_days 未活跃且未废弃的记忆标记 deprecated=True。
 
+        活跃时间取 last_recalled_at（为空回退 created_at），高频召回的
+        fact/preference 类核心记忆豁免；permanent 与 global 维持既有豁免。
         召回 filter 已排除 deprecated，标记后即从召回移除。返回标记条数。
         """
         if ttl_days <= 0 or not self._kb_helper:
             return 0
         kb_id = self._kb_helper.kb.kb_id
         cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
-        set_clause = (
-            "json_set(metadata, '$.deprecated', 1, '$.deprecated_at', :now_iso)"
-        )
-        where_clause = (
-            "json_extract(metadata,'$.is_memory_record') = 1 "
-            "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
-            "AND json_extract(metadata,'$.kb_id') = :kb_id "
-            "AND json_extract(metadata,'$.created_at') < :cutoff "
-            "AND json_extract(metadata,'$.memory_type') != 'permanent' "
-            "AND json_extract(metadata,'$.memory_scope') != 'global'"
-        )
+        set_clause = TTL_EXPIRE_SET_CLAUSE
+        where_clause = TTL_EXPIRE_WHERE_CLAUSE
         params: dict[str, Any] = {
             "kb_id": kb_id,
             "cutoff": cutoff_iso,
@@ -1063,11 +1078,6 @@ class MemoryManager:
                 "memory_scope": MemoryScope.GROUP,
                 "owner_session_id": owner_session_id,
             }
-            if parsed.is_group and self.config.get("share_group_across_groups", False):
-                filters = {
-                    "memory_scope": MemoryScope.GROUP,
-                    "platform_id": parsed.platform_id,
-                }
         elif scope == MemoryScope.CONVERSATION:
             filters = {
                 "memory_scope": MemoryScope.CONVERSATION,
@@ -1632,6 +1642,71 @@ class MemoryManager:
         )
         return bool(docs)
 
+    async def find_scoped_duplicate(
+        self,
+        *,
+        content: str,
+        memory_scope: str,
+        platform_id: str,
+        session_id: str,
+        umo: str,
+        owner_user_id: str = "",
+        threshold: float = SCOPED_DEDUP_SIMILARITY_THRESHOLD,
+        vec_db: Any | None = None,
+    ) -> str | None:
+        """同作用域、同归属的高相似度查重，命中返回已有记忆 URI。
+
+        仅供自动提取落库前调用；检索严格限定在当前归属分区内，不跨
+        作用域比对，检索失败时按无重复处理（不阻断写入）。
+        vec_db 仅供测试注入真实向量库实例，生产调用走 self.vec_db。
+        """
+        if vec_db is None:
+            if not self._kb_helper:
+                return None
+            vec_db = self.vec_db
+        filters: dict[str, Any] = {
+            "is_memory_record": True,
+            "deprecated": False,
+            "memory_scope": memory_scope,
+        }
+        if memory_scope == MemoryScope.PERSONAL:
+            if not owner_user_id:
+                return None
+            filters["owner_user_id"] = owner_user_id
+            if not self.config.get("global_memory", True):
+                filters["umo"] = umo
+        elif memory_scope == MemoryScope.GROUP:
+            filters["owner_session_id"] = build_session_id(platform_id, session_id)
+        elif memory_scope == MemoryScope.CONVERSATION:
+            filters["umo"] = umo
+        else:
+            return None
+        try:
+            results = await vec_db.retrieve(
+                query=content,
+                k=3,
+                rerank=False,
+                metadata_filters=filters,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[简单长期记忆] 提取查重检索失败（按无重复继续）: {type(e).__name__}"
+            )
+            return None
+        best_uri = None
+        best_similarity = 0.0
+        for item in results or []:
+            similarity = float(getattr(item, "similarity", 0) or 0)
+            if similarity < threshold or similarity <= best_similarity:
+                continue
+            data = getattr(item, "data", None) or {}
+            metadata = _safe_parse_metadata(data.get("metadata", {}))
+            uri = metadata.get("uri")
+            if uri:
+                best_uri = uri
+                best_similarity = similarity
+        return best_uri
+
     async def _run_recall_channel(
         self, call: Any, deadline: float, trace_id: str
     ) -> Any:
@@ -2040,11 +2115,14 @@ class MemoryManager:
                 return False
             if origin.platform_id != parsed.platform_id:
                 return False
-            return bool(
-                self.config.get("share_group_across_groups", False)
-                or meta.get("owner_session_id")
-                == build_session_id(parsed.platform_id, parsed.session_id)
-            )
+            if meta.get("owner_session_id") == build_session_id(
+                parsed.platform_id, parsed.session_id
+            ):
+                return True
+            # 跨群共享只放行客观事实类群记忆；群内偏好/事件/上下文不跨群
+            if not self.config.get("share_group_across_groups", False):
+                return False
+            return str(meta.get("domain") or "").strip().lower() in ("fact", "facts")
         if scope == MemoryScope.CONVERSATION:
             return meta.get("umo") == event.unified_msg_origin
         return False
@@ -2078,6 +2156,30 @@ class MemoryManager:
             if domain:
                 filters["domain"] = domain
             filters_list.append(filters)
+            if (
+                scope == MemoryScope.GROUP
+                and parsed.is_group
+                and self.config.get("share_group_across_groups", False)
+            ):
+                # 跨群共享预过滤与 _is_memory_visible 同边界：仅客观事实类群记忆，
+                # 覆盖 fact/facts 新旧别名；显式 domain 参数保持精确匹配语义
+                requested_domain = str(domain).lower().strip() if domain else ""
+                if not requested_domain:
+                    cross_domains = ("fact", "facts")
+                elif requested_domain in ("fact", "facts"):
+                    cross_domains = (requested_domain,)
+                else:
+                    cross_domains = ()
+                for cross_domain in cross_domains:
+                    filters_list.append(
+                        {
+                            "memory_scope": MemoryScope.GROUP,
+                            "platform_id": parsed.platform_id,
+                            "domain": cross_domain,
+                            "is_memory_record": True,
+                            "deprecated": False,
+                        }
+                    )
         return filters_list
 
     async def _retrieve_with_filter(

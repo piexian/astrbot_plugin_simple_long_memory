@@ -865,21 +865,21 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
                     _PMH(
                         id=1,
                         platform_id="webchat",
-                        user_id="s-inactive",
+                        user_id="webchat:FriendMessage:s-inactive",
                         created_at=now,
                         is_active=False,
                     ),
                     _PMH(
                         id=2,
                         platform_id="webchat",
-                        user_id="s-mixed",
+                        user_id="webchat:FriendMessage:s-mixed",
                         created_at=now,
                         is_active=False,
                     ),
                     _PMH(
                         id=3,
                         platform_id="webchat",
-                        user_id="s-mixed",
+                        user_id="webchat:FriendMessage:s-mixed",
                         created_at=now,
                         is_active=True,
                     ),
@@ -902,9 +902,11 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
             convs = await seg._list_active_conversations(
                 datetime(2000, 1, 1, tzinfo=timezone.utc)
             )
-            rows = await seg._fetch_rows("webchat", "s-mixed", after_id=0, limit=10)
+            rows = await seg._fetch_rows(
+                "webchat", "webchat:FriendMessage:s-mixed", after_id=0, limit=10
+            )
 
-        self.assertEqual(convs, [("webchat", "s-mixed")])
+        self.assertEqual(convs, [("webchat", "webchat:FriendMessage:s-mixed")])
         self.assertEqual([r.id for r in rows], [3])
 
         # 仅有非活跃 PMH 行的会话也不应通过 ConversationV2 回退重新进入提取
@@ -915,8 +917,12 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
 
         seg._list_conv2_conversations = AsyncMock(
             return_value=[
-                SimpleNamespace(platform_id="webchat", user_id="s-inactive"),
-                SimpleNamespace(platform_id="webchat", user_id="s-conv2-only"),
+                SimpleNamespace(
+                    platform_id="webchat", user_id="webchat:FriendMessage:s-inactive"
+                ),
+                SimpleNamespace(
+                    platform_id="webchat", user_id="webchat:FriendMessage:s-conv2-only"
+                ),
             ]
         )
         seg._collect_conv2_conversation = AsyncMock(side_effect=fake_collect_conv2)
@@ -925,7 +931,7 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {"astrbot.core.db.po": po_mod}):
             await seg.collect_blocks(max_llm_calls=5)
 
-        self.assertEqual(conv2_seen, ["webchat:s-conv2-only"])
+        self.assertEqual(conv2_seen, ["webchat:webchat:FriendMessage:s-conv2-only"])
 
     async def test_analyst_extracts_plain_text_from_structured_content_parts(self):
         history = [

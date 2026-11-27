@@ -25,6 +25,9 @@ except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.p
     from prompts import sanitize_memory_content
 
 
+SOURCE_EXCERPT_MAX_CHARS = 2000  # create 操作来源摘录上限，供审核员核对证据
+
+
 class CuratorAgent:
     """整理师（提取向）Agent。"""
 
@@ -146,7 +149,7 @@ class CuratorAgent:
         memories = validate_extracted_memories(
             parsed_json.get("memories"), parsed_umo.session_type
         )
-        source_excerpt = " ".join(block.text.split())[:200]
+        source_excerpt = " ".join(block.text.split())[:SOURCE_EXCERPT_MAX_CHARS]
         creates = []
         for mem in memories:
             if mem["scope"] == "personal":
