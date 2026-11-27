@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock
 import yaml
 from test_memory_commands import MemoryManager, plugin_main
 
-from maintenance.agents.analyst import AnalystAgent
 from maintenance.llm import MaintenanceLLM
+from maintenance.relations import extract_plain_text
 from maintenance.runner import MaintenanceRunner
 from maintenance.scheduler import MaintenanceScheduler
 
@@ -830,41 +830,27 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AnalystContentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_analyst_extracts_plain_text_from_structured_content_parts(self):
-        history = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "我最喜欢拿铁"},
-                    {"type": "text", "text": "<temp>", "_no_save": True},
-                    {"type": "image_url", "image_url": {"url": "data:..."}},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "think", "think": "内部思考", "encrypted": "SECRET_SIG"},
-                    {"type": "text", "text": "记住了，你喜欢拿铁。"},
-                ],
-            },
-        ]
-        conv = SimpleNamespace(history=json.dumps(history, ensure_ascii=False))
-        ctx = SimpleNamespace(
-            conversation_manager=SimpleNamespace(
-                get_conversations=AsyncMock(return_value=[conv])
-            )
+    def test_extracts_plain_text_from_structured_content_parts(self):
+        user_text = extract_plain_text(
+            [
+                {"type": "text", "text": "我最喜欢拿铁"},
+                {"type": "text", "text": "<temp>", "_no_save": True},
+                {"type": "image_url", "image_url": {"url": "data:..."}},
+            ]
         )
-        analyst = AnalystAgent(ctx, SimpleNamespace(), SimpleNamespace(), {})
+        assistant_text = extract_plain_text(
+            [
+                {"type": "think", "think": "内部思考", "encrypted": "SECRET_SIG"},
+                {"type": "text", "text": "记住了，你喜欢拿铁。"},
+            ]
+        )
 
-        text = await analyst._get_conversation_history({"umo": "qq:FriendMessage:u1"})
-
-        self.assertIn("[user]: 我最喜欢拿铁", text)
-        self.assertIn("[assistant]: 记住了，你喜欢拿铁。", text)
-        self.assertNotIn("内部思考", text)
-        self.assertNotIn("SECRET_SIG", text)
-        self.assertNotIn("<temp>", text)
-        self.assertNotIn("data:...", text)
-        self.assertNotIn("image_url", text)
+        self.assertEqual(user_text, "我最喜欢拿铁")
+        self.assertEqual(assistant_text, "记住了，你喜欢拿铁。")
+        self.assertNotIn("内部思考", assistant_text)
+        self.assertNotIn("SECRET_SIG", assistant_text)
+        self.assertNotIn("<temp>", user_text)
+        self.assertNotIn("data:...", user_text)
 
 
 class MetadataAndI18nSchemaTests(unittest.TestCase):

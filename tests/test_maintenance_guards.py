@@ -94,39 +94,54 @@ class _FakeKV:
         self.store[key] = value
 
 
-class AnalystContradictionTests(unittest.TestCase):
+class AnalystClassificationTests(unittest.TestCase):
     def _analyst(self, config: dict | None = None) -> AnalystAgent:
         return AnalystAgent(None, None, None, config or {})
 
+    def _conflict_manifest(self, analyst: AnalystAgent, count: int) -> dict:
+        manifest = {
+            "new_links": [],
+            "contradictions": [],
+            "merges": [],
+            "verification_tasks": [],
+        }
+        classification = {
+            "verdict": "conflict",
+            "reason": "两条记忆对同一事实给出相反结论",
+            "confidence": 0.9,
+        }
+        for i in range(count):
+            analyst._apply_classification(
+                manifest,
+                _mem(f"u://{i}a", f"用户喜欢苹果{i}", "2026-01-01"),
+                _mem(f"u://{i}b", f"用户讨厌苹果{i}", "2026-02-01"),
+                classification,
+            )
+        return manifest
+
     def test_respects_max_contradictions(self):
         analyst = self._analyst({"maintenance_analyst_max_contradictions": 3})
-        pairs = [
-            (
-                _mem(f"u://{i}a", f"用户喜欢 苹果 香蕉 橙子 {i}", "2026-01-01"),
-                _mem(f"u://{i}b", f"用户喜欢 苹果 香蕉 西瓜 {i}", "2026-02-01"),
-                0.8,
-            )
-            for i in range(50)
-        ]
-        result = analyst._detect_contradictions(pairs)
-        self.assertEqual(len(result), 3)
+        manifest = self._conflict_manifest(analyst, 50)
+        self.assertEqual(len(manifest["contradictions"]), 3)
 
-    def test_excludes_linked_pairs_both_directions(self):
-        analyst = self._analyst()
-        a = _mem("u://a", "用户 喜欢 苹果 香蕉 橙子", "2026-01-01")
-        b = _mem("u://b", "用户 喜欢 苹果 香蕉 西瓜", "2026-02-01")
-        result = analyst._detect_contradictions(
-            [(a, b, 0.8)], exclude_pairs={("u://b", "u://a")}
+    def test_low_confidence_conflict_held_for_verification(self):
+        analyst = self._analyst({"maintenance_verification_confidence_threshold": 0.6})
+        manifest = self._conflict_manifest(analyst, 0)
+        analyst._apply_classification(
+            manifest,
+            _mem("u://a", "用户喜欢苹果", "2026-01-01"),
+            _mem("u://b", "用户讨厌苹果", "2026-02-01"),
+            {"verdict": "conflict", "reason": "相反结论", "confidence": 0.4},
         )
-        self.assertEqual(result, [])
+        self.assertEqual(manifest["contradictions"], [])
+        self.assertEqual(len(manifest["verification_tasks"]), 1)
 
-    def test_old_new_ordering_by_time(self):
+    def test_conflict_orientation_by_time(self):
         analyst = self._analyst()
-        a = _mem("u://a", "用户 喜欢 苹果 香蕉 橙子", "2026-02-01")
-        b = _mem("u://b", "用户 喜欢 苹果 香蕉 西瓜", "2026-01-01")
-        result = analyst._detect_contradictions([(a, b, 0.8)])
-        self.assertEqual(result[0]["old_uri"], "u://b")
-        self.assertEqual(result[0]["new_uri"], "u://a")
+        manifest = self._conflict_manifest(analyst, 1)
+        conflict = manifest["contradictions"][0]
+        self.assertEqual(conflict["old_uri"], "u://0a")
+        self.assertEqual(conflict["new_uri"], "u://0b")
 
     def test_same_scope_group_tenant_isolation(self):
         analyst = self._analyst()
@@ -514,7 +529,7 @@ class DryRunMaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 agent_type="organizer", parsed=True, operations=[{"type": "archive"}]
             )
 
-        async def analyst():
+        async def analyst(**kwargs):
             return AgentManifest(
                 agent_type="analyst", parsed=True, operations=[{"type": "new_link"}]
             )
@@ -554,7 +569,7 @@ class DryRunMaintenanceTests(unittest.IsolatedAsyncioTestCase):
             cache_states.append(("organizer", llm._cache_enabled))
             return AgentManifest(agent_type="organizer", parsed=True)
 
-        async def analyst():
+        async def analyst(**kwargs):
             cache_states.append(("analyst", llm._cache_enabled))
             return AgentManifest(agent_type="analyst", parsed=True)
 

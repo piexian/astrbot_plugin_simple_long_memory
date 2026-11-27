@@ -59,6 +59,11 @@ class _Handler(BaseHTTPRequestHandler):
             if content is None:
                 self._reply(500, {"error": "no scripted chat response"})
                 return
+            message = (
+                {"role": "assistant", **content}
+                if isinstance(content, dict)
+                else {"role": "assistant", "content": content}
+            )
             self._reply(
                 200,
                 {
@@ -69,7 +74,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": content},
+                            "message": message,
                             "finish_reason": "stop",
                         }
                     ],
@@ -116,6 +121,10 @@ class LocalAstrBotServer(ThreadingHTTPServer):
     def queue_chat(self, *contents):
         self._chat_contents.extend(contents)
 
+    def queue_chat_message(self, *messages):
+        """入队完整 assistant message（如带 tool_calls 的脚本化工具调用）。"""
+        self._chat_contents.extend(messages)
+
     def set_default_chat(self, content):
         self._default_chat_content = content
 
@@ -134,6 +143,50 @@ class LocalAstrBotServer(ThreadingHTTPServer):
     @property
     def base_url(self):
         return f"http://{self.server_address[0]}:{self.server_address[1]}/v1"
+
+
+def decisions_by_request_choices(script):
+    """跨请求按问题顺序返回 choice 应答；script 为 [(choice, probability), ...]。
+
+    probabilities 覆盖该问题全部选项且和为 1，满足 Decision 契约校验。
+    """
+    cursor = {"next": 0}
+
+    def factory(request):
+        questions = request.get("questions") or []
+        answers = []
+        for index, question in enumerate(questions):
+            position = cursor["next"]
+            cursor["next"] += 1
+            choice, probability = (
+                script[position] if position < len(script) else script[-1]
+            )
+            options = [
+                str(entry.get("value")) for entry in question.get("choices") or []
+            ]
+            if choice not in options:
+                choice = options[0]
+            remainder = max(0.0, 1.0 - probability) / max(1, len(options) - 1)
+            answers.append(
+                {
+                    "name": question.get("name", f"q{index}"),
+                    "type": "choice",
+                    "choice": str(choice),
+                    "confidence": min(1.0, probability),
+                    "probabilities": [
+                        {
+                            "value": option,
+                            "probability": probability
+                            if option == choice
+                            else remainder,
+                        }
+                        for option in options
+                    ],
+                }
+            )
+        return answers
+
+    return factory
 
 
 def decisions_by_request_probability(probabilities):
@@ -204,6 +257,7 @@ def provider_configs(base_url):
             "embedding_api_key": "test-key",
             "embedding_api_base": base_url,
             "embedding_model": "test-embed",
+            "embedding_dimensions": str(EMBED_DIM),
         },
     }
 

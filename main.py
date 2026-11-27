@@ -2975,7 +2975,7 @@ class MemoryPlugin(Star):
             manifest = result.get(name)
             if isinstance(manifest, dict):
                 metrics = manifest.get("metrics") or {}
-                report.append(
+                parts = [
                     "  {name}: 解析 {parsed}，操作 {operations}，记忆 {memories}，"
                     "向量 {vectors}，缺失 {missing}，候选 {candidates}".format(
                         name=name,
@@ -2988,7 +2988,33 @@ class MemoryPlugin(Star):
                         missing=metrics.get("vector_missing", 0),
                         candidates=metrics.get("candidates_screened", 0),
                     )
+                ]
+                if name == "organizer":
+                    parts.append(
+                        "巡检 {inspected}，merge {merge}，archive {archive}，"
+                        "update {update}".format(
+                            inspected=metrics.get("inspected", 0),
+                            merge=metrics.get("op_merge", 0),
+                            archive=metrics.get("op_archive", 0),
+                            update=metrics.get("op_update", 0),
+                        )
+                    )
+                else:
+                    parts.append(
+                        "link {link}，conflict {conflict}，merge {merge}".format(
+                            link=metrics.get("op_new_link", 0),
+                            conflict=metrics.get("op_contradiction", 0),
+                            merge=metrics.get("op_merge", 0),
+                        )
+                    )
+                parts.append(
+                    "需核验 {needed}，实际核验 {executed}，预算跳过 {skipped}".format(
+                        needed=metrics.get("verification_needed", 0),
+                        executed=metrics.get("verification_executed", 0),
+                        skipped=metrics.get("verification_budget_skipped", 0),
+                    )
                 )
+                report.append("，".join(parts))
         reviewer = result.get("reviewer")
         if isinstance(reviewer, dict):
             report.append(

@@ -22,6 +22,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..llm import MaintenanceLLM
+from ..persona import PersonaSummaryProvider
 from ..prompts import DEFAULT_REVIEWER_PROMPT, build_prompt
 
 
@@ -37,12 +38,16 @@ class ReviewerAgent:
         memory_mgr: Any,
         llm: MaintenanceLLM,
         config: dict[str, Any],
+        *,
+        persona_provider: PersonaSummaryProvider | None = None,
     ) -> None:
         self._context = context
         self._memory_mgr = memory_mgr
         self._llm = llm
         self._config = config
         self._controversial_threshold = 0.5  # 置信度低于此值标记争议
+        # 宿主传入周期内共享的人格读取器；未传时自建（同一实现）
+        self._persona_provider = persona_provider
         # 最近一次 review() 中未产出裁决的原因分布（供宿主区分有意部分评审与异常）
         self.last_unresolved: dict[str, int] = {
             "budget_exhausted": 0,
@@ -326,12 +331,8 @@ class ReviewerAgent:
         return {"memories": memories}
 
     async def _get_persona_summary(self) -> str:
-        """获取人格摘要。"""
-        mode = self._config.get("persona_mode", "auto")
-        if mode == "manual":
-            return self._config.get("persona_summary", "")
-        elif mode == "off":
-            return ""
-        else:
-            # auto: 从主人格提取（Phase 5 完善）
-            return ""
+        """获取人格边界摘要（与整理师共用 PersonaSummaryProvider）。"""
+        provider = self._persona_provider or PersonaSummaryProvider(
+            self._context, self._config
+        )
+        return await provider.get()

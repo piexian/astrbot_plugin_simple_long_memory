@@ -439,6 +439,53 @@ class MaintenanceInbox:
             )
         return result
 
+    async def fetch_recent_rows_for_umo(
+        self, umo: str, limit: int = 10
+    ) -> list[_InboxRow]:
+        """按 UMO 读取最近的缓冲行（任意状态），供核验工具补上下文。"""
+        if not self._initialized or not umo:
+            return []
+        try:
+            doc_storage = self._vec_db.document_storage
+            async with doc_storage.get_session() as session:
+                from sqlalchemy import text as sa_text
+
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT id, umo, platform_id, session_type, session_id, "
+                            "conversation_id, sender_id, sender_name, user_text, "
+                            "assistant_brief, created_at, realtime_extracted, "
+                            "retry_count FROM maintenance_inbox "
+                            "WHERE umo = :umo ORDER BY id DESC LIMIT :limit"
+                        ),
+                        {"umo": str(umo), "limit": max(1, int(limit))},
+                    )
+                ).all()
+                recent = [
+                    _InboxRow(
+                        id=int(row.id),
+                        umo=str(row.umo),
+                        platform_id=str(row.platform_id),
+                        session_type=str(row.session_type),
+                        session_id=str(row.session_id),
+                        conversation_id=str(row.conversation_id),
+                        sender_id=str(row.sender_id),
+                        sender_name=str(row.sender_name),
+                        user_text=str(row.user_text),
+                        assistant_brief=str(row.assistant_brief),
+                        created_at=_parse_created_at(row.created_at),
+                        realtime_extracted=bool(row.realtime_extracted),
+                        retry_count=int(row.retry_count),
+                    )
+                    for row in rows
+                ]
+                recent.reverse()  # 恢复时间顺序
+                return recent
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 缓冲表按 UMO 读取失败: {type(e).__name__}")
+            return []
+
     async def status_counts(self) -> dict[str, int]:
         """按状态统计行数，仅供诊断与测试。"""
         if not self._initialized:

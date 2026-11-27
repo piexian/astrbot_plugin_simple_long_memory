@@ -104,6 +104,18 @@ class MaintenanceLLM:
         self._cache_hits = 0
         self._errors = 0
 
+    def reserve_calls(self, count: int) -> bool:
+        """为外部 Agent 回合（tool_loop_agent）预留预算额度。
+
+        保守按 max_steps+1 预留：额度不足返回 False（不启动核验），
+        成功即扣减剩余额度，外部模型调用因此不会绕过周期总上限。
+        """
+        count = int(count)
+        if count <= 0 or self._calls + count > self._max_calls_per_cycle:
+            return False
+        self._calls += count
+        return True
+
     # ─── 缓存 ───────────────────────────────────────────────
 
     def _cache_key(self, text_a: str, text_b: str, task: str, model_id: str) -> str:

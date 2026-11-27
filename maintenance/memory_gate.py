@@ -37,6 +37,20 @@ except ImportError:  # pragma: no cover - AstrBot < 4.30
     DecisionBooleanAnswer = None  # type: ignore[assignment]
     DecisionBooleanQuestion = None  # type: ignore[assignment]
     _DECISION_PROVIDER_TYPE = None
+
+
+def build_maintenance_gate(
+    context: Any, llm: Any, config: dict[str, Any]
+) -> MemoryGate:
+    """构造后台整理路径共用的闸门：Decision 走受控计数，Chat 复用维护模型。"""
+    return MemoryGate(
+        decision_service=getattr(context, "decision", None),
+        provider_manager=getattr(context, "provider_manager", None),
+        decision_ask=llm.ask_decisions,
+        chat_judge=MaintenanceLLMJudge(llm, config.get("maintenance_model_id", "")),
+    )
+
+
 GATE_DURABLE_MIN_PROBABILITY = 0.7
 """has_durable_value 的最低放行概率。"""
 

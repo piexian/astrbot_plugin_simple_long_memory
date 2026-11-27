@@ -24,7 +24,9 @@ from .agents.reviewer import ReviewerAgent
 from .extraction_journal import ExtractionJournal
 from .inbox import STATUS_PROCESSED, STATUS_SKIPPED
 from .llm import MaintenanceLLM
-from .memory_gate import GateCandidate, MaintenanceLLMJudge, MemoryGate
+from .memory_gate import GateCandidate, MemoryGate, build_maintenance_gate
+from .persona import PersonaSummaryProvider
+from .verifier import MaintenanceVerifier, VerificationTask
 
 try:  # 正常插件加载（包内相对导入）
     from ..extraction_utils import normalize_extracted_scope
@@ -178,8 +180,60 @@ class MaintenanceRunner:
         # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
         self._last_review_unresolved: dict[str, int] = {}
         self._extract_journal = ExtractionJournal(kv_get, kv_put)
-        # 后台闸门懒加载后跨提取调用复用（Decision 未配置缓存只探测一次）
         self._gate: MemoryGate | None = None
+        # 周期内共享的人格摘要读取器与受控核验器（每周期清缓存/清计数）
+        self._persona_provider: PersonaSummaryProvider | None = None
+        self._verifier: MaintenanceVerifier | None = None
+        self._verification_used = 0
+
+    def _reset_cycle_state(self) -> None:
+        """周期级状态复位：LLM 统计、人格缓存、核验计数。"""
+        self._llm.reset_cycle_stats()
+        self._verification_used = 0
+        if self._persona_provider is not None:
+            self._persona_provider.clear()
+
+    def _get_persona_provider(self) -> PersonaSummaryProvider:
+        """懒加载周期内共享的人格摘要读取器（Reviewer 与 Organizer 共用）。"""
+        if self._persona_provider is None:
+            self._persona_provider = PersonaSummaryProvider(self._context, self._config)
+        return self._persona_provider
+
+    def _get_verifier(self) -> MaintenanceVerifier:
+        """懒加载受控核验器（真实 tool_loop_agent，预算经 MaintenanceLLM）。"""
+        if self._verifier is None:
+            self._verifier = MaintenanceVerifier(
+                context=self._context,
+                memory_mgr=self._memory_mgr,
+                llm=self._llm,
+                config=self._config,
+            )
+        return self._verifier
+
+    async def _run_verifications(
+        self, tasks: list[VerificationTask]
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """执行本阶段积累的核验任务，返回 (提案操作, 统计)。
+
+        每周期核验次数受 maintenance_verification_max_per_cycle 限制；
+        预算不足或超出上限的任务不执行（其原提案一并保留现状，留待下周期）。
+        """
+        needed = len(tasks)
+        if needed == 0:
+            return [], {
+                "verification_needed": 0,
+                "verification_executed": 0,
+                "verification_budget_skipped": 0,
+            }
+        cap = int(self._config.get("maintenance_verification_max_per_cycle", 2))
+        allowance = max(0, cap - self._verification_used)
+        proposals, executed = await self._get_verifier().run(tasks, allowance=allowance)
+        self._verification_used += executed
+        return proposals, {
+            "verification_needed": needed,
+            "verification_executed": executed,
+            "verification_budget_skipped": needed - executed,
+        }
 
     async def run_cycle(self, *, dry_run: bool = False) -> MaintenanceReport:
         """执行一次完整整理周期；dry_run 时不执行阶段 4 写入。"""
@@ -199,8 +253,8 @@ class MaintenanceRunner:
         try:
             logger.info(f"[简单长期记忆] 开始整理周期: {session_id}")
 
-            # 重置 LLM 统计
-            self._llm.reset_cycle_stats()
+            # 重置周期级状态（LLM 统计、人格缓存、核验计数）
+            self._reset_cycle_state()
             logger.debug(
                 "[简单长期记忆] 整理周期配置: session=%s, extract=%s, organizer=%s, "
                 "analyst=%s, reviewer=%s, max_llm=%s, max_ops=%s",
@@ -248,7 +302,11 @@ class MaintenanceRunner:
             # ── 阶段 2: analyst（分析师）──
             if self._config.get("maintenance_analyst_enabled", True):
                 try:
-                    report.analyst_manifest = await self._run_analyst()
+                    report.analyst_manifest = await self._run_analyst(
+                        exclude_uris=self._organizer_merge_uris(
+                            report.organizer_manifest
+                        )
+                    )
                 except Exception as e:
                     report.errors.append(f"analyst: {e}")
                     logger.warning(f"[简单长期记忆] analyst 失败: {e}")
@@ -359,7 +417,7 @@ class MaintenanceRunner:
         self._running = True
         started = datetime.now(timezone.utc)
         result: dict[str, Any] = {"stage": normalized, "dry_run": True}
-        self._llm.reset_cycle_stats()
+        self._reset_cycle_state()
         previous_cache_enabled = getattr(self._llm, "_cache_enabled", None)
         if previous_cache_enabled is not None:
             self._llm._cache_enabled = False
@@ -384,7 +442,9 @@ class MaintenanceRunner:
                 )
             else:
                 organizer = await self._run_organizer()
-                analyst = await self._run_analyst()
+                analyst = await self._run_analyst(
+                    exclude_uris=self._organizer_merge_uris(organizer)
+                )
                 verdicts = await self._run_reviewer(organizer, analyst)
                 result["organizer"] = self._test_manifest_summary(organizer)
                 result["analyst"] = self._test_manifest_summary(analyst)
@@ -781,14 +841,7 @@ class MaintenanceRunner:
         """
         gate = getattr(self, "_gate", None)
         if gate is None:
-            gate = MemoryGate(
-                decision_service=getattr(self._context, "decision", None),
-                provider_manager=getattr(self._context, "provider_manager", None),
-                decision_ask=self._llm.ask_decisions,
-                chat_judge=MaintenanceLLMJudge(
-                    self._llm, self._config.get("maintenance_model_id", "")
-                ),
-            )
+            gate = build_maintenance_gate(self._context, self._llm, self._config)
             self._gate = gate
         return gate
 
@@ -819,29 +872,20 @@ class MaintenanceRunner:
         await journal.clear_if_finished()
 
     async def _run_organizer(self) -> AgentManifest:
-        """运行整理师：去重合并、质量精炼。"""
+        """运行整理师：去重合并、单条巡检与质量精炼。"""
         manifest = AgentManifest(agent_type="organizer")
 
-        # 使用 OrganizerAgent 执行整理
         organizer = OrganizerAgent(
             context=self._context,
             memory_mgr=self._memory_mgr,
             llm=self._llm,
             config=self._config,
+            gate=self._get_gate(),
+            persona_provider=self._get_persona_provider(),
         )
 
         try:
             result = await organizer.run()
-            manifest.metrics = {
-                key: result.get(key)
-                for key in (
-                    "memory_count",
-                    "vector_count",
-                    "vector_missing",
-                    "candidates_screened",
-                    "llm_calls",
-                )
-            }
             manifest.parsed = True
             # 将 organizer 的输出转换为 operations 格式
             for merge_op in result.get("merge", []):
@@ -871,6 +915,21 @@ class MaintenanceRunner:
                         "reason": update_op.get("reason", ""),
                     }
                 )
+            manifest.metrics = {
+                key: result.get(key)
+                for key in (
+                    "memory_count",
+                    "vector_count",
+                    "vector_missing",
+                    "candidates_screened",
+                    "llm_calls",
+                    "inspected",
+                    "inspection_kept",
+                    "inspection_unavailable",
+                )
+            }
+            await self._attach_verification_ops(manifest, result)
+            manifest.metrics.update(self._op_type_counts(manifest.operations))
             manifest.notes = result.get("notes", "")
         except Exception as e:
             manifest.error = str(e)
@@ -878,11 +937,13 @@ class MaintenanceRunner:
 
         return manifest
 
-    async def _run_analyst(self) -> AgentManifest:
-        """运行分析师：关联发现、矛盾检测。"""
+    async def _run_analyst(self, exclude_uris: set[str] | None = None) -> AgentManifest:
+        """运行分析师：中文语义四分类与矛盾发现。
+
+        exclude_uris 为整理师 merge 已消费的 URI，避免对同 URI 重复提案。
+        """
         manifest = AgentManifest(agent_type="analyst")
 
-        # 使用 AnalystAgent 执行分析
         analyst = AnalystAgent(
             context=self._context,
             memory_mgr=self._memory_mgr,
@@ -891,18 +952,7 @@ class MaintenanceRunner:
         )
 
         try:
-            result = await analyst.run()
-            manifest.metrics = {
-                key: result.get(key)
-                for key in (
-                    "memory_count",
-                    "vector_count",
-                    "vector_missing",
-                    "conversation_chars",
-                    "candidates_screened",
-                    "llm_calls",
-                )
-            }
+            result = await analyst.run(exclude_uris=exclude_uris)
             manifest.parsed = True
             # 将 analyst 的输出转换为 operations 格式
             for link_op in result.get("new_links", []):
@@ -926,12 +976,75 @@ class MaintenanceRunner:
                         "confidence": contra_op.get("confidence", 0.0),
                     }
                 )
+            for merge_op in result.get("merges", []):
+                manifest.operations.append(
+                    {
+                        "type": "merge",
+                        "uris": merge_op.get("uris", []),
+                        "merged_content": merge_op.get("merged_content", ""),
+                        "reason": merge_op.get("reason", ""),
+                        "confidence": merge_op.get("confidence", 0.0),
+                    }
+                )
+            manifest.metrics = {
+                key: result.get(key)
+                for key in (
+                    "memory_count",
+                    "vector_count",
+                    "vector_missing",
+                    "candidates_screened",
+                    "llm_calls",
+                    "decision_calls",
+                    "chat_fallback_calls",
+                )
+            }
+            await self._attach_verification_ops(manifest, result)
+            manifest.metrics.update(self._op_type_counts(manifest.operations))
             manifest.notes = result.get("notes", "")
         except Exception as e:
             manifest.error = str(e)
             logger.warning(f"[简单长期记忆] 分析师执行失败: {e}")
 
         return manifest
+
+    async def _attach_verification_ops(
+        self, manifest: AgentManifest, result: dict[str, Any]
+    ) -> None:
+        """把核验产出的提案并入 manifest 操作与统计。
+
+        核验提案仍交审核员复核；未被核验的任务不直接执行（保留现状，
+        留待下周期重新评估）。
+        """
+        proposals, stats = await self._run_verifications(
+            list(result.get("verification_tasks", []))
+        )
+        manifest.operations.extend(proposals)
+        manifest.metrics.update(stats)
+        manifest.metrics["verification_proposals"] = len(proposals)
+
+    @staticmethod
+    def _op_type_counts(operations: list[dict[str, Any]]) -> dict[str, int]:
+        """按操作类型计数（dry-run 报告用，不含正文与理由）。"""
+        counts: dict[str, int] = {}
+        for op in operations:
+            op_type = str(op.get("type", "") or "")
+            key = f"op_{op_type}" if op_type else "op_unknown"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @staticmethod
+    def _organizer_merge_uris(manifest: AgentManifest | None) -> set[str]:
+        """提取整理师 merge 操作已消费的 URI，供分析师去重。"""
+        uris: set[str] = set()
+        if manifest is None:
+            return uris
+        for op in manifest.operations:
+            if op.get("type") != "merge":
+                continue
+            for uri in op.get("uris", []):
+                if isinstance(uri, str) and uri:
+                    uris.add(uri)
+        return uris
 
     async def _run_reviewer(
         self,
@@ -960,6 +1073,7 @@ class MaintenanceRunner:
             memory_mgr=self._memory_mgr,
             llm=self._llm,
             config=self._config,
+            persona_provider=self._get_persona_provider(),
         )
 
         # 源记录由审核员按操作逐条拉取（见 ReviewerAgent._get_op_source_data）
@@ -987,17 +1101,6 @@ class MaintenanceRunner:
         """拉取对话历史。"""
         # TODO: Phase 4 从 conversation_manager 拉取
         return "# 最近对话\n（暂无数据）"
-
-    async def _get_persona_summary(self) -> str:
-        """获取人格摘要。"""
-        mode = self._config.get("persona_mode", "auto")
-        if mode == "manual":
-            return self._config.get("persona_summary", "")
-        elif mode == "off":
-            return ""
-        else:
-            # auto: 从主人格提取（Phase 5 完善）
-            return ""
 
     async def _op_touches_global(self, op: dict[str, Any]) -> bool:
         """检查操作是否涉及 global 作用域记忆（查询实际 metadata）。"""
