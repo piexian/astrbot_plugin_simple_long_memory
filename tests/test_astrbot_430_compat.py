@@ -791,6 +791,8 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3 条争议操作", msg.chain[0].text)
 
     def test_plugin_registers_real_astrbot_handlers_and_commands(self):
+        from astrbot.core.star.filter.command import CommandFilter
+        from astrbot.core.star.filter.command_group import CommandGroupFilter
         from astrbot.core.star.star_handler import EventType, star_handlers_registry
 
         by_name = {h.handler_name: h for h in star_handlers_registry}
@@ -800,12 +802,39 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
             ("on_agent_begin", EventType.OnAgentBeginEvent),
             ("on_agent_done", EventType.OnAgentDoneEvent),
             ("on_loaded", EventType.OnAstrBotLoadedEvent),
+            ("memory_group", EventType.AdapterMessageEvent),
             ("cmd_list", EventType.AdapterMessageEvent),
             ("cmd_search", EventType.AdapterMessageEvent),
             ("cmd_rebuild", EventType.AdapterMessageEvent),
         ):
             self.assertIn(name, by_name, f"missing registered handler: {name}")
             self.assertEqual(by_name[name].event_type, expected_type)
+
+        group_filters = [
+            f
+            for f in by_name["memory_group"].event_filters
+            if isinstance(f, CommandGroupFilter)
+        ]
+        self.assertTrue(any(f.group_name == "memory" for f in group_filters))
+
+        for handler_name, expected_cmd in (
+            ("cmd_list", "list"),
+            ("cmd_search", "search"),
+            ("cmd_rebuild", "rebuild"),
+        ):
+            cmd_filters = [
+                f
+                for f in by_name[handler_name].event_filters
+                if isinstance(f, CommandFilter)
+            ]
+            self.assertTrue(
+                any(
+                    f.command_name == expected_cmd
+                    and list(f.parent_command_names) == ["memory"]
+                    for f in cmd_filters
+                ),
+                f"{handler_name} did not register /memory {expected_cmd}",
+            )
 
 
 class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
