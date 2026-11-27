@@ -305,7 +305,7 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        with self.assertLogs(level="INFO") as captured:
+        with self.assertLogs("astrbot", level="INFO") as captured:
             await runner._execute_operations(report)
 
         output = "\n".join(captured.output)
@@ -325,7 +325,7 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("sensitive-database-details")
         )
 
-        with self.assertLogs(level="WARNING") as captured:
+        with self.assertLogs("astrbot", level="WARNING") as captured:
             result = await runner._execute_operation(
                 {"type": "create", "content": "private-memory-body"}
             )
@@ -370,7 +370,7 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
             "subject": "u1",
         }
 
-        with self.assertLogs(level="WARNING") as captured:
+        with self.assertLogs("astrbot", level="WARNING") as captured:
             result = await runner._execute_create(op)
 
         output = "\n".join(captured.output)
@@ -392,7 +392,7 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("sensitive-update-details")
         )
 
-        with self.assertLogs(level="WARNING") as captured:
+        with self.assertLogs("astrbot", level="WARNING") as captured:
             result = await runner._execute_update(
                 {"uri": "facts://one", "new_content": "private-memory-body"}
             )
