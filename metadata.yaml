@@ -4,4 +4,5 @@ desc: 为 AstrBot 提供长期记忆能力，基于内置知识库实现用户�
 version: v0.6.3
 author: piexian
 repo: https://github.com/piexian/astrbot_plugin_simple_long_memory
-astrbot_version: ">=4.17"
+category: ai_context
+astrbot_version: ">=4.29.4"

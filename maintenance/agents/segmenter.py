@@ -143,14 +143,14 @@ class SegmenterAgent:
             from sqlmodel import select
 
             async with db.get_db() as session:
-                stmt = (
-                    select(
-                        PlatformMessageHistory.platform_id,
-                        PlatformMessageHistory.user_id,
-                    )
-                    .where(PlatformMessageHistory.created_at >= self._naive(since))
-                    .distinct()
-                )
+                stmt = select(
+                    PlatformMessageHistory.platform_id,
+                    PlatformMessageHistory.user_id,
+                ).where(PlatformMessageHistory.created_at >= self._naive(since))
+                is_active_col = getattr(PlatformMessageHistory, "is_active", None)
+                if is_active_col is not None:
+                    stmt = stmt.where(is_active_col == True)  # noqa: E712
+                stmt = stmt.distinct()
                 rows = (await session.execute(stmt)).all()
                 return [(str(r[0]), str(r[1])) for r in rows]
         except Exception as e:
@@ -169,16 +169,15 @@ class SegmenterAgent:
             from sqlmodel import select
 
             async with db.get_db() as session:
-                stmt = (
-                    select(PlatformMessageHistory)
-                    .where(
-                        PlatformMessageHistory.platform_id == platform_id,
-                        PlatformMessageHistory.user_id == user_id,
-                        PlatformMessageHistory.id > after_id,
-                    )
-                    .order_by(PlatformMessageHistory.id)
-                    .limit(limit)
+                stmt = select(PlatformMessageHistory).where(
+                    PlatformMessageHistory.platform_id == platform_id,
+                    PlatformMessageHistory.user_id == user_id,
+                    PlatformMessageHistory.id > after_id,
                 )
+                is_active_col = getattr(PlatformMessageHistory, "is_active", None)
+                if is_active_col is not None:
+                    stmt = stmt.where(is_active_col == True)  # noqa: E712
+                stmt = stmt.order_by(PlatformMessageHistory.id).limit(limit)
                 return list((await session.execute(stmt)).scalars().all())
         except Exception as e:
             logger.warning(
@@ -811,7 +810,7 @@ class SegmenterAgent:
             return []
         items: list[tuple[str, str, str, str]] = []
         for entry in history:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get("_no_save"):
                 continue
             role = entry.get("role")
             if role not in ("user", "assistant"):
@@ -823,7 +822,9 @@ class SegmenterAgent:
                 text = "".join(
                     str(part.get("text") or "")
                     for part in content
-                    if isinstance(part, dict) and part.get("type") == "text"
+                    if isinstance(part, dict)
+                    and not part.get("_no_save")
+                    and part.get("type") == "text"
                 )
             else:
                 continue

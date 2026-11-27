@@ -1058,8 +1058,8 @@ class MaintenanceRunner:
             umo = self._config.get("review_notify_umo", "")
             if not umo:
                 return
+            from astrbot.api.event import MessageChain
             from astrbot.api.message_components import Plain
-            from astrbot.api.star import MessageChain
 
             msg = MessageChain(
                 chain=[
@@ -1068,6 +1068,8 @@ class MaintenanceRunner:
                     )
                 ]
             )
+            if hasattr(msg, "use_markdown"):
+                msg.use_markdown(False)
             await self._context.send_message(umo, msg)
         except Exception as e:
             logger.debug(f"[简单长期记忆] 待审通知发送失败: {e}")

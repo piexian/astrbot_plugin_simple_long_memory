@@ -23,6 +23,8 @@ class _Filter:
     on_astrbot_loaded = staticmethod(_identity_decorator)
     on_llm_request = staticmethod(_identity_decorator)
     on_llm_response = staticmethod(_identity_decorator)
+    on_agent_begin = staticmethod(_identity_decorator)
+    on_agent_done = staticmethod(_identity_decorator)
     llm_tool = staticmethod(_identity_decorator)
 
     @staticmethod
@@ -531,7 +533,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
 
         plugin = SimpleNamespace(
             memory_mgr=Manager(),
-            _get_cmd_prefix=lambda: "!",
+            _get_cmd_prefix=lambda *_args, **_kwargs: "!",
         )
         result = await _collect(
             plugin_main.MemoryPlugin.cmd_search,
@@ -665,7 +667,7 @@ class MemoryCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(passed=verification["passed"]):
                 plugin = SimpleNamespace(
                     memory_mgr=Manager(verification),
-                    _get_cmd_prefix=lambda: "!",
+                    _get_cmd_prefix=lambda *_args, **_kwargs: "!",
                 )
                 result = await _collect(
                     plugin_main.MemoryPlugin.cmd_rebuild,
@@ -685,7 +687,7 @@ class AdministratorMemoryToolTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             config={"enable_admin_global_memory_tool": enabled},
             memory_mgr=manager,
-            _get_display_timezone=lambda: "Asia/Shanghai",
+            _get_display_timezone=lambda *_args, **_kwargs: "Asia/Shanghai",
             _get_viewer_user_id=lambda event: "test_42",
         )
 

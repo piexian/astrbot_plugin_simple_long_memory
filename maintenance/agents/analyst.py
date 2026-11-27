@@ -171,6 +171,26 @@ class AnalystAgent:
             logger.warning(f"[简单长期记忆] 拉取记忆列表失败: {e}")
         return all_memories
 
+    @staticmethod
+    def _extract_entry_text(content: Any) -> str:
+        """从 Conversation.history 的 content 字段提取纯文本，跳过思考块与临时块。"""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part:
+                        parts.append(part)
+                elif isinstance(part, dict):
+                    if part.get("_no_save") or part.get("type") != "text":
+                        continue
+                    text = str(part.get("text") or "")
+                    if text:
+                        parts.append(text)
+            return "".join(parts).strip()
+        return ""
+
     async def _get_conversation_history(
         self, owner_filter: dict[str, Any] | None
     ) -> str:
@@ -220,9 +240,13 @@ class AnalystAgent:
                 for entry in reversed(history):  # 最新的在前
                     if total_rounds >= max_rounds or total_chars >= max_chars:
                         break
+                    if not isinstance(entry, dict) or entry.get("_no_save"):
+                        continue
                     role = entry.get("role", "")
-                    text = entry.get("content", "")
-                    if not text or role not in ("user", "assistant"):
+                    if role not in ("user", "assistant"):
+                        continue
+                    text = self._extract_entry_text(entry.get("content"))
+                    if not text:
                         continue
                     line = f"[{role}]: {text}"
                     if total_chars + len(line) > max_chars:

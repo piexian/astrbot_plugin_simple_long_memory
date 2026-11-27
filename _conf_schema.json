@@ -345,7 +345,8 @@
     "description": "通知目标 UMO",
     "type": "string",
     "default": "",
-    "hint": "填写群聊或私聊的 unified_msg_origin，留空则自动发给最近一次执行管理命令的管理员"
+    "_special": "umo",
+    "hint": "选择或填写群聊、私聊的 unified_msg_origin，留空则自动发给最近一次执行管理命令的管理员"
   },
   "review_notify_schedule": {
     "description": "通知频率",

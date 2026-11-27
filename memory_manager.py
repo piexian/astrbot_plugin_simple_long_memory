@@ -271,6 +271,8 @@ class MemoryManager:
         """从当前消息事件写入一条结构化接触事实。"""
         if not self._contact_index:
             return False
+        if getattr(event, "event_kind", "message") == "agent_wakeup":
+            return False
         try:
             parsed = UMOInfo.parse(event.unified_msg_origin)
             sender_id = str(event.get_sender_id() or "").strip()

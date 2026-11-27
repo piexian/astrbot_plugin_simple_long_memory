@@ -151,7 +151,14 @@ class MaintenanceScheduler:
         # 读取 AstrBot 主配置的时区，与旧 cron_manager 行为一致
         self._tz_str: str | None = None
         try:
-            self._tz_str = context.astrbot_config.get("timezone") or None
+            get_config = getattr(context, "get_config", None)
+            cfg = (
+                get_config()
+                if callable(get_config)
+                else getattr(context, "astrbot_config", None)
+            )
+            if isinstance(cfg, dict):
+                self._tz_str = cfg.get("timezone") or None
         except Exception:
             pass
 

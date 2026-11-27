@@ -31,7 +31,11 @@
     },
     "global_memory": {
       "description": "按人跨会话共享",
-      "hint": "同一平台实例内，个人记忆跟随本人跨群聊和私聊召回；关闭后仅本会话可见。不控制群公共记忆或 global 记忆"
+      "hint": "同一平台实例内，个人记忆跟随本人跨群聊和私聊召回，并允许注入跨会话接触摘要；关闭后仅本会话可见且不注入接触摘要。保留旧配置键，不控制群公共记忆或 global 记忆"
+    },
+    "share_contacts_across_bots": {
+      "description": "跨 Bot 共享接触记录",
+      "hint": "仅在同一平台实例内共享同一用户 ID 的已知会话记录；只影响接触索引，不改变记忆可见性，也不能绕过按人跨会话共享或管理员权限"
     },
     "share_group_across_groups": {
       "description": "跨群聊共用",
@@ -113,6 +117,58 @@
       "description": "巩固批量大小",
       "hint": "每次巩固任务处理的记忆条数上限"
     },
+    "maintenance_enabled": {
+      "description": "后台整理总开关",
+      "hint": "开启后按 cron 定时执行记忆整理任务（需配置整理模型）"
+    },
+    "maintenance_model_id": {
+      "description": "整理模型",
+      "hint": "用于后台整理 Agent 的 LLM 模型，建议使用廉价模型（留空则使用会话主 LLM）"
+    },
+    "maintenance_window": {
+      "description": "整理时间窗口",
+      "hint": "单时间点如 03:00，或范围如 02:00-06:00；整理 cron 命中窗口外时仅记 DEBUG 日志并跳过"
+    },
+    "maintenance_cron": {
+      "description": "整理周期定时表达式",
+      "hint": "标准 cron 表达式，默认每天 03:00 执行完整整理管线（purge + 整理师 + 分析师 + 审核员）"
+    },
+    "maintenance_max_llm_calls": {
+      "description": "每周期 LLM 调用上限",
+      "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
+    },
+    "maintenance_max_ops_per_cycle": {
+      "description": "每周期操作数上限",
+      "hint": "整理师与分析师单周期产出的操作总数硬上限，超出部分本周期跳过并在下周期重新评估，防止异常放大"
+    },
+    "maintenance_analyst_max_new_links": {
+      "description": "分析师每次最多新建关联数",
+      "hint": "单个整理周期内分析师最多新建的关联边数量"
+    },
+    "maintenance_analyst_detect_contradiction": {
+      "description": "分析师同时检测矛盾",
+      "hint": "开启后分析师会检测互相矛盾的记忆对"
+    },
+    "maintenance_analyst_max_contradictions": {
+      "description": "分析师每次最多报告矛盾数",
+      "hint": "单个整理周期内分析师最多报告的矛盾记忆对数量，超出部分截断"
+    },
+    "maintenance_reviewer_enabled": {
+      "description": "启用审核员",
+      "hint": "复核整理师和分析师的操作建议，防止误删误改"
+    },
+    "maintenance_reviewer_model_id": {
+      "description": "审核模型",
+      "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
+    },
+    "maintenance_organizer_enabled": {
+      "description": "启用整理师",
+      "hint": "去重合并相似记忆、精炼措辞、归档无价值条目"
+    },
+    "maintenance_analyst_enabled": {
+      "description": "启用分析师",
+      "hint": "拉取对话历史，发现记忆间隐含关联，检测矛盾"
+    },
     "maintenance_extract_enabled": {
       "description": "启用对话提取",
       "hint": "整理周期内从平台消息历史切分对话块并提取新记忆，关闭后只做存量记忆整理"
@@ -152,6 +208,64 @@
     "maintenance_extract_conv2_chunk_messages": {
       "description": "ConversationV2 分段消息数",
       "hint": "ConversationV2 对话记录无时间戳，按每 N 条消息切为一个候选块"
+    },
+    "review_notify_enabled": {
+      "description": "待审通知开关",
+      "hint": "争议操作产生时主动通知管理员"
+    },
+    "review_notify_umo": {
+      "description": "通知目标 UMO",
+      "hint": "选择或填写群聊、私聊的 unified_msg_origin，留空则自动发给最近一次执行管理命令的管理员"
+    },
+    "review_notify_schedule": {
+      "description": "通知频率",
+      "hint": "daily=每天固定时间，weekly=每周固定日，monthly=每月固定日",
+      "labels": ["每天", "每周", "每月"]
+    },
+    "review_notify_time": {
+      "description": "通知时间",
+      "hint": "daily 为每天时刻，weekly 为周几加时刻如 mon:10:00，monthly 为几号加时刻如 1:10:00"
+    },
+    "maintenance_pending_queue_max": {
+      "description": "待审队列容量上限",
+      "hint": "待人工审核队列的最大长度，满了之后新争议项直接丢弃并记日志，防止队列无限膨胀"
+    },
+    "auto_purge_enabled": {
+      "description": "自动清理废弃记忆",
+      "hint": "定期物理删除已标记废弃超期的记忆"
+    },
+    "auto_purge_after_days": {
+      "description": "清理超期天数",
+      "hint": "deprecated 标记超过此天数后物理删除"
+    },
+    "auto_purge_cron": {
+      "description": "清理定时表达式",
+      "hint": "标准 cron 表达式，默认每天 05:00 执行"
+    },
+    "maintenance_tasks": {
+      "description": "整理团队编排",
+      "hint": "添加后台整理角色（organizer/analyst/reviewer），配置执行时间和行为"
+    },
+    "context_max_rounds": {
+      "description": "最大拉取对话轮数",
+      "hint": "分析师拉取对话历史的最大轮数"
+    },
+    "context_max_chars": {
+      "description": "最大拉取字符数",
+      "hint": "分析师拉取对话历史的最大总字符数"
+    },
+    "context_max_age_days": {
+      "description": "对话最大回溯天数",
+      "hint": "分析师只拉取最近 N 天的对话"
+    },
+    "persona_mode": {
+      "description": "人格加载模式",
+      "hint": "auto=自动从主人格提取摘要，manual=使用下方自定义，off=不加载",
+      "labels": ["自动", "手动", "关闭"]
+    },
+    "persona_summary": {
+      "description": "自定义人格摘要",
+      "hint": "manual 模式下填写，帮助整理 Agent 理解对话语境"
     }
   }
 }
