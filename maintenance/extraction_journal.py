@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import copy
 import uuid
-from dataclasses import asdict
 from typing import Any
-
-from .agents.segmenter import ConversationBlock
 
 JOURNAL_KV_KEY = "maintenance_extract_journal"
 
 
 class ExtractionJournal:
+    """跨周期保存提取操作与块到缓冲行的映射。"""
+
     def __init__(self, kv_get: Any, kv_put: Any) -> None:
         self._get = kv_get
         self._put = kv_put
@@ -26,29 +25,24 @@ class ExtractionJournal:
         return bool(self.state)
 
     async def prepare(
-        self, segment: dict[str, Any], curator: dict[str, Any], metrics: dict[str, Any]
+        self,
+        operations: list[dict[str, Any]],
+        block_rows: dict[str, list[int]],
+        metrics: dict[str, Any],
+        notes: str,
     ) -> None:
-        operations = copy.deepcopy(
-            curator.get("create", []) + curator.get("update", [])
-        )
-        for op in operations:
+        """保存本周期提取提案；操作的最终完成由 acknowledge 逐条登记。"""
+        stored = copy.deepcopy(operations)
+        for op in stored:
             op["_extract_id"] = uuid.uuid4().hex
-        outcomes = []
-        for block, outcome in curator.get("outcomes", []):
-            data = asdict(block)
-            data["text"] = ""
-            outcomes.append({"block": data, "key": block.key, "outcome": outcome})
         state = {
-            "operations": operations,
+            "operations": stored,
             "completed": [],
-            "outcomes": outcomes,
-            "segment": {
-                k: copy.deepcopy(v) for k, v in segment.items() if k != "blocks"
-            },
+            "block_rows": {str(key): list(rows) for key, rows in block_rows.items()},
             "metrics": metrics,
-            "notes": curator.get("notes", ""),
+            "notes": notes,
         }
-        if operations and (not self._get or not self._put):
+        if stored and (not self._get or not self._put):
             raise RuntimeError("extraction requires persistent KV storage")
         if self._put:
             await self._put(JOURNAL_KV_KEY, copy.deepcopy(state))
@@ -75,17 +69,14 @@ class ExtractionJournal:
             await self._put(JOURNAL_KV_KEY, copy.deepcopy(state))
             self.state = state
 
-    def outcomes(self) -> list[tuple[ConversationBlock, str]]:
-        pending = self.pending
-        outcomes = []
-        for item in self.state.get("outcomes", []):
-            outcome = item["outcome"]
-            if any(
-                op.get("_extract_block", item["key"]) == item["key"] for op in pending
-            ):
-                outcome = "skipped_budget"
-            outcomes.append((ConversationBlock(**item["block"]), outcome))
-        return outcomes
+    def settled_block_rows(self) -> dict[str, list[int]]:
+        """返回操作已全部完成的块及其缓冲行 id，供宿主标记 processed。"""
+        pending_blocks = {op.get("_extract_block") for op in self.pending}
+        return {
+            str(key): list(rows)
+            for key, rows in self.state.get("block_rows", {}).items()
+            if key not in pending_blocks
+        }
 
     async def clear_if_finished(self) -> None:
         if self.state and not self.pending:

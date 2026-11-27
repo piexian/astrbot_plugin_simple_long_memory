@@ -116,7 +116,25 @@ class SharingPolicyTests(unittest.TestCase):
                         )
                         self.assertEqual(
                             mgr._is_memory_visible(event, memory(scope="group")),
+                            same,
+                        )
+                        self.assertEqual(
+                            mgr._is_memory_visible(
+                                event, memory(scope="group", domain="facts")
+                            ),
                             same or (group and ":GroupMessage:" in destination),
+                        )
+                        self.assertEqual(
+                            mgr._is_memory_visible(
+                                event, memory(scope="group", domain="preferences")
+                            ),
+                            same,
+                        )
+                        self.assertEqual(
+                            mgr._is_memory_visible(
+                                event, memory(scope="group", domain="events")
+                            ),
+                            same,
                         )
                         self.assertEqual(
                             mgr._is_memory_visible(event, memory(scope="conversation")),
@@ -162,8 +180,25 @@ class SharingPolicyTests(unittest.TestCase):
         self.assertEqual(personal_filter["umo"], event.unified_msg_origin)
         self.assertEqual(personal_filter["owner_user_id"], "sl_bob")
         group_filter = mgr._scope_filter(event, "group")
-        self.assertEqual(group_filter["platform_id"], "sl")
-        self.assertNotIn("owner_session_id", group_filter)
+        self.assertEqual(group_filter["owner_session_id"], "sl_g2")
+        self.assertNotIn("platform_id", group_filter)
+        recall_filters = mgr._build_recall_filters(event, True)
+        cross = [f for f in recall_filters if f.get("platform_id") == "sl"]
+        self.assertEqual({f["domain"] for f in cross}, {"fact", "facts"})
+        self.assertTrue(all("owner_session_id" not in f for f in cross))
+        # 显式 domain 参数保持精确语义：fact 只查 fact，facts 只查 facts
+        fact_filters = mgr._build_recall_filters(event, True, domain="fact")
+        self.assertEqual(
+            {f["domain"] for f in fact_filters if f.get("platform_id") == "sl"},
+            {"fact"},
+        )
+        facts_filters = mgr._build_recall_filters(event, True, domain="facts")
+        self.assertEqual(
+            {f["domain"] for f in facts_filters if f.get("platform_id") == "sl"},
+            {"facts"},
+        )
+        pref_filters = mgr._build_recall_filters(event, True, domain="preferences")
+        self.assertEqual([f for f in pref_filters if f.get("platform_id") == "sl"], [])
         self.assertEqual(mgr._build_user_filter(event), {"user_id": "sl_bob"})
 
 
@@ -320,3 +355,119 @@ class SharingReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(item["metadata"]["memory_scope"] == "global" for item in result)
         )
+
+    async def test_cross_group_prefilter_sql_only_matches_facts(self):
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        self.addAsyncCleanup(engine.dispose)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)"
+                )
+            )
+            rows = [
+                memory(
+                    scope="group",
+                    uri="facts://own-pref",
+                    domain="preferences",
+                    umo="sl:GroupMessage:g2",
+                ),
+                memory(
+                    scope="group",
+                    uri="facts://own-fact",
+                    domain="facts",
+                    umo="sl:GroupMessage:g2",
+                ),
+                memory(
+                    scope="group",
+                    uri="facts://other-fact",
+                    domain="facts",
+                    umo="sl:GroupMessage:g1",
+                ),
+                memory(
+                    scope="group",
+                    uri="facts://other-fact-legacy",
+                    domain="fact",
+                    umo="sl:GroupMessage:g1",
+                ),
+                memory(
+                    scope="group",
+                    uri="facts://other-pref",
+                    domain="preferences",
+                    umo="sl:GroupMessage:g1",
+                ),
+                memory(
+                    scope="group",
+                    uri="facts://other-event",
+                    domain="events",
+                    umo="sl:GroupMessage:g1",
+                ),
+                memory(
+                    scope="group",
+                    uri="facts://other-nodomain",
+                    umo="sl:GroupMessage:g1",
+                ),
+            ]
+            for i, doc in enumerate(rows, start=1):
+                await conn.execute(
+                    text("INSERT INTO documents VALUES (:id, :text, :metadata)"),
+                    {
+                        "id": i,
+                        "text": doc["text"],
+                        "metadata": json.dumps(doc["metadata"]),
+                    },
+                )
+        mgr = MemoryManager(None, {"share_group_across_groups": True})
+
+        async def run_filters(session, filters):
+            hits = {}
+            for item in filters:
+                where, params = MemoryManager._filters_to_sql(item)
+                result = await session.execute(
+                    text(f"SELECT metadata FROM documents WHERE {where}"), params
+                )
+                for (raw,) in result.all():
+                    uri = json.loads(raw)["uri"]
+                    hits[uri] = hits.get(uri, 0) + 1
+            return hits
+
+        event = Event("sl:GroupMessage:g2")
+        filters_list = mgr._build_recall_filters(event, True)
+        async with AsyncSession(engine) as session:
+            hits = await run_filters(session, filters_list)
+            # 显式 domain 参数：fact 只查 fact，facts 只查 facts，其他域不跨群
+            fact_hits = await run_filters(
+                session, mgr._build_recall_filters(event, True, domain="fact")
+            )
+            facts_hits = await run_filters(
+                session, mgr._build_recall_filters(event, True, domain="facts")
+            )
+            pref_hits = await run_filters(
+                session, mgr._build_recall_filters(event, True, domain="preferences")
+            )
+        # 本群记忆不受限，跨群 fact/facts 新旧别名均可召回
+        self.assertEqual(
+            set(hits),
+            {
+                "facts://own-pref",
+                "facts://own-fact",
+                "facts://other-fact",
+                "facts://other-fact-legacy",
+            },
+        )
+        self.assertEqual(fact_hits, {"facts://other-fact-legacy": 1})
+        self.assertEqual(set(facts_hits), {"facts://own-fact", "facts://other-fact"})
+        self.assertEqual(pref_hits, {"facts://own-pref": 1})
+        # 本群 facts 被本群与跨群过滤器重复命中，按 uri 去重后分页不受影响
+        self.assertGreater(hits["facts://own-fact"], 1)
+        # 稀疏通道本地过滤与 SQL 预过滤一致
+        for doc in rows:
+            meta = doc["metadata"]
+            local_hit = any(
+                MemoryManager._matches_filters(meta, filters)
+                for filters in filters_list
+            )
+            self.assertEqual(meta["uri"] in hits, local_hit, meta["uri"])

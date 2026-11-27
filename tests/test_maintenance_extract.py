@@ -1,26 +1,22 @@
-"""夜间对话提取测试：整理师三态、runner 提取集成、游标提交、create 执行、过期 carry。"""
+"""后台提取链路测试：整理师三态、Inbox 提取集成、状态提交、create 执行。"""
 
 import copy
+import shutil
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_maintenance_segmenter import (
-    _KV,
-    INCOMPLETE,
-    _config,
-    _row,
-    _StubSegmenter,
-)
-from test_maintenance_segmenter import (
-    _FakeLLM as _SegFakeLLM,
-)
-from test_memory_commands import plugin_main
+from astrbot.core.db.vec_db.faiss_impl.document_storage import DocumentStorage
+from test_memory_commands import plugin_main  # noqa: F401
 
 import maintenance.runner as runner_module
-from maintenance.agents.curator import CuratorAgent
+from maintenance.agents.curator import SOURCE_EXCERPT_MAX_CHARS, CuratorAgent
 from maintenance.agents.reviewer import ReviewerAgent
-from maintenance.agents.segmenter import ConversationBlock
+from maintenance.extraction_journal import JOURNAL_KV_KEY
+from maintenance.inbox import InboxRecord, MaintenanceInbox
+from maintenance.memory_gate import GateOutcome
 from maintenance.runner import MaintenanceRunner
 
 
@@ -31,17 +27,28 @@ def _block(
     first_id=1,
     last_id=10,
     truncated=False,
+    realtime_extracted=False,
+    row_ids=None,
 ):
+    from maintenance.inbox import ConversationBlock
+
     return ConversationBlock(
         conv_key=conv_key,
         platform_id="qq",
         umo=umo,
+        conversation_id="c1",
+        session_type="private",
+        session_id="u1",
         text=text,
         message_count=3,
         char_count=len(text),
-        truncated=truncated,
         first_id=first_id,
         last_id=last_id,
+        row_ids=row_ids if row_ids is not None else list(range(first_id, last_id + 1)),
+        sender_ids=["u1"],
+        user_chars=len(text),
+        truncated=truncated,
+        realtime_extracted=realtime_extracted,
     )
 
 
@@ -84,6 +91,7 @@ class _CuratorLLM:
         self._max = max_calls
         self.calls = 0
         self.model_ids = []
+        self.prompts = []
 
     @property
     def remaining_calls(self):
@@ -92,6 +100,7 @@ class _CuratorLLM:
     async def chat_json(self, system, user, model_id=""):
         self.calls += 1
         self.model_ids.append(model_id)
+        self.prompts.append(f"{system}\n\n{user}")
         if self._responses:
             return self._responses.pop(0)
         return {"memories": [], "updates": [], "notes": ""}
@@ -104,6 +113,44 @@ def _curator(llm, vec_db=None, config=None):
         llm=llm,
         config=config or {},
     )
+
+
+async def _real_inbox(case):
+    """每个用例独立的真实 AstrBot DocumentStorage + 缓冲表，结束自动关闭。"""
+    tmp = tempfile.mkdtemp(prefix="inbox-runner-")
+    case.addCleanup(shutil.rmtree, tmp, True)
+    storage = DocumentStorage(f"{tmp}/doc.db")
+    await storage.initialize()
+    case.addAsyncCleanup(storage.close)
+    inbox = MaintenanceInbox(SimpleNamespace(document_storage=storage))
+    return inbox, storage
+
+
+async def _seed_turn(
+    inbox,
+    *,
+    text="聊" * 160,
+    cid="c1",
+    umo="qq:private:u1",
+    sender_id="u1",
+    minutes_ago=60,
+    brief="助手简短回复",
+):
+    record = InboxRecord(
+        umo=umo,
+        platform_id="qq",
+        session_type="private" if ":private:" in umo else "group",
+        session_id=umo.rsplit(":", 1)[-1],
+        conversation_id=cid,
+        sender_id=sender_id,
+        sender_name="测试用户",
+        user_text=text,
+        assistant_brief=brief,
+        created_at=(
+            datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+        ).isoformat(),
+    )
+    return await inbox.append(record)
 
 
 class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
@@ -151,9 +198,9 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         )
         curator = _curator(llm, vec_db)
         blocks = [
-            _block(last_id=10),
-            _block(last_id=20),
-            _block(last_id=30),
+            _block(first_id=1, last_id=10),
+            _block(first_id=11, last_id=20),
+            _block(first_id=21, last_id=30),
         ]
         result = await curator.run(blocks, 10)
 
@@ -178,7 +225,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create["importance"], 4)
         self.assertEqual(create["umo"], "qq:private:u1")
         self.assertFalse(create["truncated_block"])
-        self.assertLessEqual(len(create["source_excerpt"]), 200)
+        self.assertLessEqual(len(create["source_excerpt"]), 2000)
 
         update = result["update"][0]
         self.assertEqual(
@@ -191,6 +238,17 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
                 "_extract_block": blocks[1].key,
             },
         )
+
+    async def test_realtime_extracted_block_prompts_no_duplicate_create(self):
+        llm = _CuratorLLM()
+        curator = _curator(llm)
+        block = _block(realtime_extracted=True)
+        await curator.run([block], 5)
+        self.assertIn("realtime extractor", llm.prompts[0])
+
+        llm_plain = _CuratorLLM()
+        await _curator(llm_plain).run([_block()], 5)
+        self.assertNotIn("realtime extractor", llm_plain.prompts[0])
 
     async def test_retrieve_filters_and_failure_fallback(self):
         llm = _CuratorLLM()
@@ -236,7 +294,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
                     "memories": [],
                     "updates": [
                         {
-                            "uri": "facts://ghost",
+                            "uri": "facts://hallucinated",
                             "new_content": "幻觉引用",
                             "reason": "x",
                         }
@@ -280,7 +338,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([o for _, o in result["outcomes"]], ["nothing"])
 
     async def test_source_excerpt_collapsed_and_capped(self):
-        text = ("  多  空   格\n换行\t" + "聊" * 400) * 2
+        text = ("  多  空   格\n换行\t" + "聊" * 1500) * 2
         llm = _CuratorLLM(
             responses=[
                 {
@@ -299,7 +357,8 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
         curator = _curator(llm)
         result = await curator.run([_block(text=text)], 5)
         excerpt = result["create"][0]["source_excerpt"]
-        self.assertLessEqual(len(excerpt), 200)
+        self.assertGreater(len(" ".join(text.split())), SOURCE_EXCERPT_MAX_CHARS)
+        self.assertEqual(len(excerpt), SOURCE_EXCERPT_MAX_CHARS)
         self.assertNotIn("\n", excerpt)
         self.assertNotIn("  ", excerpt)
 
@@ -323,7 +382,7 @@ class CuratorAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_budget_exhaustion_marks_skipped(self):
         llm = _CuratorLLM()
         curator = _curator(llm)
-        blocks = [_block(last_id=10), _block(last_id=20)]
+        blocks = [_block(last_id=10), _block(first_id=11, last_id=20)]
         result = await curator.run(blocks, 0)
         self.assertEqual(
             [o for _, o in result["outcomes"]], ["skipped_budget", "skipped_budget"]
@@ -365,13 +424,18 @@ class _RunnerFakeLLM:
     def reset_cycle_stats(self):
         self.calls = 0
 
+    async def ask_decisions(self, questions, state, *, timeout_seconds=30):
+        # 镜像真实 MaintenanceLLM.ask_decisions：测试桩不做真实问答
+        return None
+
     def stats(self):
         return {"calls": self.calls, "cache_hits": 0, "errors": 0}
 
 
 class _StoreMemoryMgr:
-    def __init__(self):
+    def __init__(self, inbox=None):
         self.vec_db = _FakeVecDB()
+        self.inbox = inbox
         self.stored = []
 
     async def store_memory(self, **kwargs):
@@ -385,21 +449,34 @@ class _KVLog:
         self.put_log = []
 
     async def get_kv_data(self, key, default=None):
-        return self.store.get(key, default)
+        return copy.deepcopy(self.store.get(key, default))
 
     async def put_kv_data(self, key, value):
         self.put_log.append((key, copy.deepcopy(value)))
-        self.store[key] = value
+        self.store[key] = copy.deepcopy(value)
 
 
-class _FakeSegmenter:
-    def __init__(self, result):
-        self._result = result
-        self.budgets = []
+class _MarkerGate:
+    """按候选内容标记决定结论的插件内测试替身。"""
 
-    async def collect_blocks(self, max_llm_calls):
-        self.budgets.append(max_llm_calls)
-        return self._result
+    @staticmethod
+    def _decide(candidate):
+        if "吵架" in candidate.content:
+            return GateOutcome("rejected", "rejected:emotion_or_grudge")
+        if "闲聊" in candidate.content:
+            return GateOutcome("unavailable", "gate judge unavailable")
+        return GateOutcome("approved", "approved")
+
+    async def evaluate(self, candidates, *, chat_judge=None):
+        return {c.candidate_id: self._decide(c) for c in candidates}
+
+
+class _AllUnavailableGate:
+    async def evaluate(self, candidates, *, chat_judge=None):
+        return {
+            c.candidate_id: GateOutcome("unavailable", "gate judge unavailable")
+            for c in candidates
+        }
 
 
 class _FakeCurator:
@@ -426,12 +503,17 @@ class _FakeCurator:
         }
 
 
-def _seg_result(blocks, llm_calls=0, cursor_updates=None, carry_updates=None):
+def _create_op(block, content="用户喜欢咖啡"):
     return {
-        "blocks": blocks,
-        "cursor_updates": cursor_updates or {},
-        "carry_updates": carry_updates or {},
-        "stats": {"llm_calls": llm_calls, "blocks_emitted": len(blocks)},
+        "type": "create",
+        "content": content,
+        "domain": "preference",
+        "scope": "personal",
+        "subject": "u1",
+        "subjects": ["u1"],
+        "umo": block.umo,
+        "sender_ids": ["u1"],
+        "_extract_block": block.key,
     }
 
 
@@ -448,171 +530,418 @@ class RunnerExtractionTests(unittest.IsolatedAsyncioTestCase):
         cfg.update(config or {})
         return MaintenanceRunner(
             context=None,
-            memory_mgr=memory_mgr or _StoreMemoryMgr(),
+            memory_mgr=memory_mgr,
             llm=_RunnerFakeLLM(),
             config=cfg,
             kv_put=kv.put_kv_data if kv else None,
             kv_get=kv.get_kv_data if kv else None,
         )
 
-    def _patched(self, seg, cur):
-        if not hasattr(self, "_patches"):
-            self._patches = [
-                patch.object(runner_module, "SegmenterAgent", lambda **kw: seg),
-                patch.object(runner_module, "CuratorAgent", lambda **kw: cur),
-            ]
-        return self._patches
+    def _patches(self, gate, curator):
+        return [
+            patch.object(
+                runner_module.MaintenanceRunner, "_get_gate", lambda self: gate
+            ),
+            patch.object(runner_module, "CuratorAgent", lambda **kw: curator),
+        ]
 
-    async def test_budget_split_60_40(self):
-        blocks = [_block()]
-        seg = _FakeSegmenter(_seg_result(blocks, llm_calls=2))
-        cur = _FakeCurator()
-        runner = self._runner()
-        for p in self._patched(seg, cur):
+    def _context(self, patches):
+        for p in patches:
             p.start()
+
+    def _exit(self, patches):
+        for p in patches:
+            p.stop()
+
+    async def test_gate_outcomes_drive_row_status(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, text="聊咖啡偏好" * 40, minutes_ago=90)
+        await _seed_turn(
+            inbox, text="吵架记账别存我" * 30, umo="qq:private:u2", minutes_ago=60
+        )
+        await _seed_turn(
+            inbox, text="闲聊无增量内容" * 25, umo="qq:private:u3", minutes_ago=30
+        )
+        kv = _KVLog()
+
+        budgets = []
+
+        async def cur_run(blocks, max_llm_calls):
+            budgets.append(max_llm_calls)
+            return {
+                "create": [_create_op(b) for b in blocks],
+                "update": [],
+                "notes": "",
+                "blocks_processed": len(blocks),
+                "blocks_nothing": 0,
+                "llm_calls": 1,
+                "outcomes": [(b, "created") for b in blocks],
+            }
+
+        curator = SimpleNamespace(run=cur_run)
+        gate = _MarkerGate()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(gate, curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+
+        self.assertTrue(manifest.parsed)
+        self.assertEqual(manifest.metrics["blocks"], 3)
+        self.assertEqual(manifest.metrics["gate_approved"], 1)
+        self.assertEqual(manifest.metrics["gate_unavailable"], 1)
+        self.assertEqual(manifest.metrics["gate_rejected"], 1)
+        self.assertEqual(budgets, [30])  # 全部提取预算归整理师
+        counts = await inbox.status_counts()
+        # created 块行保持 pending（等待操作执行完成），拒收块行 skipped
+        self.assertEqual(counts.get("pending"), 2)
+        self.assertEqual(counts.get("skipped"), 1)
+        self.assertEqual(len(manifest.operations), 1)
+        journal_state = kv.store[JOURNAL_KV_KEY]
+        self.assertEqual(len(journal_state["operations"]), 1)
+        self.assertEqual(len(journal_state["block_rows"]), 1)
+
+    async def test_gate_splits_long_block_before_judging_the_tail(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(
+            inbox,
+            text="吵架无价值" * 400,
+            minutes_ago=90,
+        )
+        await _seed_turn(
+            inbox,
+            text="有效事实" * 20,
+            minutes_ago=80,
+        )
+        kv = _KVLog()
+
+        async def cur_run(blocks, max_llm_calls):
+            self.assertEqual(len(blocks), 1)
+            return {
+                "create": [_create_op(blocks[0])],
+                "update": [],
+                "notes": "",
+                "blocks_processed": 1,
+                "blocks_nothing": 0,
+                "llm_calls": 1,
+                "outcomes": [(blocks[0], "created")],
+            }
+
+        curator = SimpleNamespace(run=cur_run)
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(_MarkerGate(), curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+
+        self.assertEqual(manifest.metrics["blocks"], 2)
+        self.assertEqual(manifest.metrics["gate_rejected"], 1)
+        self.assertEqual(manifest.metrics["gate_approved"], 1)
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("skipped"), 1)
+        self.assertEqual(counts.get("pending"), 1)
+
+    async def test_nothing_outcome_marks_rows_processed(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, text="聊无增量内容" * 30, minutes_ago=90)
+        kv = _KVLog()
+
+        async def cur_run(blocks, max_llm_calls):
+            return {
+                "create": [],
+                "update": [],
+                "notes": "",
+                "blocks_processed": len(blocks),
+                "blocks_nothing": len(blocks),
+                "llm_calls": 1,
+                "outcomes": [(b, "nothing") for b in blocks],
+            }
+
+        curator = SimpleNamespace(run=cur_run)
+        gate = _MarkerGate()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(gate, curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+        self.assertEqual(manifest.operations, [])
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("processed"), 1)
+        self.assertNotIn(JOURNAL_KV_KEY, kv.store)  # 无操作不写日志
+
+    async def test_gate_unavailable_keeps_rows_pending(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
+        kv = _KVLog()
+        curator = _FakeCurator()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(_AllUnavailableGate(), curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+
+        self.assertEqual(manifest.metrics["gate_unavailable"], 1)
+        self.assertEqual(manifest.metrics["gate_approved"], 0)
+        self.assertEqual(manifest.operations, [])
+        self.assertEqual(curator.budgets, [])  # 无块进入整理师
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("pending"), 1)
+        self.assertNotIn(JOURNAL_KV_KEY, kv.store)
+
+    async def test_curator_budget_exhaustion_keeps_rows_pending(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
+        kv = _KVLog()
+
+        async def cur_run(blocks, max_llm_calls):
+            self.assertEqual(max_llm_calls, 30)  # 闸门未耗预算时整理师独享提取额度
+            return {
+                "create": [],
+                "update": [],
+                "notes": "",
+                "blocks_processed": 0,
+                "blocks_nothing": 0,
+                "llm_calls": 0,
+                "outcomes": [(b, "skipped_budget") for b in blocks],
+            }
+
+        curator = SimpleNamespace(run=cur_run)
+        gate = _MarkerGate()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(gate, curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+
+        self.assertEqual(manifest.operations, [])
+        # 预算耗尽的块不落终态、不写日志，行留待下周期
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("pending"), 1)
+        self.assertNotIn(JOURNAL_KV_KEY, kv.store)
+
+    async def test_settle_failure_keeps_journal_until_retry(self):
+        inbox, storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        row_id = await _seed_turn(inbox, minutes_ago=90)
+        kv = _KVLog()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        journal = runner._extract_journal
+        op = _create_op(_block(), "用户喜欢咖啡")
+        await journal.prepare(
+            operations=[op],
+            block_rows={op["_extract_block"]: [row_id]},
+            metrics={},
+            notes="",
+        )
+        await journal.acknowledge(journal.state["operations"][0])
+        self.assertTrue(journal.settled_block_rows())
+
+        # 真实存储故障：行状态提交失败时日志保留，避免下周期重复提取
+        await storage.close()
+        with self.assertLogs("astrbot", level="WARNING") as caught:
+            await runner._settle_inbox_blocks()
+        self.assertTrue(any("提取日志保留" in str(entry) for entry in caught.records))
+        # 日志保留：操作未销账重放，行状态待存储恢复后重试
+        self.assertTrue(kv.store[JOURNAL_KV_KEY]["operations"])
+
+        # 存储恢复后重试成功，日志才清理，行落 processed
+        await storage.initialize()
+        await runner._settle_inbox_blocks()
+        self.assertFalse(kv.store.get(JOURNAL_KV_KEY))
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("processed"), 1)
+
+    async def test_settle_without_inbox_keeps_journal(self):
+        kv = _KVLog()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=None), kv=kv)
+        journal = runner._extract_journal
+        op = _create_op(_block(), "用户喜欢咖啡")
+        await journal.prepare(
+            operations=[op],
+            block_rows={op["_extract_block"]: [999]},
+            metrics={},
+            notes="",
+        )
+        await journal.acknowledge(journal.state["operations"][0])
+        with self.assertLogs("astrbot", level="WARNING") as caught:
+            await runner._settle_inbox_blocks()
+        self.assertTrue(any("缓冲表不可用" in str(entry) for entry in caught.records))
+        # 日志保留：下周期缓冲表可用时重试标 processed
+        self.assertTrue(kv.store[JOURNAL_KV_KEY]["operations"])
+
+    async def test_gate_is_lazy_and_reused(self):
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(), kv=_KVLog())
+        gate = runner._get_gate()
+        self.assertIs(runner._get_gate(), gate)
+        # 后台 Decision 走受控问答计入总预算
+        self.assertEqual(gate._decision_ask, runner._llm.ask_decisions)
+
+    async def test_dry_run_commits_no_inbox_status(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
+        gate = _MarkerGate()
+        curator = _FakeCurator()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=_KVLog())
+        patches = self._patches(gate, curator)
+        self._context(patches)
         try:
             manifest = await runner._run_extraction(dry_run=True)
         finally:
-            for p in self._patched(seg, cur):
-                p.stop()
-        self.assertEqual(seg.budgets, [15])  # 分段最多使用提取预算的一半
-        self.assertEqual(cur.budgets, [28])  # 30 - 分段员实际 2
-        self.assertTrue(manifest.parsed)
+            self._exit(patches)
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("pending"), 1)
         self.assertEqual(manifest.metrics["blocks"], 1)
-        self.assertEqual(manifest.metrics["llm_calls"], 2)
 
-    async def test_cursor_commit_per_block_and_carry_clear(self):
-        b1 = _block(conv_key="qq:a", umo="qq:private:a", last_id=10)
-        b2 = _block(conv_key="qq:a", umo="qq:private:a", first_id=11, last_id=20)
-        b3 = _block(conv_key="qq:b", umo="qq:private:b", last_id=5)
+    async def test_journal_short_circuits_new_extraction(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
         kv = _KVLog(
             {
-                "maintenance_extract_carry": {
-                    "qq:a": {"start_id": 1, "cycles": 1, "fail_count": 0},
-                    "qq:z": {"start_id": 3, "cycles": 0, "fail_count": 1},
+                JOURNAL_KV_KEY: {
+                    "operations": [
+                        {
+                            "type": "create",
+                            "content": "旧提案",
+                            "umo": "qq:private:u1",
+                            "_extract_id": "old-op",
+                            "_extract_block": "old-block",
+                        }
+                    ],
+                    "completed": [],
+                    "block_rows": {"old-block": [999]},
+                    "metrics": {"blocks": 1},
+                    "notes": "",
                 }
             }
         )
-        seg = _FakeSegmenter(
-            _seg_result(
-                [b1, b2, b3],
-                cursor_updates={"qq:a": 20, "qq:b": 5, "qq:c": 7},
-                carry_updates={"qq:a": None},
-            )
-        )
-        cur = _FakeCurator(
-            outcomes=[(b1, "created"), (b2, "nothing"), (b3, "skipped_budget")]
-        )
-        runner = self._runner(kv=kv)
-        for p in self._patched(seg, cur):
-            p.start()
+        gate = _MarkerGate()
+        curator = _FakeCurator()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(gate, curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+        self.assertEqual(len(manifest.operations), 1)
+        self.assertEqual(manifest.operations[0]["content"], "旧提案")
+        self.assertEqual(curator.budgets, [])  # 不新提取
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("pending"), 1)  # 新行不受旧日志影响
+
+    async def test_failed_block_marks_retry(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
+        kv = _KVLog()
+
+        async def cur_run(blocks, max_llm_calls):
+            return {
+                "create": [],
+                "update": [],
+                "notes": "",
+                "blocks_processed": 0,
+                "blocks_nothing": 0,
+                "llm_calls": 1,
+                "outcomes": [(b, "failed") for b in blocks],
+            }
+
+        curator = SimpleNamespace(run=cur_run)
+        gate = _MarkerGate()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(gate, curator)
+        self._context(patches)
         try:
             await runner._run_extraction(dry_run=False)
         finally:
-            for p in self._patched(seg, cur):
-                p.stop()
+            self._exit(patches)
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("failed"), 1)
 
-        cursor_writes = [v for k, v in kv.put_log if k == "maintenance_extract_cursors"]
-        # 逐块提交：a 先推进到 10 再到 20；b 因 skipped_budget 不推进；
-        # c 无产出块，直接采用分段员游标 7
-        self.assertEqual(cursor_writes[0]["qq:a"]["id"], 10)
-        self.assertEqual(cursor_writes[1]["qq:a"]["id"], 20)
-        self.assertNotIn("qq:b", kv.store["maintenance_extract_cursors"])
-        self.assertEqual(kv.store["maintenance_extract_cursors"]["qq:c"]["id"], 7)
-        self.assertEqual(len(cursor_writes), 3)
-        # carry None 清除 a，未提及的 z 保留
-        carry = kv.store["maintenance_extract_carry"]
-        self.assertNotIn("qq:a", carry)
-        self.assertIn("qq:z", carry)
-
-    async def test_dry_run_zero_kv_zero_store(self):
-        blocks = [_block()]
-        seg = _FakeSegmenter(
-            _seg_result(blocks, cursor_updates={"qq:qq:private:u1": 10})
-        )
-        cur = _FakeCurator(
-            create=[{"type": "create", "content": "x", "umo": "qq:private:u1"}]
-        )
+    async def test_cycle_settles_rows_after_execution(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, text="聊咖啡偏好" * 40, minutes_ago=90)
         kv = _KVLog()
-        mgr = _StoreMemoryMgr()
+        gate = _MarkerGate()
+        mgr = _StoreMemoryMgr(inbox=inbox)
         runner = self._runner(memory_mgr=mgr, kv=kv)
-        for p in self._patched(seg, cur):
-            p.start()
-        try:
-            report = await runner.run_cycle(dry_run=True)
-        finally:
-            for p in self._patched(seg, cur):
-                p.stop()
-        self.assertIsNotNone(report.extract_manifest)
-        self.assertEqual(len(report.extract_manifest.operations), 1)
-        self.assertEqual(kv.put_log, [])
-        self.assertEqual(mgr.stored, [])
 
-    async def test_extract_disabled_skips_stage(self):
-        runner = self._runner(config={"maintenance_extract_enabled": False})
-        report = await runner.run_cycle(dry_run=True)
-        self.assertIsNone(report.extract_manifest)
+        async def cur_run(blocks, max_llm_calls):
+            return {
+                "create": [_create_op(b) for b in blocks],
+                "update": [],
+                "notes": "",
+                "blocks_processed": len(blocks),
+                "blocks_nothing": 0,
+                "llm_calls": 1,
+                "outcomes": [(b, "created") for b in blocks],
+            }
 
-    async def test_create_op_executed_when_reviewer_disabled(self):
-        blocks = [_block()]
-        seg = _FakeSegmenter(_seg_result(blocks))
-        create_op = {
-            "type": "create",
-            "content": "用户喜欢美式咖啡",
-            "domain": "preference",
-            "scope": "personal",
-            "subject": "u1",
-            "subjects": ["u1"],
-            "entities": [],
-            "topics": [],
-            "disclosure": "",
-            "importance": 3,
-            "umo": "qq:private:u1",
-            "source_excerpt": "用户说喜欢美式咖啡",
-            "truncated_block": False,
-        }
-        cur = _FakeCurator(create=[create_op])
-        kv = _KVLog()
-        mgr = _StoreMemoryMgr()
-        runner = self._runner(memory_mgr=mgr, kv=kv)
-        for p in self._patched(seg, cur):
-            p.start()
+        curator = SimpleNamespace(run=cur_run)
+        patches = self._patches(gate, curator)
+        self._context(patches)
         try:
             report = await runner.run_cycle(dry_run=False)
         finally:
-            for p in self._patched(seg, cur):
-                p.stop()
+            self._exit(patches)
         self.assertEqual(report.executed_ops, 1)
-        self.assertEqual(len(mgr.stored), 1)
-        kw = mgr.stored[0]
-        self.assertEqual(kw["event"].unified_msg_origin, "qq:private:u1")
-        self.assertEqual(kw["event"].get_sender_id(), "u1")
-        self.assertEqual(kw["memory_scope"], "personal")
-        self.assertEqual(kw["owner_sender_id"], "u1")
-        self.assertEqual(kw["extra_metadata"]["created_by"], "maintenance_curator")
-        self.assertTrue(kw["extra_metadata"]["extraction_id"])
-        # 游标已提交
-        self.assertIn(
-            "qq:qq:private:u1", kv.store.get("maintenance_extract_cursors", {})
-        )
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("processed"), 1)
+        self.assertEqual(kv.store.get(JOURNAL_KV_KEY), {})  # 日志已清空
 
     async def test_run_test_stage_extract(self):
-        blocks = [_block()]
-        seg = _FakeSegmenter(_seg_result(blocks, llm_calls=1))
-        cur = _FakeCurator(create=[{"type": "create", "content": "x"}])
-        kv = _KVLog()
-        runner = self._runner(kv=kv)
-        for p in self._patched(seg, cur):
-            p.start()
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
+        gate = _MarkerGate()
+        curator = _FakeCurator()
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=_KVLog())
+        patches = self._patches(gate, curator)
+        self._context(patches)
         try:
             result = await runner.run_test_stage("extract")
         finally:
-            for p in self._patched(seg, cur):
-                p.stop()
+            self._exit(patches)
         self.assertEqual(result["stage"], "extract")
         self.assertTrue(result["extract"]["parsed"])
-        self.assertEqual(result["extract"]["operations"], 1)
-        self.assertEqual(kv.put_log, [])  # dry-run 不提交游标
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("pending"), 1)  # dry-run 不写状态
+
+    async def test_extract_disabled_skips_stage(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(inbox, minutes_ago=90)
+        runner = self._runner(
+            memory_mgr=_StoreMemoryMgr(inbox=inbox),
+            kv=_KVLog(),
+            config={"maintenance_extract_enabled": False},
+        )
+        report = await runner.run_cycle(dry_run=True)
+        self.assertIsNone(report.extract_manifest)
+
+    async def test_inbox_unavailable_returns_error_manifest(self):
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=None), kv=_KVLog())
+        manifest = await runner._run_extraction(dry_run=False)
+        self.assertFalse(manifest.parsed)
+        self.assertEqual(manifest.error, "maintenance inbox unavailable")
 
 
 class ExecuteCreateTests(unittest.IsolatedAsyncioTestCase):
@@ -683,113 +1012,41 @@ class ReviewerCreateSourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_op_source_data(self):
         class _NoFetchMgr:
             async def _get_memory_by_uri(self, uri):
-                raise AssertionError("create 操作不应拉取源记忆")
+                raise AssertionError("create 操作不应按 URI 拉取源记忆")
 
-        reviewer = ReviewerAgent(None, _NoFetchMgr(), _RunnerFakeLLM(), {})
-        data = await reviewer._get_op_source_data(
-            {
-                "type": "create",
-                "content": "提案内容",
-                "scope": "personal",
-                "source_excerpt": "来源摘要",
-            },
-            {},
+        reviewer = ReviewerAgent(
+            context=None,
+            memory_mgr=_NoFetchMgr(),
+            llm=_RunnerFakeLLM(),
+            config={},
         )
-        self.assertEqual(
-            data,
-            {
-                "memories": {},
-                "proposed_create": {
-                    "content": "提案内容",
-                    "scope": "personal",
-                    "source_excerpt": "来源摘要",
-                },
-            },
-        )
-
-
-class SegmenterStaleCarryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stale_carry_dropped_and_cleared(self):
-        now = datetime.now(timezone.utc)
-        rows = [_row(1, "聊" * 120, now - timedelta(hours=3))]
-        kv = _KV(
-            {
-                "maintenance_extract_carry": {
-                    "qq:g1": {"start_id": 99, "cycles": 2, "fail_count": 0}
-                }
-            }
-        )
-        agent = _StubSegmenter(rows, [("qq", "g1")], _SegFakeLLM(), _config(), kv)
-        result = await agent.collect_blocks(10)
-        # 过期 carry（start_id=99 ≠ 候选块 first_id=1）被丢弃并清除
-        self.assertEqual(result["carry_updates"], {"qq:g1": None})
-        self.assertEqual(len(result["blocks"]), 1)
-
-    async def test_stale_carry_cycles_not_inherited(self):
-        now = datetime.now(timezone.utc)
-        # 块尾距今 5 分钟未超 gap → 判定不完整时挂起
-        rows = [_row(1, "聊" * 120, now - timedelta(minutes=5))]
-        kv = _KV(
-            {
-                "maintenance_extract_carry": {
-                    "qq:g1": {"start_id": 99, "cycles": 2, "fail_count": 0}
-                }
-            }
-        )
-        agent = _StubSegmenter(
-            rows, [("qq", "g1")], _SegFakeLLM(responses=[INCOMPLETE]), _config(), kv
-        )
-        result = await agent.collect_blocks(10)
-        # cycles 从 0 重计为 1，而非继承过期的 2（否则将立刻触发强制截断）
-        self.assertEqual(
-            result["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}},
-        )
-
-    async def test_matching_carry_still_inherited(self):
-        now = datetime.now(timezone.utc)
-        rows = [_row(1, "聊" * 120, now - timedelta(minutes=5))]
-        kv = _KV(
-            {
-                "maintenance_extract_carry": {
-                    "qq:g1": {"start_id": 1, "cycles": 1, "fail_count": 0}
-                }
-            }
-        )
-        agent = _StubSegmenter(
-            rows, [("qq", "g1")], _SegFakeLLM(responses=[INCOMPLETE]), _config(), kv
-        )
-        result = await agent.collect_blocks(10)
-        # start_id 匹配时正常继承 cycles
-        self.assertEqual(
-            result["carry_updates"],
-            {"qq:g1": {"start_id": 1, "cycles": 2, "fail_count": 0}},
-        )
+        op = {
+            "type": "create",
+            "content": "用户喜欢咖啡",
+            "scope": "personal",
+            "source_excerpt": "[11-27 10:00] 用户(sender_id=u1): 我喜欢咖啡",
+        }
+        data = await reviewer._get_op_source_data(op, {})
+        self.assertEqual(data["memories"], {})
+        self.assertEqual(data["proposed_create"]["content"], "用户喜欢咖啡")
+        self.assertIn("source_excerpt", data["proposed_create"])
 
 
 class MainAliasTests(unittest.TestCase):
-    """main.py 薄封装行为不变：共享解析经别名委派。"""
-
     def test_parse_extracted_memories_delegates(self):
+        plugin_cls = plugin_main.MemoryPlugin
         text = (
-            '```json\n[{"scope": "global", "type": "fact", '
-            '"content": "测试内容", "importance": 9}]\n```'
+            '[{"scope": "personal", "type": "fact", "content": "c", "subject": "u1"}]'
         )
-        result = plugin_main.MemoryPlugin._parse_extracted_memories(
-            None, text, "private"
+        parsed = plugin_cls._parse_extracted_memories(
+            SimpleNamespace(), text, "private"
         )
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["scope"], "personal")  # global 降级
-        self.assertEqual(result[0]["importance"], 5)  # clamp 到 1-5
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["content"], "c")
 
     def test_strip_json_fence_delegates(self):
+        plugin_cls = plugin_main.MemoryPlugin
         self.assertEqual(
-            plugin_main.MemoryPlugin._strip_json_fence(None, "```json\n{}\n```"),
-            "{}",
+            plugin_cls._strip_json_fence(SimpleNamespace(), "```json\n[1]\n```"),
+            "[1]",
         )
-        self.assertEqual(plugin_main._normalize_subject_id("user:u1"), "u1")
-        self.assertEqual(plugin_main._normalize_subject_ids("u1, u2"), ["u1", "u2"])
-
-
-if __name__ == "__main__":
-    unittest.main()

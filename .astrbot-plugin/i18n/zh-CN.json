@@ -117,155 +117,193 @@
       "description": "巩固批量大小",
       "hint": "每次巩固任务处理的记忆条数上限"
     },
-    "maintenance_enabled": {
-      "description": "后台整理总开关",
-      "hint": "开启后按 cron 定时执行记忆整理任务（需配置整理模型）"
-    },
-    "maintenance_model_id": {
-      "description": "整理模型",
-      "hint": "用于后台整理 Agent 的 LLM 模型，建议使用廉价模型（留空则使用会话主 LLM）"
-    },
-    "maintenance_window": {
-      "description": "整理时间窗口",
-      "hint": "单时间点如 03:00，或范围如 02:00-06:00；整理 cron 命中窗口外时仅记 DEBUG 日志并跳过"
-    },
-    "maintenance_cron": {
-      "description": "整理周期定时表达式",
-      "hint": "标准 cron 表达式，默认每天 03:00 执行完整整理管线（purge + 整理师 + 分析师 + 审核员）"
-    },
-    "maintenance_max_llm_calls": {
-      "description": "每周期 LLM 调用上限",
-      "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
-    },
-    "maintenance_max_ops_per_cycle": {
-      "description": "每周期操作数上限",
-      "hint": "整理师与分析师单周期产出的操作总数硬上限，超出部分本周期跳过并在下周期重新评估，防止异常放大"
-    },
-    "maintenance_analyst_max_new_links": {
-      "description": "分析师每次最多新建关联数",
-      "hint": "单个整理周期内分析师最多新建的关联边数量"
-    },
-    "maintenance_analyst_detect_contradiction": {
-      "description": "分析师同时检测矛盾",
-      "hint": "开启后分析师会检测互相矛盾的记忆对"
-    },
-    "maintenance_analyst_max_contradictions": {
-      "description": "分析师每次最多报告矛盾数",
-      "hint": "单个整理周期内分析师最多报告的矛盾记忆对数量，超出部分截断"
-    },
-    "maintenance_reviewer_enabled": {
-      "description": "启用审核员",
-      "hint": "复核整理师和分析师的操作建议，防止误删误改"
-    },
-    "maintenance_reviewer_model_id": {
-      "description": "审核模型",
-      "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
-    },
-    "maintenance_organizer_enabled": {
-      "description": "启用整理师",
-      "hint": "去重合并相似记忆、精炼措辞、归档无价值条目"
-    },
-    "maintenance_analyst_enabled": {
-      "description": "启用分析师",
-      "hint": "拉取对话历史，发现记忆间隐含关联，检测矛盾"
-    },
-    "maintenance_extract_enabled": {
-      "description": "启用对话提取",
-      "hint": "整理周期内从平台消息历史切分对话块并提取新记忆，关闭后只做存量记忆整理"
-    },
-    "maintenance_segmenter_model_id": {
-      "description": "分段模型",
-      "hint": "用于判断对话块是否闭环的 LLM 模型，留空使用全局整理模型"
-    },
-    "maintenance_curator_model_id": {
-      "description": "提取整理模型",
-      "hint": "用于从对话块提取记忆的 LLM 模型，留空使用全局整理模型"
-    },
-    "maintenance_segment_time_gap_minutes": {
-      "description": "分段时间间隙（分钟）",
-      "hint": "相邻消息间隔超过此值时预切为不同对话块"
-    },
-    "maintenance_segment_max_chars": {
-      "description": "对话块最大字符数",
-      "hint": "单个对话块扁平化文本的最大字符数，超出后滚动并入下一段重判"
-    },
-    "maintenance_segment_max_extensions": {
-      "description": "分段最大滚动扩展次数",
-      "hint": "对话块未闭环时最多并入后续段的次数，超限后挂起等待下周期"
-    },
-    "maintenance_extract_max_blocks_per_cycle": {
-      "description": "每周期最大对话块数",
-      "hint": "单个整理周期内分段员最多产出的对话块数量，超出部分下周期处理"
-    },
-    "maintenance_extract_llm_budget_ratio": {
-      "description": "提取 LLM 预算占比",
-      "hint": "每周期 LLM 调用上限中分配给对话提取（分段+提取）的比例，其余留给存量整理"
-    },
-    "maintenance_extract_conv2_enabled": {
-      "description": "ConversationV2 兜底提取",
-      "hint": "无平台消息历史的会话（如私聊）改用 LLM 对话记录兜底提取"
-    },
-    "maintenance_extract_conv2_chunk_messages": {
-      "description": "ConversationV2 分段消息数",
-      "hint": "ConversationV2 对话记录无时间戳，按每 N 条消息切为一个候选块"
-    },
-    "review_notify_enabled": {
-      "description": "待审通知开关",
-      "hint": "争议操作产生时主动通知管理员"
-    },
-    "review_notify_umo": {
-      "description": "通知目标 UMO",
-      "hint": "选择或填写接收待审通知的群聊或私聊 unified_msg_origin；留空则不发送主动通知"
-    },
-    "review_notify_schedule": {
-      "description": "通知频率（预留）",
-      "hint": "预留配置项（保留兼容）：当前版本在产生新争议操作时立即通知，暂未按此频率定时汇总",
-      "labels": ["每天", "每周", "每月"]
-    },
-    "review_notify_time": {
-      "description": "通知时间（预留）",
-      "hint": "预留配置项（保留兼容）：当前版本在产生新争议操作时立即通知，暂未按此时间点定时发送"
-    },
-    "maintenance_pending_queue_max": {
-      "description": "待审队列容量上限",
-      "hint": "待人工审核队列的最大长度，满了之后新争议项直接丢弃并记日志，防止队列无限膨胀"
-    },
-    "auto_purge_enabled": {
-      "description": "自动清理废弃记忆",
-      "hint": "定期物理删除已标记废弃超期的记忆"
-    },
-    "auto_purge_after_days": {
-      "description": "清理超期天数",
-      "hint": "deprecated 标记超过此天数后物理删除"
-    },
-    "auto_purge_cron": {
-      "description": "清理定时表达式",
-      "hint": "标准 cron 表达式，默认每天 05:00 执行"
-    },
-    "maintenance_tasks": {
-      "description": "整理团队编排",
-      "hint": "添加后台整理角色（organizer/analyst/reviewer），配置执行时间和行为"
-    },
-    "context_max_rounds": {
-      "description": "最大拉取对话轮数",
-      "hint": "分析师拉取对话历史的最大轮数"
-    },
-    "context_max_chars": {
-      "description": "最大拉取字符数",
-      "hint": "分析师拉取对话历史的最大总字符数"
-    },
-    "context_max_age_days": {
-      "description": "对话最大回溯天数",
-      "hint": "分析师只拉取最近 N 天的对话"
-    },
-    "persona_mode": {
-      "description": "人格加载模式",
-      "hint": "auto=自动从主人格提取摘要，manual=使用下方自定义，off=不加载",
-      "labels": ["自动", "手动", "关闭"]
-    },
-    "persona_summary": {
-      "description": "自定义人格摘要",
-      "hint": "manual 模式下填写，帮助整理 Agent 理解对话语境"
+    "maintenance": {
+      "description": "后台记忆整理",
+      "hint": "折叠组：后台提取、存量巡检、关系分析、审核、自动清理与待审通知。旧版顶层 maintenance_* 等键在首次加载时自动迁入本组，无需手动搬移",
+      "enabled": {
+        "description": "后台整理总开关",
+        "hint": "开启后按 cron 定时执行记忆整理任务（仅 AstrBot 4.30+ 可用，需配置整理模型）"
+      },
+      "model_id": {
+        "description": "整理模型",
+        "hint": "用于后台整理 Agent 的 LLM 模型，建议使用廉价模型（留空则使用会话主 LLM）"
+      },
+      "window": {
+        "description": "整理时间窗口",
+        "hint": "单时间点如 03:00，或范围如 02:00-06:00；整理 cron 命中窗口外时仅记 DEBUG 日志并跳过"
+      },
+      "cron": {
+        "description": "整理周期定时表达式",
+        "hint": "标准 cron 表达式，默认每天 03:00 执行完整整理管线（purge + 提取 + 整理师 + 分析师 + 审核员）"
+      },
+      "max_llm_calls": {
+        "description": "每周期 LLM 调用上限",
+        "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
+      },
+      "max_ops_per_cycle": {
+        "description": "每周期操作数上限",
+        "hint": "整理师+分析师单周期产出的操作总数硬上限，超出部分本周期跳过（下周期重新评估），防止异常放大"
+      },
+      "llm_timeout": {
+        "description": "LLM 调用超时(秒)",
+        "hint": "后台整理单次 LLM 请求的最长等待时间"
+      },
+      "pending_queue_max": {
+        "description": "待审队列容量上限",
+        "hint": "待人工审核队列的最大长度，满了之后新争议项直接丢弃并记日志，防止队列无限膨胀"
+      },
+      "extract_enabled": {
+        "description": "启用对话提取",
+        "hint": "整理周期内从对话缓冲表按时间窗口纯规则切分对话块并提取新记忆，关闭后只做存量记忆整理"
+      },
+      "curator_model_id": {
+        "description": "提取整理模型",
+        "hint": "用于从对话块提取记忆的 LLM 模型，留空使用全局整理模型"
+      },
+      "segment_time_gap_minutes": {
+        "description": "对话块时间间隙(分钟)",
+        "hint": "缓冲表相邻轮次间隔超过此值时切为不同对话块，纯规则切分不消耗 LLM"
+      },
+      "segment_max_chars": {
+        "description": "对话块最大字符数",
+        "hint": "单个对话块扁平化文本的最大字符数，超出后切为下一块"
+      },
+      "extract_max_blocks_per_cycle": {
+        "description": "每周期最大对话块数",
+        "hint": "单个整理周期内最多提取的对话块数量，超出部分下周期处理"
+      },
+      "extract_llm_budget_ratio": {
+        "description": "提取 LLM 预算占比",
+        "hint": "每周期 LLM 调用上限中分配给对话提取（闸门+提取）的比例，其余留给存量整理"
+      },
+      "organizer_enabled": {
+        "description": "启用整理师",
+        "hint": "去重合并相似记忆、单条存量巡检、归档无价值条目并中性化改写"
+      },
+      "organizer_model_id": {
+        "description": "整理师模型",
+        "hint": "用于存量巡检与清洗判定的 LLM 模型，留空使用全局整理模型"
+      },
+      "organizer_batch_size": {
+        "description": "整理师巡检批量",
+        "hint": "每周期单条存量巡检选样的最大记忆条数"
+      },
+      "organizer_merge_batch_size": {
+        "description": "整理师合并采样上限",
+        "hint": "merge 相似度候选预筛时采样的最大记忆条数，独立于巡检批量"
+      },
+      "analyst_enabled": {
+        "description": "启用分析师",
+        "hint": "对同作用域记忆对做 merge/link/conflict/none 语义分类，发现隐含关联并检测矛盾"
+      },
+      "analyst_max_new_links": {
+        "description": "分析师每次最多新建关联数",
+        "hint": "单个整理周期内分析师最多新建的关联边数量"
+      },
+      "analyst_detect_contradiction": {
+        "description": "分析师同时检测矛盾",
+        "hint": "开启后分析师会检测互相矛盾的记忆对"
+      },
+      "analyst_max_contradictions": {
+        "description": "分析师每次最多报告矛盾数",
+        "hint": "单个整理周期内分析师最多报告的矛盾记忆对数量，超出部分截断"
+      },
+      "analyst_max_merges": {
+        "description": "分析师每次最多合并数",
+        "hint": "单个整理周期内分析师最多产出的 merge 操作数量"
+      },
+      "analyst_batch_size": {
+        "description": "分析师采样上限",
+        "hint": "分析师相似度候选预筛的最大记忆条数，避免大知识库分配巨大相似度矩阵"
+      },
+      "reviewer_enabled": {
+        "description": "启用审核员",
+        "hint": "复核整理师和分析师的操作建议，防止误删误改"
+      },
+      "reviewer_model_id": {
+        "description": "审核模型",
+        "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
+      },
+      "reviewer_prompt_extra": {
+        "description": "审核附加提示",
+        "hint": "追加到审核员提示词末尾的补充规则，留空不追加"
+      },
+      "verification_max_per_cycle": {
+        "description": "每周期核验上限",
+        "hint": "单个整理周期内受控核验代理最多核验的低置信操作数量"
+      },
+      "verification_confidence_threshold": {
+        "description": "核验置信度阈值",
+        "hint": "清洗/分类置信度低于此值的操作转受控核验，达标才进入审核"
+      },
+      "auto_purge_enabled": {
+        "description": "自动清理废弃记忆",
+        "hint": "定期物理删除已标记废弃超期的记忆"
+      },
+      "auto_purge_after_days": {
+        "description": "清理超期天数",
+        "hint": "deprecated 标记超过此天数后物理删除"
+      },
+      "auto_purge_cron": {
+        "description": "清理定时表达式",
+        "hint": "标准 cron 表达式，默认每天 05:00 执行"
+      },
+      "review_notify_enabled": {
+        "description": "待审通知开关",
+        "hint": "争议操作产生时主动通知管理员"
+      },
+      "review_notify_umo": {
+        "description": "通知目标 UMO",
+        "hint": "选择或填写接收待审通知的群聊或私聊 unified_msg_origin；留空则不发送主动通知"
+      },
+      "review_notify_schedule": {
+        "description": "通知频率（预留）",
+        "hint": "预留配置项（保留兼容）：当前版本在产生新争议操作时立即通知，暂未按此频率定时汇总",
+        "labels": [
+          "每天",
+          "每周",
+          "每月"
+        ]
+      },
+      "review_notify_time": {
+        "description": "通知时间（预留）",
+        "hint": "预留配置项（保留兼容）：当前版本在产生新争议操作时立即通知，暂未按此时间点定时发送"
+      },
+      "context_max_rounds": {
+        "description": "最大拉取对话轮数（预留）",
+        "hint": "预留配置项（保留兼容）：当前整理管线改为对话缓冲表增量提取，不再按轮数拉取平台历史"
+      },
+      "context_max_chars": {
+        "description": "最大拉取字符数（预留）",
+        "hint": "预留配置项（保留兼容）：当前整理管线改为对话缓冲表增量提取，不再按字符数拉取平台历史"
+      },
+      "context_max_age_days": {
+        "description": "对话最大回溯天数（预留）",
+        "hint": "预留配置项（保留兼容）：对话缓冲表超期清理由生命周期统一处理，不再按天数回溯平台历史"
+      },
+      "persona_mode": {
+        "description": "人格加载模式",
+        "hint": "auto=自动从主人格提取摘要, manual=使用下方自定义, off=不加载",
+        "labels": [
+          "自动",
+          "手动",
+          "关闭"
+        ]
+      },
+      "persona_summary": {
+        "description": "自定义人格摘要",
+        "hint": "manual 模式下填写，帮助整理 Agent 理解对话语境"
+      }
+    }
+  },
+  "views": {
+    "memory_review": {
+      "title": "记忆待审列表",
+      "description": "审核后台记忆整理产生的争议操作",
+      "button_approve": "通过",
+      "button_reject": "废案",
+      "empty": "无待审争议项",
+      "action_failed": "操作失败，请重试"
     }
   }
 }

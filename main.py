@@ -18,6 +18,7 @@ import re
 import shlex
 import time
 import weakref
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +28,23 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.api.util import SessionController, SessionWaiter
 
+from .config_compat import build_flat_config_view, migrate_maintenance_config
+from .maintenance.inbox import (
+    INBOX_ASSISTANT_BRIEF_MAX_CHARS,
+    INBOX_USER_TEXT_MAX_CHARS,
+    InboxRecord,
+)
+from .maintenance.memory_gate import (
+    GateCandidate,
+    GateOutcome,
+    LlmGenerateJudge,
+    MemoryGate,
+)
 from .maintenance.scheduler import MaintenanceScheduler
+from .maintenance.version_gate import (
+    maintenance_supported,
+    unsupported_maintenance_reason,
+)
 from .memory_manager import (
     MemoryManager,
     _debug_content_summary,
@@ -83,6 +100,17 @@ from .prompts import (
 
 DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT = 10
 DEFAULT_MAX_SESSION_SNAPSHOTS = 20
+
+# 命令轮次排除：本插件命令组与核心管理命令（核心会剥离唤醒前缀，两种形式等价）
+INBOX_COMMAND_TOKENS = frozenset({"memory", "reset"})
+INBOX_MIN_USER_TEXT_CHARS = 2
+"""低于该用户文本长度的轮次视为无有效用户输入，不入缓冲表。"""
+INBOX_LOW_INFO_ASSISTANT_CHARS = 200
+"""用户文本极短且助手输出超过该长度时视为单向回显，不入缓冲表。"""
+INBOX_LOW_INFO_USER_CHARS = 8
+"""判定单向回显时用户文本的极短阈值。"""
+GATE_TOOL_TIMEOUT_SECONDS = 20
+"""memory_store 工具与实时提取的闸门 Chat 判定超时。"""
 DEFAULT_MAX_SNAPSHOT_CHARS = 8000
 
 
@@ -741,6 +769,48 @@ def _collect_turn_messages(
     return turn_messages
 
 
+def _is_inbox_command_turn(message_str: str) -> bool:
+    """命令轮次不入缓冲表；核心会剥离唤醒前缀，两种形式等价处理。"""
+    text = str(message_str or "").strip()
+    if not text:
+        return False
+    if text.startswith("/"):
+        return True
+    first_token = text.split(None, 1)[0].strip("/")
+    return first_token in INBOX_COMMAND_TOKENS
+
+
+def _is_inbox_command_event(event: Any) -> bool:
+    """核心消费过唤醒前缀或原生标记为命令的轮次视为命令调用。
+
+    唤醒检查阶段消费斜杠前缀后 message_str 不再带 "/"，需要靠
+    _consumed_wake_prefix 标记识别；Discord 等平台另有原生 is_slash_command。
+    """
+    is_slash_command = getattr(event, "is_slash_command", None)
+    if callable(is_slash_command):
+        try:
+            if is_slash_command():
+                return True
+        except Exception:
+            pass
+    try:
+        return bool(event.get_extra("_consumed_wake_prefix"))
+    except Exception:
+        return False
+
+
+def _build_inbox_user_text(
+    run_state: dict[str, Any] | None, turn_messages: list[tuple[str, str]]
+) -> str:
+    """初始用户文本 + Steering 追问按时间顺序拼接。"""
+    parts: list[str] = []
+    initial = str((run_state or {}).get("message_str", "") or "").strip()
+    if initial:
+        parts.append(initial)
+    parts.extend(text for role, text in turn_messages or [] if role == "user")
+    return "\n".join(parts)
+
+
 def authorize_memory_mutation(
     event: AstrMessageEvent,
     *,
@@ -802,6 +872,73 @@ def _validate_command(
     return None
 
 
+REVIEW_VIEW_NAME = "memory_review"
+"""ChatUI 审核卡片视图名，入口为 views/memory_review/index.html。"""
+
+REVIEW_CARD_SUMMARY_MAX_CHARS = 120
+"""卡片与文本回退中单条待审摘要的截断长度。"""
+
+_UI_ACTION_FILTER = getattr(filter, "ui_action", None)
+"""4.30 的 ui_action 装饰器；4.29 无此 API 时回退为不注册。"""
+
+
+def _ui_action(action_id: str):
+    """按宿主能力注册视图动作回调，低版本直接保留原函数。"""
+    if _UI_ACTION_FILTER is not None:
+        return _UI_ACTION_FILTER(action_id)
+    return lambda awaitable: awaitable
+
+
+def _chatui_view_supported(event: AstrMessageEvent) -> bool:
+    """当前平台是否支持 ChatUI 卡片，且事件带 4.30 的 view_result 方法。"""
+    return callable(getattr(event, "view_result", None)) and bool(
+        getattr(event.platform_meta, "support_ui_interaction", False)
+    )
+
+
+def _review_item_summary(op: dict[str, Any]) -> str:
+    """从待审操作提取一句安全摘要，覆盖 create/update/merge/link 等操作字段。"""
+    for key in ("content", "new_content", "merged_content"):
+        value = str(op.get(key) or "").strip()
+        if value:
+            return value[:REVIEW_CARD_SUMMARY_MAX_CHARS]
+    parts = [
+        str(op.get(key) or "").strip()
+        for key in ("uri", "old_uri", "new_uri", "source", "target")
+    ]
+    uris = op.get("uris")
+    if isinstance(uris, list):
+        parts.extend(str(uri).strip() for uri in uris if str(uri).strip())
+    parts.append(str(op.get("reason") or "").strip()[:60])
+    return " ".join(part for part in parts if part)[:REVIEW_CARD_SUMMARY_MAX_CHARS]
+
+
+def _review_card_data(
+    pending: list[dict[str, Any]],
+    *,
+    notice: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    """构造审核卡片数据：待审条目列表加可选反馈信息。"""
+    data: dict[str, Any] = {
+        "items": [
+            {
+                "id": item.get("id", 0),
+                "op_type": str(item.get("op_type", "")),
+                "reason": str(item.get("verdict_reason", "")),
+                "summary": _review_item_summary(item.get("op") or {}),
+                "created_at": str(item.get("created_at", "")),
+            }
+            for item in pending
+        ]
+    }
+    if notice:
+        data["notice"] = notice
+    if error:
+        data["error"] = error
+    return data
+
+
 class MemoryPlugin(Star):
     """长期记忆插件"""
 
@@ -814,10 +951,17 @@ class MemoryPlugin(Star):
     CONTACT_WRITE_CACHE_MAX = 10000
     MAX_SESSION_SNAPSHOTS = DEFAULT_MAX_SESSION_SNAPSHOTS
     MAX_SNAPSHOT_CHARS = DEFAULT_MAX_SNAPSHOT_CHARS
+    EXTRACTION_ASSISTANT_MAX_CHARS = 300  # 实时提取对话中助手回复的截断长度
 
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
-        self.config = config or {}
+        raw_config = config or {}
+        migrate_maintenance_config(raw_config)
+        # 迁移后 self.config 即单一平面视图，卡片/命令/后台与 MemoryManager 读取同一来源
+        self.config = build_flat_config_view(raw_config)
+        self._flat_config = self.config
+        # 命令与审核卡片的待审裁决互斥锁，覆盖读队列→执行→写回
+        self._review_lock = asyncio.Lock()
         self.memory_mgr: MemoryManager | None = None
         # 实例级请求快照字典，按 session_key 键控，避免跨用户污染
         # 结构: {session_key: {"snapshots": [...], "timestamp": float}}
@@ -842,6 +986,7 @@ class MemoryPlugin(Star):
         ] = weakref.WeakKeyDictionary()
         self._pending_event_snapshots_fallback: list[tuple[Any, dict[str, str]]] = []
         self._scheduler: MaintenanceScheduler | None = None
+        self._memory_gate: MemoryGate | None = None
 
     async def initialize(self):
         """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
@@ -859,6 +1004,14 @@ class MemoryPlugin(Star):
             self.memory_mgr = None
             return
 
+        if (
+            self.config.get("maintenance_enabled", False)
+            and not maintenance_supported()
+        ):
+            logger.warning(
+                "[简单长期记忆] %s，已跳过后台整理调度；基础记忆读写与召回不受影响",
+                unsupported_maintenance_reason(),
+            )
         # 尝试立即连接 KB（热重载时 KB 已就绪）
         try:
             await self.memory_mgr.connect_kb()
@@ -997,6 +1150,16 @@ class MemoryPlugin(Star):
             return
         if self._scheduler:
             return  # 已启动
+        if (
+            self.config.get("maintenance_enabled", False)
+            and not maintenance_supported()
+        ):
+            # maintenance_enabled 仅允许 AstrBot 4.30+；版本不足时不创建调度
+            logger.warning(
+                "[简单长期记忆] %s，本次不创建后台整理调度器",
+                unsupported_maintenance_reason(),
+            )
+            return
         self._scheduler = MaintenanceScheduler(
             context=self.context,
             memory_mgr=self.memory_mgr,
@@ -1147,10 +1310,16 @@ class MemoryPlugin(Star):
         if not prompt_text:
             return
 
+        snapshot_timestamp = getattr(event, "created_at", None)
+        try:
+            snapshot_timestamp = float(snapshot_timestamp)
+        except (TypeError, ValueError):
+            snapshot_timestamp = time.time()
         snapshot: dict[str, Any] = {
             "prompt": prompt_text,
             "response": response_text[: self.MAX_SNAPSHOT_CHARS],
             "sender_id": sender_id,
+            "timestamp": snapshot_timestamp,
         }
 
         if turn_messages:
@@ -1259,8 +1428,8 @@ class MemoryPlugin(Star):
             return
         if not self.config.get("memory_consolidation_enabled", True):
             return
-        # 后台整理启用时禁用旧巩固，避免并发竞态（spec: 旧 consolidation 迁移）
-        if self.config.get("maintenance_enabled", False):
+        # 仅在新后台整理实际可用时禁用旧巩固，旧版保留旧路径。
+        if self.config.get("maintenance_enabled", False) and maintenance_supported():
             return
         min_age_days = _read_positive_int(
             self.config.get("consolidation_min_age_days", 14), 14
@@ -1359,7 +1528,25 @@ class MemoryPlugin(Star):
     def _build_conversation_from_snapshots(
         self, snapshots: list[dict[str, Any]]
     ) -> str:
-        """从快照列表构建对话文本"""
+        """从快照列表构建带消息时间的对话文本。"""
+        assistant_limit = self.EXTRACTION_ASSISTANT_MAX_CHARS
+
+        def _clip_assistant(text: str) -> str:
+            if len(text) <= assistant_limit:
+                return text
+            return text[:assistant_limit] + "…"
+
+        def _timestamp_suffix(value: Any) -> str:
+            if value in (None, ""):
+                return ""
+            try:
+                rendered = time.strftime(
+                    "%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(value))
+                )
+            except (OverflowError, OSError, TypeError, ValueError):
+                return ""
+            return f" [消息时间: {rendered}]"
+
         lines = []
         for snapshot in snapshots:
             ordered_messages = snapshot.get("messages")
@@ -1369,22 +1556,40 @@ class MemoryPlugin(Star):
                     text = item.get("text", "")
                     if not text:
                         continue
+                    suffix = _timestamp_suffix(
+                        item.get("timestamp", snapshot.get("timestamp"))
+                    )
                     if role == "user":
                         sid = item.get("sender_id", "")
                         sender_label = f"用户:{sid}" if sid else "用户"
-                        lines.append(f"[{sender_label}]: {text}")
+                        lines.append(f"[{sender_label}]: {text}{suffix}")
                     elif role == "assistant":
-                        lines.append(f"[助手]: {text}")
+                        lines.append(f"[助手]: {_clip_assistant(text)}{suffix}")
                 continue
             prompt = snapshot.get("prompt", "")
             response = snapshot.get("response", "")
             sender_id = snapshot.get("sender_id", "")
+            suffix = _timestamp_suffix(snapshot.get("timestamp"))
             if prompt:
                 sender_label = f"用户:{sender_id}" if sender_id else "用户"
-                lines.append(f"[{sender_label}]: {prompt}")
+                lines.append(f"[{sender_label}]: {prompt}{suffix}")
             if response:
-                lines.append(f"[助手]: {response}")
+                lines.append(f"[助手]: {_clip_assistant(response)}{suffix}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _snapshot_user_text_length(snapshots: list[dict[str, Any]]) -> int:
+        """统计快照中的有效用户文本长度（不含角色标签与助手输出）。"""
+        total = 0
+        for snapshot in snapshots:
+            ordered_messages = snapshot.get("messages")
+            if isinstance(ordered_messages, list) and ordered_messages:
+                for item in ordered_messages:
+                    if item.get("role") == "user":
+                        total += len(item.get("text", "") or "")
+                continue
+            total += len(snapshot.get("prompt", "") or "")
+        return total
 
     # ==================== 检索优化 ====================
 
@@ -1553,11 +1758,16 @@ class MemoryPlugin(Star):
     @_on_agent_begin_decorator()
     async def on_agent_begin(self, event: AstrMessageEvent, run_context: Any):
         """标记由 Agent 生命周期收口的事件，避免子代理与 Steering 重复触发提取。"""
-        if not self.memory_mgr or not self.config.get("auto_memorize", True):
+        if not self.memory_mgr:
+            return
+        if not (
+            self.config.get("auto_memorize", True) or self._inbox_collection_active()
+        ):
             return
         if _is_wakeup_event(event):
             return
-
+        if getattr(event, "_is_maintenance_internal", False):
+            return
         _mark_agent_managed_event(self, event)
         if _is_subagent_run(run_context):
             return
@@ -1570,6 +1780,7 @@ class MemoryPlugin(Star):
             {
                 "start_len": len(messages),
                 "anchor": messages[-1] if messages else None,
+                "message_str": str(getattr(event, "message_str", "") or "").strip(),
             },
         )
 
@@ -1580,10 +1791,16 @@ class MemoryPlugin(Star):
         run_context: Any,
         response: LLMResponse | None = None,
     ):
-        """在主 Agent 单轮结束时收口快照并按间隔提取记忆。"""
-        if not self.memory_mgr or not self.config.get("auto_memorize", True):
+        """主 Agent 单轮收口：快照提取（auto_memorize）与缓冲表采集相互独立。"""
+        if not self.memory_mgr:
+            return
+        inbox_active = self._inbox_collection_active()
+        if not (self.config.get("auto_memorize", True) or inbox_active):
             return
         if _is_wakeup_event(event) or _is_subagent_run(run_context):
+            return
+        if getattr(event, "_is_maintenance_internal", False):
+            _pop_agent_run_state(self, event)
             return
 
         _mark_agent_managed_event(self, event)
@@ -1622,9 +1839,34 @@ class MemoryPlugin(Star):
             self._clear_pending_snapshot(event)
             return
 
-        await self._record_response_and_maybe_extract(
-            event, assistant_output, turn_messages=turn_messages
-        )
+        inbox_row_id: int | None = None
+        if (
+            inbox_active
+            and end_reason not in {"cancelled", "error"}
+            and resp_role != "err"
+        ):
+            inbox_row_id = await self._append_inbox_turn(
+                # response 为空时回退到本轮已收集的助手回复，避免 brief 无故为空
+                event,
+                run_state,
+                turn_messages,
+                final_text or assistant_output,
+            )
+
+        # 实时提取只受 auto_memorize 控制；缓冲采集独立于该开关
+        extraction: dict[str, Any] = {"extraction_performed": False}
+        if self.config.get("auto_memorize", True):
+            extraction = await self._record_response_and_maybe_extract(
+                event, assistant_output, turn_messages=turn_messages
+            )
+        if (
+            inbox_row_id is not None
+            and extraction.get("extraction_performed")
+            and self.memory_mgr
+        ):
+            inbox = getattr(self.memory_mgr, "inbox", None)
+            if inbox is not None:
+                await inbox.mark_realtime_extracted(inbox_row_id)
 
     def _clear_pending_snapshot(self, event: AstrMessageEvent) -> None:
         """取消或报错且无有效回复时仅清除当前事件对应的待匹配请求。"""
@@ -1640,6 +1882,91 @@ class MemoryPlugin(Star):
             entry["pending_prompt"] = None
             entry["pending_sender_id"] = ""
             entry["pending_event_ref"] = None
+
+    def _inbox_collection_active(self) -> bool:
+        """后台提取缓冲采集是否开启：maintenance_enabled 且 AstrBot 4.30+。"""
+        if not self.config.get("maintenance_enabled", False):
+            return False
+        if not maintenance_supported():
+            return False
+        inbox = getattr(self.memory_mgr, "inbox", None) if self.memory_mgr else None
+        return inbox is not None and inbox.ready
+
+    async def _get_current_conversation_id(self, umo: str) -> str:
+        """从真实 ConversationManager 读取当前会话 cid，不额外创建会话。"""
+        manager = getattr(self.context, "conversation_manager", None)
+        get_curr = getattr(manager, "get_curr_conversation_id", None)
+        if not callable(get_curr):
+            return ""
+        try:
+            cid = await get_curr(umo)
+        except Exception as e:
+            logger.debug(
+                "[简单长期记忆] 读取当前会话 cid 失败: error_type=%s", type(e).__name__
+            )
+            return ""
+        return str(cid or "")
+
+    async def _append_inbox_turn(
+        self,
+        event: AstrMessageEvent,
+        run_state: dict[str, Any] | None,
+        turn_messages: list[tuple[str, str]],
+        assistant_text: str,
+    ) -> int | None:
+        """把一轮正常收口的主轮次写入后台提取缓冲表，返回行 id。
+
+        sender_id 只取真实事件字段，不从正文推定；日志不输出对话正文。
+        """
+        inbox = getattr(self.memory_mgr, "inbox", None) if self.memory_mgr else None
+        if inbox is None or not inbox.ready:
+            return None
+        parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+        if not parsed_umo.is_valid:
+            return None
+        initial_text = str((run_state or {}).get("message_str", "") or "").strip()
+        if _is_inbox_command_event(event) or _is_inbox_command_turn(initial_text):
+            return None
+        user_text = _build_inbox_user_text(run_state, turn_messages)
+        user_text = "\n".join(line.strip() for line in user_text.splitlines())
+        user_text = user_text[:INBOX_USER_TEXT_MAX_CHARS]
+        if len(user_text) < INBOX_MIN_USER_TEXT_CHARS:
+            return None
+        assistant_brief = (assistant_text or "").strip()[
+            :INBOX_ASSISTANT_BRIEF_MAX_CHARS
+        ]
+        if (
+            len(user_text) < INBOX_LOW_INFO_USER_CHARS
+            and len(assistant_brief) > INBOX_LOW_INFO_ASSISTANT_CHARS
+        ):
+            # 用户输入极短而内容几乎全在助手输出：单向回显不入缓冲
+            return None
+        conversation_id = await self._get_current_conversation_id(
+            event.unified_msg_origin
+        )
+        record = InboxRecord(
+            umo=event.unified_msg_origin,
+            platform_id=parsed_umo.platform_id,
+            session_type=parsed_umo.session_type,
+            session_id=parsed_umo.session_id,
+            conversation_id=conversation_id,
+            sender_id=event.get_sender_id(),
+            sender_name=event.get_sender_name(),
+            user_text=user_text,
+            assistant_brief=assistant_brief,
+        )
+        return await inbox.append(record)
+
+    def _plugin_gate(self) -> MemoryGate:
+        """插件级长生命周期闸门，保留 Decision 未配置的探测缓存。"""
+        gate = getattr(self, "_memory_gate", None)
+        if gate is None:
+            gate = MemoryGate(
+                decision_service=getattr(self.context, "decision", None),
+                provider_manager=getattr(self.context, "provider_manager", None),
+            )
+            self._memory_gate = gate
+        return gate
 
     @filter.on_llm_response()
     async def extract_memories(self, event: AstrMessageEvent, response: LLMResponse):
@@ -1665,14 +1992,26 @@ class MemoryPlugin(Star):
         assistant_output: str,
         *,
         turn_messages: list[tuple[str, str]] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
+        """按间隔提取记忆并返回明确结果，供调用方判断是否标记实时提取。"""
+
+        def _result(performed: bool = False, **extra: Any) -> dict[str, Any]:
+            base: dict[str, Any] = {
+                "extraction_performed": performed,
+                "stored": 0,
+                "gate_rejected": 0,
+                "gate_unavailable": 0,
+            }
+            base.update(extra)
+            return base
+
         try:
             extraction_interval = _read_positive_int(
                 self.config.get("extraction_interval", 20), 20
             )
             if extraction_interval <= 0:
                 self._discard_session_snapshots(event)
-                return
+                return _result()
 
             # 用响应完成快照（仅在具备轮内有序消息时传关键字参数，兼容旧测试桩）
             if turn_messages:
@@ -1687,38 +2026,39 @@ class MemoryPlugin(Star):
 
             # 检查是否达到提取间隔
             if current_count % extraction_interval != 0:
-                return
+                return _result()
 
             # 先校验 UMO 再清空快照缓冲，无效 UMO 保留累积对话等下个间隔重试
             parsed_umo = UMOInfo.parse(event.unified_msg_origin)
             if not parsed_umo.is_valid:
                 logger.warning("[简单长期记忆] 自动提取跳过: invalid_umo")
-                return
+                return _result()
 
             # 获取累积的快照列表
             snapshots = self._get_and_clear_session_snapshots(event)
             if not snapshots:
-                return
+                return _result()
 
             # 构建对话文本（包含所有累积的对话）
             conversation = self._build_conversation_from_snapshots(snapshots)
 
-            # 检查最小内容长度
+            # 检查有效用户文本最小长度（不含角色标签与助手输出）
             min_length = self.config.get("extraction_min_content_length", 150)
-            if len(conversation) < min_length:
+            user_text_length = self._snapshot_user_text_length(snapshots)
+            if user_text_length < min_length:
                 logger.debug(
-                    f"[简单长期记忆] 对话总长度 {len(conversation)} < {min_length}，跳过提取"
+                    f"[简单长期记忆] 有效用户文本长度 {user_text_length} < {min_length}，跳过提取"
                 )
-                return
+                return _result()
 
             if not conversation:
-                return
+                return _result()
 
             # 获取提取模型
             provider_id = await self._get_llm_provider_id(event, "extraction")
             if not provider_id:
                 logger.debug("[简单长期记忆] 未配置提取模型，跳过记忆提取")
-                return
+                return _result()
 
             allowed_sender_ids = list(
                 dict.fromkeys(
@@ -1762,7 +2102,7 @@ class MemoryPlugin(Star):
 
             except Exception as e:
                 logger.warning(f"[简单长期记忆] LLM 提取调用失败: {e}")
-                return
+                return _result()
 
             # 解析提取结果
             memories = self._parse_extracted_memories(
@@ -1772,14 +2112,30 @@ class MemoryPlugin(Star):
                 "[简单长期记忆] 自动提取解析完成: parsed=%s",
                 len(memories),
             )
+            # LLM 已实际调用并返回：即使候选为空也算完成一次提取
+            extraction_done = _result(performed=True)
             if not memories:
-                return
+                return extraction_done
+
+            # 准入闸门：解析后的候选在查重与写入之前批量判定
+            gate_outcomes = await self._evaluate_store_gate(
+                memories, conversation, provider_id
+            )
 
             # 存储提取的记忆
             stored_count = 0
             skipped_empty_count = 0
+            skipped_duplicate_count = 0
             store_failures = 0
-            for mem in memories:
+            for idx, mem in enumerate(memories):
+                outcome = gate_outcomes.get(str(idx))
+                if outcome is not None and outcome.status == "rejected":
+                    extraction_done["gate_rejected"] += 1
+                    continue
+                if outcome is None or outcome.status == "unavailable":
+                    # 判定失败 fail closed：本条不入库，不中断其余候选
+                    extraction_done["gate_unavailable"] += 1
+                    continue
                 memory_domain = mem.get("type", "fact")
                 scope = mem.get("scope", MemoryScope.PERSONAL)
                 content = mem.get("content", "")
@@ -1800,6 +2156,10 @@ class MemoryPlugin(Star):
                 disclosure = mem.get("disclosure", "")
                 importance = mem.get("importance", 3)
                 owner_sender_ids = subjects if scope == MemoryScope.PERSONAL else []
+                owner_user_ids = [
+                    build_user_id(parsed_umo.platform_id, sender_id)
+                    for sender_id in owner_sender_ids
+                ]
 
                 if not content:
                     skipped_empty_count += 1
@@ -1807,6 +2167,21 @@ class MemoryPlugin(Star):
 
                 domain = normalize_domain(memory_domain)
 
+                duplicate_uri = await self.memory_mgr.find_scoped_duplicate(
+                    content=content,
+                    memory_scope=scope,
+                    platform_id=parsed_umo.platform_id,
+                    session_id=parsed_umo.session_id,
+                    umo=event.unified_msg_origin,
+                    owner_user_id=owner_user_ids[0] if owner_user_ids else "",
+                    owner_user_ids=owner_user_ids,
+                )
+                if duplicate_uri:
+                    skipped_duplicate_count += 1
+                    logger.debug(
+                        f"[简单长期记忆] 自动提取查重命中，跳过写入: {duplicate_uri}"
+                    )
+                    continue
                 try:
                     uri = await self.memory_mgr.store_memory(
                         event=event,
@@ -1843,22 +2218,93 @@ class MemoryPlugin(Star):
                         e,
                     )
 
+            extraction_done["stored"] = stored_count
             logger.debug(
                 "[简单长期记忆] 自动提取完成: snapshots=%s, parsed=%s, "
-                "stored=%s, skipped_empty=%s, store_failures=%s, elapsed_ms=%s",
+                "stored=%s, skipped_empty=%s, skipped_duplicate=%s, "
+                "gate_rejected=%s, gate_unavailable=%s, store_failures=%s, "
+                "elapsed_ms=%s",
                 len(snapshots),
                 len(memories),
                 stored_count,
                 skipped_empty_count,
+                skipped_duplicate_count,
+                extraction_done["gate_rejected"],
+                extraction_done["gate_unavailable"],
                 store_failures,
                 round((time.monotonic() - extraction_started_at) * 1000),
             )
             logger.info(
                 f"[简单长期记忆] 已从 {len(snapshots)} 轮对话中存储 {stored_count} 条记忆（候选 {len(memories)} 条）"
             )
+            return extraction_done
 
         except Exception as e:
             logger.warning(f"[简单长期记忆] 提取记忆失败: {e}")
+            return _result()
+
+    async def _evaluate_store_gate(
+        self,
+        memories: list[dict[str, Any]],
+        conversation: str,
+        provider_id: str | None,
+    ) -> dict[str, GateOutcome]:
+        """对实时提取候选批量执行准入闸门；异常时全部按 unavailable fail closed。"""
+        candidates = [
+            GateCandidate(
+                candidate_id=str(idx),
+                content=str(mem.get("content", "")),
+                evidence=conversation,
+            )
+            for idx, mem in enumerate(memories)
+        ]
+        try:
+            gate = self._plugin_gate()
+            judge = (
+                LlmGenerateJudge(self.context, provider_id, GATE_TOOL_TIMEOUT_SECONDS)
+                if provider_id
+                else None
+            )
+            return await gate.evaluate(candidates, chat_judge=judge)
+        except Exception as e:
+            logger.warning(
+                "[简单长期记忆] 闸门判定异常，候选全部 fail closed: error_type=%s",
+                type(e).__name__,
+            )
+            return {
+                candidate.candidate_id: GateOutcome(
+                    "unavailable", "gate evaluation error"
+                )
+                for candidate in candidates
+            }
+
+    async def _gate_tool_content(
+        self, event: AstrMessageEvent, content: str
+    ) -> str | None:
+        """memory_store 工具的准入闸门；返回错误文案或 None（放行）。"""
+        provider_id = await self._get_llm_provider_id(event, "extraction")
+        outcome: GateOutcome | None = None
+        try:
+            gate = self._plugin_gate()
+            judge = (
+                LlmGenerateJudge(self.context, provider_id, GATE_TOOL_TIMEOUT_SECONDS)
+                if provider_id
+                else None
+            )
+            outcomes = await gate.evaluate(
+                [GateCandidate(candidate_id="tool", content=content)],
+                chat_judge=judge,
+            )
+            outcome = outcomes.get("tool")
+        except Exception as e:
+            logger.warning(
+                "[简单长期记忆] 工具写入闸门异常: error_type=%s", type(e).__name__
+            )
+        if outcome is not None and outcome.status == "approved":
+            return None
+        if outcome is not None and outcome.status == "rejected":
+            return f"Error: memory rejected by admission gate ({outcome.reason})"
+        return "Error: memory gate temporarily unavailable, please retry later"
 
     # ==================== 用户命令 ====================
 
@@ -2440,7 +2886,7 @@ class MemoryPlugin(Star):
 
     @memory_group.command("review")
     async def cmd_review(self, event: AstrMessageEvent):
-        """争议审查 /memory review [approve|reject|clear] [id]"""
+        """争议审查 /memory review [list|approve|reject|clear] [id]"""
         if not event.is_admin():
             yield event.plain_result("仅管理员可用")
             return
@@ -2449,9 +2895,18 @@ class MemoryPlugin(Star):
 
         if action == "list":
             queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            overflow = (
+                await self.get_kv_data("maintenance_pending_review_overflow", None)
+                or []
+            )
             pending = [q for q in queue if q.get("status") == "pending"]
             if not pending:
-                yield event.plain_result("✅ 无待审争议项")
+                if overflow:
+                    yield event.plain_result(
+                        f"✅ 当前无待审争议项，另有 {len(overflow)} 条操作等待队列容量释放"
+                    )
+                else:
+                    yield event.plain_result("✅ 无待审争议项")
                 return
             lines = [f"📝 待审争议 ({len(pending)} 条)："]
             for item in pending:
@@ -2460,14 +2915,30 @@ class MemoryPlugin(Star):
                     f"{item.get('verdict_reason', '')} "
                     f"({item.get('created_at', '')})"
                 )
+            if overflow:
+                lines.append(
+                    f"\n另有 {len(overflow)} 条操作等待队列容量释放后自动进入待审"
+                )
             lines.append("\n/memory review approve <id> 批准")
             lines.append("/memory review reject <id> 废案")
             lines.append("/memory review clear 清空")
-            yield event.plain_result("\n".join(lines))
+            text = "\n".join(lines)
+            if _chatui_view_supported(event):
+                # ChatUI 平台发交互卡片，text 同时作为非 ChatUI 平台的文字回退
+                yield event.view_result(
+                    name=REVIEW_VIEW_NAME,
+                    data=_review_card_data(pending),
+                    text=text,
+                    title="记忆待审列表",
+                )
+            else:
+                yield event.plain_result(text)
 
         elif action == "clear":
-            await self.put_kv_data("maintenance_pending_review", [])
-            yield event.plain_result("✅ 待审队列已清空")
+            async with self._review_lock:
+                await self.put_kv_data("maintenance_pending_review", [])
+                await self.put_kv_data("maintenance_pending_review_overflow", [])
+            yield event.plain_result("✅ 待审队列及溢出暂存已清空")
 
         elif action in ("approve", "reject"):
             if len(args) < 2:
@@ -2478,44 +2949,81 @@ class MemoryPlugin(Star):
             except ValueError:
                 yield event.plain_result("id 必须是数字")
                 return
-            queue = await self.get_kv_data("maintenance_pending_review", None) or []
-            found = None
-            for item in queue:
-                if item.get("id") == target_id and item.get("status") == "pending":
-                    found = item
-                    break
-            if not found:
-                yield event.plain_result(f"未找到待审项 #{target_id}")
-                return
-            if action == "reject":
-                found["status"] = "rejected"
-                await self.put_kv_data("maintenance_pending_review", queue)
-                yield event.plain_result(f"🚫 #{target_id} 已废案")
-            elif action == "approve":
-                # 先执行，成功后才标记 approved（失败保留可重试）
-                # execute_approved 与后台周期阶段 4 互斥，避免并发写竞态
-                runner = self._scheduler.runner if self._scheduler else None
-                if not runner:
-                    yield event.plain_result(f"⚠️ #{target_id} 调度器未运行，无法执行")
-                    return
-                try:
-                    ok = await runner.execute_approved(found.get("op", {}))
-                    if ok:
-                        found["status"] = "approved"
-                        await self.put_kv_data("maintenance_pending_review", queue)
-                        yield event.plain_result(f"✅ #{target_id} 已批准并执行")
-                    else:
-                        found["status"] = "failed"
-                        await self.put_kv_data("maintenance_pending_review", queue)
-                        yield event.plain_result(
-                            f"⚠️ #{target_id} 执行失败，已标记 failed"
-                        )
-                except Exception as e:
-                    yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
+            feedback, _pending = await self._decide_review_item(action, target_id)
+            yield event.plain_result(feedback)
         else:
             yield event.plain_result(
                 "用法: /memory review [list|approve <id>|reject <id>|clear]"
             )
+
+    async def _decide_review_item(
+        self, action: str, target_id: int
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """裁决一条待审项，返回 (反馈文本, 最新待审列表)。
+
+        approve 复用 runner.execute_approved，与后台周期阶段互斥；
+        成功才标记 approved，执行失败保留 pending 可重试。
+        """
+        async with self._review_lock:
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            pending = [q for q in queue if q.get("status") == "pending"]
+            found = next((q for q in pending if q.get("id") == target_id), None)
+            if found is None:
+                return f"未找到待审项 #{target_id}（可能已被处理）", pending
+
+            if action == "reject":
+                found["status"] = "rejected"
+                await self.put_kv_data("maintenance_pending_review", queue)
+                return f"🚫 #{target_id} 已废案", [
+                    q for q in queue if q.get("status") == "pending"
+                ]
+
+            runner = self._scheduler.runner if self._scheduler else None
+            if not runner:
+                return f"⚠️ #{target_id} 调度器未运行，无法执行", pending
+            try:
+                ok = await runner.execute_approved(found.get("op", {}))
+            except Exception as e:
+                return f"⚠️ #{target_id} 执行异常: {e}", pending
+            if not ok:
+                return f"⚠️ #{target_id} 执行失败，条目保留待审可重试", pending
+            found["status"] = "approved"
+            await self.put_kv_data("maintenance_pending_review", queue)
+            return f"✅ #{target_id} 已批准并执行", [
+                q for q in queue if q.get("status") == "pending"
+            ]
+
+    async def _handle_review_action(
+        self, event: AstrMessageEvent, action: str
+    ) -> AsyncGenerator[Any, None]:
+        """处理审核卡片的通过/驳回回调，成功后用最新队列刷新卡片。"""
+        if not event.is_admin():
+            raise PermissionError("仅管理员可操作待审队列")
+        interaction = event.get_ui_interaction()
+        if interaction is None:
+            return
+        data = interaction.data if isinstance(interaction.data, dict) else None
+        target_id = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(target_id, int) or isinstance(target_id, bool):
+            raise ValueError("卡片操作缺少有效的待审 id")
+        feedback, pending = await self._decide_review_item(action, target_id)
+        error = feedback if feedback.startswith("⚠️") else ""
+        notice = "" if error else feedback
+        yield event.view_result(
+            data=_review_card_data(pending, notice=notice, error=error)
+        )
+
+    @_ui_action("approve")
+    async def review_approve_action(self, event: AstrMessageEvent):
+        """审核卡片回调：通过一条待审操作。"""
+        async for result in self._handle_review_action(event, "approve"):
+            yield result
+
+    @_ui_action("reject")
+    async def review_reject_action(self, event: AstrMessageEvent):
+        """审核卡片回调：驳回一条待审操作。"""
+        async for result in self._handle_review_action(event, "reject"):
+            yield result
 
     async def _run_memory_test(self, event: AstrMessageEvent) -> str:
         """执行一次记忆写入-读取测试并返回报告"""
@@ -2572,6 +3080,13 @@ class MemoryPlugin(Star):
 
     async def _run_maintenance_test(self, stage: str) -> str:
         """运行后台阶段 dry-run，并只返回计数摘要。"""
+        if not maintenance_supported():
+            # 后台整理管线整体要求 4.30+，不通过临时调度器绕过版本门控
+            return (
+                f"[后台整理测试: {stage}]\n"
+                f"  结果: 失败（{unsupported_maintenance_reason()}）\n"
+                "  模式: dry-run，无持久化写入"
+            )
         scheduler = self._scheduler
         if scheduler is None:
             scheduler = MaintenanceScheduler(
@@ -2600,13 +3115,17 @@ class MemoryPlugin(Star):
         extract = result.get("extract")
         if isinstance(extract, dict):
             metrics = extract.get("metrics") or {}
-            seg = metrics.get("segmenter") or {}
+            inbox_stats = metrics.get("inbox") or {}
             report.append(
-                "  extract: 解析 {parsed}，扫描会话 {convs}，产出块 {blocks}，"
+                "  extract: 解析 {parsed}，缓冲行 {rows}，产出块 {blocks}，"
+                "闸门通过 {approved}/拒绝 {rejected}/失败 {unavailable}，"
                 "新增 {created}，更新 {updated}".format(
                     parsed="成功" if extract.get("parsed") else "失败",
-                    convs=seg.get("conversations_scanned", 0),
+                    rows=inbox_stats.get("rows_fetched", 0),
                     blocks=metrics.get("blocks", 0),
+                    approved=metrics.get("gate_approved", 0),
+                    rejected=metrics.get("gate_rejected", 0),
+                    unavailable=metrics.get("gate_unavailable", 0),
                     created=metrics.get("created", 0),
                     updated=metrics.get("updated", 0),
                 )
@@ -2615,7 +3134,7 @@ class MemoryPlugin(Star):
             manifest = result.get(name)
             if isinstance(manifest, dict):
                 metrics = manifest.get("metrics") or {}
-                report.append(
+                parts = [
                     "  {name}: 解析 {parsed}，操作 {operations}，记忆 {memories}，"
                     "向量 {vectors}，缺失 {missing}，候选 {candidates}".format(
                         name=name,
@@ -2628,7 +3147,33 @@ class MemoryPlugin(Star):
                         missing=metrics.get("vector_missing", 0),
                         candidates=metrics.get("candidates_screened", 0),
                     )
+                ]
+                if name == "organizer":
+                    parts.append(
+                        "巡检 {inspected}，merge {merge}，archive {archive}，"
+                        "update {update}".format(
+                            inspected=metrics.get("inspected", 0),
+                            merge=metrics.get("op_merge", 0),
+                            archive=metrics.get("op_archive", 0),
+                            update=metrics.get("op_update", 0),
+                        )
+                    )
+                else:
+                    parts.append(
+                        "link {link}，conflict {conflict}，merge {merge}".format(
+                            link=metrics.get("op_new_link", 0),
+                            conflict=metrics.get("op_contradiction", 0),
+                            merge=metrics.get("op_merge", 0),
+                        )
+                    )
+                parts.append(
+                    "需核验 {needed}，实际核验 {executed}，预算跳过 {skipped}".format(
+                        needed=metrics.get("verification_needed", 0),
+                        executed=metrics.get("verification_executed", 0),
+                        skipped=metrics.get("verification_budget_skipped", 0),
+                    )
                 )
+                report.append("，".join(parts))
         reviewer = result.get("reviewer")
         if isinstance(reviewer, dict):
             report.append(
@@ -2851,6 +3396,11 @@ class MemoryPlugin(Star):
         content = _sanitize_memory_content(content)
         if not content:
             return "Invalid memory content"
+
+        # 准入闸门：sanitize 后、入库前统一判定；失败 fail closed 不静默降级
+        gate_error = await self._gate_tool_content(event, content)
+        if gate_error:
+            return gate_error
 
         domain = normalize_domain(mem_type_lower)
         uri = str(MemoryURI.generate(domain))

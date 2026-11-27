@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from astrbot.api import logger
 
 from .contact_index import ContactIndex, ContactObservation
+from .maintenance.inbox import INBOX_RETENTION_DAYS, MaintenanceInbox
 from .maintenance.links import MemoryLinkManager
 from .memory_protocol import (
     MemoryMetadata,
@@ -58,7 +59,29 @@ KVGetFn = Callable[[str, Any], Any]
 KVDeleteFn = Callable[[str], Any]
 
 SIMILARITY_THRESHOLD = 0.85  # 相似度阈值，用于记忆合并
+SCOPED_DEDUP_SIMILARITY_THRESHOLD = (
+    0.9  # 自动提取落库前同归属查重阈值（与合并预筛一致）
+)
 
+
+# TTL 过期标记的 SQL 片段（单一来源，测试直接复用验证边界）
+TTL_EXPIRE_SET_CLAUSE = (
+    "json_set(metadata, '$.deprecated', 1, '$.deprecated_at', :now_iso)"
+)
+TTL_EXPIRE_WHERE_CLAUSE = (
+    "json_extract(metadata,'$.is_memory_record') = 1 "
+    "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
+    "AND json_extract(metadata,'$.kb_id') = :kb_id "
+    "AND COALESCE(NULLIF(json_extract(metadata,'$.last_recalled_at'), ''), "
+    "json_extract(metadata,'$.created_at')) < :cutoff "
+    "AND json_extract(metadata,'$.memory_type') != 'permanent' "
+    "AND json_extract(metadata,'$.memory_scope') != 'global' "
+    "AND NOT ("
+    "CAST(COALESCE(json_extract(metadata,'$.recall_count'),0) AS INTEGER) >= 5 "
+    "AND COALESCE(json_extract(metadata,'$.domain'), '') IN "
+    "('fact','facts','preference','preferences')"
+    ")"
+)
 # 允许的记忆域
 _ALLOWED_DOMAINS = frozenset(
     [
@@ -244,6 +267,8 @@ class MemoryManager:
         # 关联表管理器（connect_kb 后初始化）
         self._link_manager: MemoryLinkManager | None = None
         self._contact_index: ContactIndex | None = None
+        # 后台提取缓冲表（connect_kb 后初始化；插件与后台整理共用）
+        self.inbox: MaintenanceInbox | None = None
         self._last_active_memory_stats: dict[str, Any] = {}
 
     # ---------- public state accessors ----------
@@ -409,13 +434,19 @@ class MemoryManager:
             }
         from .maintenance.purge import purge_deprecated_memories
 
-        return await purge_deprecated_memories(
+        result = await purge_deprecated_memories(
             vec_db=self.vec_db,
             kb_helper=self._kb_helper,
             link_manager=self._link_manager,
             after_days=after_days,
             dry_run=dry_run,
         )
+        # 超期终态的缓冲行一并清理；pending 行不因超期删除
+        if self.inbox is not None:
+            result["inbox"] = await self.inbox.purge_terminal(
+                INBOX_RETENTION_DAYS, dry_run=dry_run
+            )
+        return result
 
     def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
         """从外部恢复重建期间未落盘的写入缓冲（启动恢复用）"""
@@ -458,6 +489,10 @@ class MemoryManager:
 
         self._contact_index = ContactIndex(self.vec_db)
         await self._contact_index.ensure_table()
+
+        # 后台提取缓冲表：插件采集与 Scheduler/Runner 共用同一实例
+        self.inbox = MaintenanceInbox(self.vec_db)
+        await self.inbox.ensure_table()
 
     async def cleanup_orphan_links(self) -> int:
         """在中断重建恢复完成后清理真正缺失端点的关联。"""
@@ -597,25 +632,18 @@ class MemoryManager:
         return updated
 
     async def expire_stale_memories(self, ttl_days: int) -> int:
-        """TTL 过期：把超过 ttl_days 且未废弃的记忆标记 deprecated=True（P1.1）。
+        """TTL 过期：把超过 ttl_days 未活跃且未废弃的记忆标记 deprecated=True。
 
+        活跃时间取 last_recalled_at（为空回退 created_at），高频召回的
+        fact/preference 类核心记忆豁免；permanent 与 global 维持既有豁免。
         召回 filter 已排除 deprecated，标记后即从召回移除。返回标记条数。
         """
         if ttl_days <= 0 or not self._kb_helper:
             return 0
         kb_id = self._kb_helper.kb.kb_id
         cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
-        set_clause = (
-            "json_set(metadata, '$.deprecated', 1, '$.deprecated_at', :now_iso)"
-        )
-        where_clause = (
-            "json_extract(metadata,'$.is_memory_record') = 1 "
-            "AND json_extract(metadata,'$.deprecated') IS NOT 1 "
-            "AND json_extract(metadata,'$.kb_id') = :kb_id "
-            "AND json_extract(metadata,'$.created_at') < :cutoff "
-            "AND json_extract(metadata,'$.memory_type') != 'permanent' "
-            "AND json_extract(metadata,'$.memory_scope') != 'global'"
-        )
+        set_clause = TTL_EXPIRE_SET_CLAUSE
+        where_clause = TTL_EXPIRE_WHERE_CLAUSE
         params: dict[str, Any] = {
             "kb_id": kb_id,
             "cutoff": cutoff_iso,
@@ -1063,11 +1091,6 @@ class MemoryManager:
                 "memory_scope": MemoryScope.GROUP,
                 "owner_session_id": owner_session_id,
             }
-            if parsed.is_group and self.config.get("share_group_across_groups", False):
-                filters = {
-                    "memory_scope": MemoryScope.GROUP,
-                    "platform_id": parsed.platform_id,
-                }
         elif scope == MemoryScope.CONVERSATION:
             filters = {
                 "memory_scope": MemoryScope.CONVERSATION,
@@ -1632,6 +1655,106 @@ class MemoryManager:
         )
         return bool(docs)
 
+    async def find_scoped_duplicate(
+        self,
+        *,
+        content: str,
+        memory_scope: str,
+        platform_id: str,
+        session_id: str,
+        umo: str,
+        owner_user_id: str = "",
+        owner_user_ids: list[str] | None = None,
+        threshold: float = SCOPED_DEDUP_SIMILARITY_THRESHOLD,
+        vec_db: Any | None = None,
+    ) -> str | None:
+        """按作用域和完整归属者集合查找高相似度记忆。"""
+        if vec_db is None:
+            if not self._kb_helper:
+                return None
+            vec_db = self.vec_db
+
+        required_owners = {
+            str(owner).strip() for owner in (owner_user_ids or []) if str(owner).strip()
+        }
+        if owner_user_id:
+            required_owners.add(str(owner_user_id).strip())
+
+        filters: dict[str, Any] = {
+            "is_memory_record": True,
+            "deprecated": False,
+            "memory_scope": memory_scope,
+        }
+        owner_filters: list[str | None] = [None]
+        if memory_scope == MemoryScope.PERSONAL:
+            if not required_owners:
+                return None
+            owner_filters = sorted(required_owners)
+            if not self.config.get("global_memory", True):
+                filters["umo"] = umo
+        elif memory_scope == MemoryScope.GROUP:
+            filters["owner_session_id"] = build_session_id(platform_id, session_id)
+        elif memory_scope == MemoryScope.CONVERSATION:
+            filters["umo"] = umo
+        else:
+            return None
+
+        best_uri = None
+        best_similarity = 0.0
+        query_succeeded = False
+        for owner in owner_filters:
+            query_filters = dict(filters)
+            if owner is not None:
+                query_filters["owner_user_id"] = owner
+            try:
+                results = await vec_db.retrieve(
+                    query=content,
+                    k=3,
+                    rerank=False,
+                    metadata_filters=query_filters,
+                )
+                query_succeeded = True
+            except Exception as e:
+                logger.debug(
+                    "[简单长期记忆] 提取查重检索失败（按无重复继续）: %s",
+                    type(e).__name__,
+                )
+                continue
+
+            for item in results or []:
+                similarity = float(getattr(item, "similarity", 0) or 0)
+                if similarity < threshold or similarity <= best_similarity:
+                    continue
+                data = getattr(item, "data", None) or {}
+                metadata = _safe_parse_metadata(data.get("metadata", {}))
+                uri = metadata.get("uri")
+                if not uri:
+                    continue
+
+                if required_owners:
+                    stored_owners = metadata.get("owner_user_ids")
+                    if not isinstance(stored_owners, list):
+                        stored_owners = [metadata.get("owner_user_id", "")]
+                    stored_owner_set = {
+                        str(owner_id).strip()
+                        for owner_id in stored_owners
+                        if str(owner_id).strip()
+                    }
+                    if not required_owners.issubset(stored_owner_set):
+                        continue
+                    if (
+                        len(required_owners) > 1
+                        and metadata.get("visibility") != MemoryVisibility.GROUP
+                    ):
+                        continue
+
+                best_uri = uri
+                best_similarity = similarity
+
+        if not query_succeeded:
+            return None
+        return best_uri
+
     async def _run_recall_channel(
         self, call: Any, deadline: float, trace_id: str
     ) -> Any:
@@ -2040,11 +2163,14 @@ class MemoryManager:
                 return False
             if origin.platform_id != parsed.platform_id:
                 return False
-            return bool(
-                self.config.get("share_group_across_groups", False)
-                or meta.get("owner_session_id")
-                == build_session_id(parsed.platform_id, parsed.session_id)
-            )
+            if meta.get("owner_session_id") == build_session_id(
+                parsed.platform_id, parsed.session_id
+            ):
+                return True
+            # 跨群共享只放行客观事实类群记忆；群内偏好/事件/上下文不跨群
+            if not self.config.get("share_group_across_groups", False):
+                return False
+            return str(meta.get("domain") or "").strip().lower() in ("fact", "facts")
         if scope == MemoryScope.CONVERSATION:
             return meta.get("umo") == event.unified_msg_origin
         return False
@@ -2078,6 +2204,30 @@ class MemoryManager:
             if domain:
                 filters["domain"] = domain
             filters_list.append(filters)
+            if (
+                scope == MemoryScope.GROUP
+                and parsed.is_group
+                and self.config.get("share_group_across_groups", False)
+            ):
+                # 跨群共享预过滤与 _is_memory_visible 同边界：仅客观事实类群记忆，
+                # 覆盖 fact/facts 新旧别名；显式 domain 参数保持精确匹配语义
+                requested_domain = str(domain).lower().strip() if domain else ""
+                if not requested_domain:
+                    cross_domains = ("fact", "facts")
+                elif requested_domain in ("fact", "facts"):
+                    cross_domains = (requested_domain,)
+                else:
+                    cross_domains = ()
+                for cross_domain in cross_domains:
+                    filters_list.append(
+                        {
+                            "memory_scope": MemoryScope.GROUP,
+                            "platform_id": parsed.platform_id,
+                            "domain": cross_domain,
+                            "is_memory_record": True,
+                            "deprecated": False,
+                        }
+                    )
         return filters_list
 
     async def _retrieve_with_filter(

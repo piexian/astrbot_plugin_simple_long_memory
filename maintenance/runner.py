@@ -21,9 +21,17 @@ from .agents.analyst import AnalystAgent
 from .agents.curator import CuratorAgent
 from .agents.organizer import OrganizerAgent
 from .agents.reviewer import ReviewerAgent
-from .agents.segmenter import CARRY_KV_KEY, CURSOR_KV_KEY, SegmenterAgent
 from .extraction_journal import ExtractionJournal
+from .inbox import STATUS_PROCESSED, STATUS_SKIPPED
 from .llm import MaintenanceLLM
+from .memory_gate import (
+    GATE_CONTENT_MAX_CHARS,
+    GateCandidate,
+    MemoryGate,
+    build_maintenance_gate,
+)
+from .persona import PersonaSummaryProvider
+from .verifier import MaintenanceVerifier, VerificationTask
 
 try:  # 正常插件加载（包内相对导入）
     from ..extraction_utils import normalize_extracted_scope
@@ -177,6 +185,60 @@ class MaintenanceRunner:
         # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
         self._last_review_unresolved: dict[str, int] = {}
         self._extract_journal = ExtractionJournal(kv_get, kv_put)
+        self._gate: MemoryGate | None = None
+        # 周期内共享的人格摘要读取器与受控核验器（每周期清缓存/清计数）
+        self._persona_provider: PersonaSummaryProvider | None = None
+        self._verifier: MaintenanceVerifier | None = None
+        self._verification_used = 0
+
+    def _reset_cycle_state(self) -> None:
+        """周期级状态复位：LLM 统计、人格缓存、核验计数。"""
+        self._llm.reset_cycle_stats()
+        self._verification_used = 0
+        if self._persona_provider is not None:
+            self._persona_provider.clear()
+
+    def _get_persona_provider(self) -> PersonaSummaryProvider:
+        """懒加载周期内共享的人格摘要读取器（Reviewer 与 Organizer 共用）。"""
+        if self._persona_provider is None:
+            self._persona_provider = PersonaSummaryProvider(self._context, self._config)
+        return self._persona_provider
+
+    def _get_verifier(self) -> MaintenanceVerifier:
+        """懒加载受控核验器（真实 tool_loop_agent，预算经 MaintenanceLLM）。"""
+        if self._verifier is None:
+            self._verifier = MaintenanceVerifier(
+                context=self._context,
+                memory_mgr=self._memory_mgr,
+                llm=self._llm,
+                config=self._config,
+            )
+        return self._verifier
+
+    async def _run_verifications(
+        self, tasks: list[VerificationTask]
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """执行本阶段积累的核验任务，返回 (提案操作, 统计)。
+
+        每周期核验次数受 maintenance_verification_max_per_cycle 限制；
+        预算不足或超出上限的任务不执行（其原提案一并保留现状，留待下周期）。
+        """
+        needed = len(tasks)
+        if needed == 0:
+            return [], {
+                "verification_needed": 0,
+                "verification_executed": 0,
+                "verification_budget_skipped": 0,
+            }
+        cap = int(self._config.get("maintenance_verification_max_per_cycle", 2))
+        allowance = max(0, cap - self._verification_used)
+        proposals, executed = await self._get_verifier().run(tasks, allowance=allowance)
+        self._verification_used += executed
+        return proposals, {
+            "verification_needed": needed,
+            "verification_executed": executed,
+            "verification_budget_skipped": needed - executed,
+        }
 
     async def run_cycle(self, *, dry_run: bool = False) -> MaintenanceReport:
         """执行一次完整整理周期；dry_run 时不执行阶段 4 写入。"""
@@ -196,8 +258,8 @@ class MaintenanceRunner:
         try:
             logger.info(f"[简单长期记忆] 开始整理周期: {session_id}")
 
-            # 重置 LLM 统计
-            self._llm.reset_cycle_stats()
+            # 重置周期级状态（LLM 统计、人格缓存、核验计数）
+            self._reset_cycle_state()
             logger.debug(
                 "[简单长期记忆] 整理周期配置: session=%s, extract=%s, organizer=%s, "
                 "analyst=%s, reviewer=%s, max_llm=%s, max_ops=%s",
@@ -245,7 +307,11 @@ class MaintenanceRunner:
             # ── 阶段 2: analyst（分析师）──
             if self._config.get("maintenance_analyst_enabled", True):
                 try:
-                    report.analyst_manifest = await self._run_analyst()
+                    report.analyst_manifest = await self._run_analyst(
+                        exclude_uris=self._organizer_merge_uris(
+                            report.organizer_manifest
+                        )
+                    )
                 except Exception as e:
                     report.errors.append(f"analyst: {e}")
                     logger.warning(f"[简单长期记忆] analyst 失败: {e}")
@@ -356,7 +422,7 @@ class MaintenanceRunner:
         self._running = True
         started = datetime.now(timezone.utc)
         result: dict[str, Any] = {"stage": normalized, "dry_run": True}
-        self._llm.reset_cycle_stats()
+        self._reset_cycle_state()
         previous_cache_enabled = getattr(self._llm, "_cache_enabled", None)
         if previous_cache_enabled is not None:
             self._llm._cache_enabled = False
@@ -381,7 +447,9 @@ class MaintenanceRunner:
                 )
             else:
                 organizer = await self._run_organizer()
-                analyst = await self._run_analyst()
+                analyst = await self._run_analyst(
+                    exclude_uris=self._organizer_merge_uris(organizer)
+                )
                 verdicts = await self._run_reviewer(organizer, analyst)
                 result["organizer"] = self._test_manifest_summary(organizer)
                 result["analyst"] = self._test_manifest_summary(analyst)
@@ -428,6 +496,7 @@ class MaintenanceRunner:
             if report.analyst_manifest and report.analyst_manifest.parsed:
                 all_operations.extend(report.analyst_manifest.operations)
 
+            n_reviewed_ops = len(all_operations)
             # 周期操作总数硬上限：防异常放大，超出部分下周期重新评估
             max_ops = self._config.get("maintenance_max_ops_per_cycle", 100)
             if len(all_operations) > max_ops:
@@ -446,6 +515,13 @@ class MaintenanceRunner:
                 len(report.reviewer_verdicts),
                 max_ops,
             )
+            # 审核员按序审核、预算耗尽即中断：未裁决下标落在尾部即预算耗尽操作
+            budget_tail_start = max(
+                0,
+                n_reviewed_ops
+                - int(self._last_review_unresolved.get("budget_exhausted", 0) or 0),
+            )
+            budget_deferred = 0
             # reviewer 启用时校验裁决完整性：
             # 下标越界/重复 → 真正不一致（LLM 乱序/错号），告警；
             # 仅数量不足 → 有意的部分评审（预算耗尽/输出无效），info 级给出原因分布
@@ -473,7 +549,7 @@ class MaintenanceRunner:
                             f"[简单长期记忆] 审核员部分评审: {len(missing)}/{n_ops} 条未裁决"
                             f"（预算耗尽 {unresolved.get('budget_exhausted', 0)}, "
                             f"输出无效 {unresolved.get('invalid_output', 0)}），"
-                            f"fail closed 转待审"
+                            f"预算耗尽部分留待下周期，其余 fail closed 转待审"
                         )
 
             # 按审核结果执行操作
@@ -485,10 +561,11 @@ class MaintenanceRunner:
                         verdict = v
                         break
 
-                # 缺失裁决 → fail closed，拒绝执行（避免 reviewer 故障时放行破坏性操作）
+                # 缺失裁决 → 拒绝执行（避免 reviewer 故障时放行破坏性操作）
                 if verdict is None:
                     # additive 操作（new_link/create）仅在审核员整体禁用时直接放行；
-                    # 审核员启用却缺失裁决属于异常（LLM 漏判），同样 fail closed 转待审
+                    # 审核员启用时的缺失裁决需区分：预算耗尽的尾部操作留待下周期，
+                    # 输出无效等异常缺失才 fail closed 转待审
                     if (
                         op.get("type") in ("new_link", "create")
                         and not reviewer_enabled
@@ -508,6 +585,20 @@ class MaintenanceRunner:
                             report.errors.append(
                                 f"op[{i}] {op.get('type')}: {type(e).__name__}"
                             )
+                        continue
+                    # 预算耗尽而未轮到审核：转入待审队列，避免操作丢失或阻塞提取日志
+                    if reviewer_enabled and i >= budget_tail_start:
+                        budget_deferred += 1
+                        pending_items.append(
+                            (
+                                op,
+                                {
+                                    "verdict": "pending",
+                                    "reason": "审核预算耗尽，转人工审核",
+                                },
+                            )
+                        )
+                        skipped += 1
                         continue
                     # 其余情况（破坏性操作，或审核员启用但裁决缺失）→ 转待审队列
                     reason = (
@@ -582,7 +673,7 @@ class MaintenanceRunner:
             for op, _ in pending_items:
                 if self._op_signature(op) in persisted:
                     await self._extract_journal.acknowledge(op)
-            await self._finish_extract_progress()
+            await self._settle_inbox_blocks()
 
             report.executed_ops = executed
             report.skipped_ops = skipped
@@ -591,11 +682,12 @@ class MaintenanceRunner:
             report.llm_stats = self._llm.stats()
             logger.debug(
                 "[简单长期记忆] 执行阶段完成: executed=%s, skipped=%s, failed=%s, "
-                "pending=%s, llm=%s",
+                "pending=%s, budget_deferred=%s, llm=%s",
                 executed,
                 skipped,
                 failed,
                 len(pending_items),
+                budget_deferred,
                 report.llm_stats,
             )
 
@@ -609,67 +701,148 @@ class MaintenanceRunner:
             return await self._execute_operation(op)
 
     async def _run_extraction(self, *, dry_run: bool) -> AgentManifest:
-        """提取阶段：分段员切对话块 → 整理师提取 create/update 操作。
+        """提取阶段：Inbox 纯规则切块 → 闸门 → 整理师提取 create/update 操作。
 
+        闸门明确拒收的块标 skipped；判定失败或预算耗尽的块保留 pending 下周期；
+        已产出操作的块在操作最终执行完成后才由 _settle_inbox_blocks 标 processed。
         LLM 预算占每周期上限的 maintenance_extract_llm_budget_ratio（默认 60%），
-        分段最多使用提取预算的一半，其余留给整理师；两者也受全局预算约束。
+        闸门与整理师共享提取预算，不再消耗任何分段判定调用。
         """
         manifest = AgentManifest(agent_type="extract")
         journal = (
             ExtractionJournal(self._kv_get, None) if dry_run else self._extract_journal
         )
         if await journal.load():
+            # 上一周期未完成的操作先走完审核与执行，本周期不再新提取
             manifest.parsed = True
             manifest.operations = journal.pending
             manifest.metrics = journal.state.get("metrics", {})
             manifest.notes = journal.state.get("notes", "")
             return manifest
+
+        inbox = getattr(self._memory_mgr, "inbox", None)
+        if inbox is None or not inbox.ready:
+            manifest.error = "maintenance inbox unavailable"
+            logger.warning("[简单长期记忆] 提取阶段跳过: 缓冲表不可用")
+            return manifest
+
+        segment_max_chars = int(self._config.get("maintenance_segment_max_chars", 8000))
+        collect_max_chars = min(max(64, segment_max_chars), GATE_CONTENT_MAX_CHARS)
+        collect = await inbox.collect_blocks(
+            gap_minutes=self._config.get("maintenance_segment_time_gap_minutes", 30),
+            max_chars=collect_max_chars,
+            min_user_chars=self._config.get("extraction_min_content_length", 150),
+            max_blocks=self._config.get("maintenance_extract_max_blocks_per_cycle", 20),
+            commit=not dry_run,
+        )
+        blocks = collect["blocks"]
+        collect_stats = collect["stats"]
+
+        gate = self._get_gate()
+        gate_outcomes = await gate.evaluate(
+            [
+                GateCandidate(candidate_id=block.key, content=block.text)
+                for block in blocks
+            ]
+        )
+        approved_blocks = [
+            block for block in blocks if gate_outcomes[block.key].approved
+        ]
+
         max_calls = int(self._config.get("maintenance_max_llm_calls", 50))
         ratio = float(self._config.get("maintenance_extract_llm_budget_ratio", 0.6))
         extract_budget = max(0, int(max_calls * ratio))
+        curator_budget = max(0, extract_budget - self._llm.calls)
 
-        segmenter = SegmenterAgent(
-            context=self._context,
-            llm=self._llm,
-            config=self._config,
-            kv_get=self._kv_get,
-            kv_put=self._kv_put,
-        )
-        seg_result = await segmenter.collect_blocks(extract_budget // 2)
-        seg_stats = seg_result.get("stats", {})
-        blocks = seg_result.get("blocks", [])
-
-        curator_budget = max(0, extract_budget - int(seg_stats.get("llm_calls", 0)))
         curator = CuratorAgent(
             context=self._context,
             memory_mgr=self._memory_mgr,
             llm=self._llm,
             config=self._config,
         )
-        cur_result = await curator.run(blocks, curator_budget)
+        if approved_blocks:
+            cur_result = await curator.run(approved_blocks, curator_budget)
+        else:
+            cur_result = {
+                "create": [],
+                "update": [],
+                "notes": "",
+                "blocks_processed": 0,
+                "blocks_nothing": 0,
+                "llm_calls": 0,
+                "outcomes": [],
+            }
+        curator_outcomes = {
+            block.key: outcome for block, outcome in cur_result.get("outcomes", [])
+        }
 
+        # 块级最终结局：gate 拒收 → skipped；gate 失败/预算耗尽 → 留 pending
+        skipped_rows: list[int] = []
+        processed_rows: list[int] = []
+        failed_rows: list[int] = []
+        op_block_rows: dict[str, list[int]] = {}
+        for block in blocks:
+            gate_outcome = gate_outcomes[block.key]
+            if gate_outcome.status == "rejected":
+                outcome = "skipped"
+            elif gate_outcome.status == "unavailable":
+                outcome = "deferred"
+            else:
+                outcome = curator_outcomes.get(block.key, "deferred")
+            if outcome == "skipped":
+                skipped_rows.extend(block.row_ids)
+            elif outcome == "nothing":
+                processed_rows.extend(block.row_ids)
+            elif outcome in ("created", "updated"):
+                op_block_rows[block.key] = block.row_ids
+            elif outcome == "failed":
+                failed_rows.extend(block.row_ids)
+
+        operations = list(cur_result.get("create", [])) + list(
+            cur_result.get("update", [])
+        )
+        gate_approved = len(approved_blocks)
+        gate_rejected = sum(1 for o in gate_outcomes.values() if o.status == "rejected")
+        gate_unavailable = len(blocks) - gate_approved - gate_rejected
         manifest.parsed = True
         manifest.notes = str(cur_result.get("notes", "") or "")
-        manifest.operations.extend(cur_result.get("create", []))
-        manifest.operations.extend(cur_result.get("update", []))
+        manifest.operations = operations
         manifest.metrics = {
-            "segmenter": seg_stats,
+            "inbox": collect_stats,
             "blocks": len(blocks),
+            "gate_approved": gate_approved,
+            "gate_rejected": gate_rejected,
+            "gate_unavailable": gate_unavailable,
             "blocks_processed": cur_result.get("blocks_processed", 0),
             "blocks_nothing": cur_result.get("blocks_nothing", 0),
             "created": len(cur_result.get("create", [])),
             "updated": len(cur_result.get("update", [])),
-            "llm_calls": int(seg_stats.get("llm_calls", 0))
-            + cur_result.get("llm_calls", 0),
+            "llm_calls": cur_result.get("llm_calls", 0),
         }
+
         if not dry_run:
-            await journal.prepare(seg_result, cur_result, manifest.metrics)
-            manifest.operations = journal.pending
-            await self._finish_extract_progress()
+            if skipped_rows:
+                await inbox.mark_rows(skipped_rows, STATUS_SKIPPED)
+            if processed_rows:
+                await inbox.mark_rows(processed_rows, STATUS_PROCESSED)
+            if failed_rows:
+                await inbox.mark_failed(failed_rows)
+            if operations:
+                await journal.prepare(
+                    operations=operations,
+                    block_rows=op_block_rows,
+                    metrics=manifest.metrics,
+                    notes=manifest.notes,
+                )
+                manifest.operations = journal.pending
         logger.debug(
-            "[简单长期记忆] 提取阶段完成: blocks=%s, processed=%s, create=%s, "
-            "update=%s, llm_calls=%s, dry_run=%s",
+            "[简单长期记忆] 提取阶段完成: blocks=%s, approved=%s, rejected=%s, "
+            "unavailable=%s, processed=%s, create=%s, update=%s, llm_calls=%s, "
+            "dry_run=%s",
             len(blocks),
+            gate_approved,
+            gate_rejected,
+            gate_unavailable,
             manifest.metrics["blocks_processed"],
             manifest.metrics["created"],
             manifest.metrics["updated"],
@@ -678,112 +851,58 @@ class MaintenanceRunner:
         )
         return manifest
 
-    async def _finish_extract_progress(self) -> None:
-        journal = self._extract_journal
-        if journal.state:
-            await self._commit_extract_progress(
-                journal.state["segment"], journal.outcomes()
-            )
-            await journal.clear_if_finished()
+    def _get_gate(self) -> MemoryGate:
+        """后台闸门：懒加载并复用同一实例，Decision 未配置缓存跨提取调用有效。
 
-    async def _commit_extract_progress(
-        self,
-        seg_result: dict[str, Any],
-        outcomes: list[tuple[Any, str]],
-    ) -> None:
-        """按块提交提取游标并应用 carry 更新（整字典读改写，数据量小）。
-
-        游标只随已持久化完成的连续块推进，失败或未完成块及其后续块保留；
-        无产出块会话（短块/毒块跳过）直接采用分段员游标，避免每周期重扫。
+        Decision 走 MaintenanceLLM 受控包装计入总预算；Chat 降级复用 maintenance_model_id。
         """
-        if not self._kv_put or not self._kv_get:
-            return
-        now_iso = datetime.now(timezone.utc).isoformat()
-        try:
-            cursors = await self._kv_get(CURSOR_KV_KEY, None)
-            cursors = dict(cursors) if isinstance(cursors, dict) else {}
-            for key, value in seg_result.get("discovered", {}).items():
-                cursors.setdefault(key, value)
-            if seg_result.get("discovered"):
-                await self._kv_put(CURSOR_KV_KEY, dict(cursors))
-            grouped: dict[str, list[tuple[Any, str]]] = {}
-            for block, outcome in outcomes:
-                grouped.setdefault(block.conv_key, []).append((block, outcome))
-            for conv_key, items in grouped.items():
-                for block, outcome in items:
-                    if outcome not in {"created", "updated", "nothing"}:
-                        break
-                    if getattr(block, "source", "pmh") == "conv2":
-                        # conv2 无行 id，游标为内容锚点 + 消息下标
-                        cursors[conv_key] = {
-                            "source": "conv2",
-                            "anchor": str(getattr(block, "end_anchor", "") or ""),
-                            "idx": block.last_id,
-                            "ts": now_iso,
-                        }
-                    else:
-                        cursors[conv_key] = {"id": block.last_id, "ts": now_iso}
-                    if getattr(block, "last_offset", 0):
-                        cursors[conv_key]["offset"] = block.last_offset
-                    # 逐块提交：崩溃后已处理块不重拉、未处理块不丢
-                    await self._kv_put(CURSOR_KV_KEY, dict(cursors))
-            block_convs = set(grouped)
-            for conv_key, value in (seg_result.get("cursor_updates") or {}).items():
-                if conv_key in block_convs:
-                    continue  # 有块会话由 outcome 驱动，避免跳过未提取块
-                if isinstance(value, dict) and value.get("source") == "conv2":
-                    cursors[conv_key] = {
-                        "source": "conv2",
-                        "anchor": str(value.get("anchor") or ""),
-                        "idx": int(value.get("idx") or 0),
-                        "ts": now_iso,
-                    }
-                    if value.get("offset"):
-                        cursors[conv_key]["offset"] = value["offset"]
-                elif isinstance(value, dict):
-                    cursors[conv_key] = {**value, "ts": now_iso}
-                else:
-                    cursors[conv_key] = {"id": value, "ts": now_iso}
-                await self._kv_put(CURSOR_KV_KEY, dict(cursors))
+        gate = getattr(self, "_gate", None)
+        if gate is None:
+            gate = build_maintenance_gate(self._context, self._llm, self._config)
+            self._gate = gate
+        return gate
 
-            carry_updates = seg_result.get("carry_updates") or {}
-            if carry_updates:
-                carries = await self._kv_get(CARRY_KV_KEY, None)
-                carries = dict(carries) if isinstance(carries, dict) else {}
-                for conv_key, value in carry_updates.items():
-                    if value is None:
-                        carries.pop(conv_key, None)  # None = 清除该键
-                    else:
-                        carries[conv_key] = value
-                    await self._kv_put(CARRY_KV_KEY, carries)
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] 提交提取进度失败: {e}")
-            raise
+    async def _settle_inbox_blocks(self) -> None:
+        """把操作已全部完成的块对应缓冲行标 processed，全部成功后才清理日志。
+
+        缓冲表不可用或任一行状态提交失败时保留日志，下周期重试；
+        避免行仍为 pending 时日志被清导致同一对话块重复提取。
+        """
+        journal = self._extract_journal
+        if not journal.state:
+            return
+        settled = journal.settled_block_rows()
+        if settled:
+            inbox = getattr(self._memory_mgr, "inbox", None)
+            if inbox is None:
+                logger.warning("[简单长期记忆] 缓冲表不可用，提取日志保留待下周期重试")
+                return
+            for block_key, row_ids in settled.items():
+                if not await inbox.mark_rows(row_ids, STATUS_PROCESSED):
+                    logger.warning(
+                        "[简单长期记忆] 缓冲行状态提交失败: block=%s, rows=%s，"
+                        "提取日志保留待下周期重试",
+                        block_key,
+                        len(row_ids),
+                    )
+                    return
+        await journal.clear_if_finished()
 
     async def _run_organizer(self) -> AgentManifest:
-        """运行整理师：去重合并、质量精炼。"""
+        """运行整理师：去重合并、单条巡检与质量精炼。"""
         manifest = AgentManifest(agent_type="organizer")
 
-        # 使用 OrganizerAgent 执行整理
         organizer = OrganizerAgent(
             context=self._context,
             memory_mgr=self._memory_mgr,
             llm=self._llm,
             config=self._config,
+            gate=self._get_gate(),
+            persona_provider=self._get_persona_provider(),
         )
 
         try:
             result = await organizer.run()
-            manifest.metrics = {
-                key: result.get(key)
-                for key in (
-                    "memory_count",
-                    "vector_count",
-                    "vector_missing",
-                    "candidates_screened",
-                    "llm_calls",
-                )
-            }
             manifest.parsed = True
             # 将 organizer 的输出转换为 operations 格式
             for merge_op in result.get("merge", []):
@@ -813,6 +932,21 @@ class MaintenanceRunner:
                         "reason": update_op.get("reason", ""),
                     }
                 )
+            manifest.metrics = {
+                key: result.get(key)
+                for key in (
+                    "memory_count",
+                    "vector_count",
+                    "vector_missing",
+                    "candidates_screened",
+                    "llm_calls",
+                    "inspected",
+                    "inspection_kept",
+                    "inspection_unavailable",
+                )
+            }
+            await self._attach_verification_ops(manifest, result)
+            manifest.metrics.update(self._op_type_counts(manifest.operations))
             manifest.notes = result.get("notes", "")
         except Exception as e:
             manifest.error = str(e)
@@ -820,11 +954,13 @@ class MaintenanceRunner:
 
         return manifest
 
-    async def _run_analyst(self) -> AgentManifest:
-        """运行分析师：关联发现、矛盾检测。"""
+    async def _run_analyst(self, exclude_uris: set[str] | None = None) -> AgentManifest:
+        """运行分析师：中文语义四分类与矛盾发现。
+
+        exclude_uris 为整理师 merge 已消费的 URI，避免对同 URI 重复提案。
+        """
         manifest = AgentManifest(agent_type="analyst")
 
-        # 使用 AnalystAgent 执行分析
         analyst = AnalystAgent(
             context=self._context,
             memory_mgr=self._memory_mgr,
@@ -833,18 +969,7 @@ class MaintenanceRunner:
         )
 
         try:
-            result = await analyst.run()
-            manifest.metrics = {
-                key: result.get(key)
-                for key in (
-                    "memory_count",
-                    "vector_count",
-                    "vector_missing",
-                    "conversation_chars",
-                    "candidates_screened",
-                    "llm_calls",
-                )
-            }
+            result = await analyst.run(exclude_uris=exclude_uris)
             manifest.parsed = True
             # 将 analyst 的输出转换为 operations 格式
             for link_op in result.get("new_links", []):
@@ -868,12 +993,75 @@ class MaintenanceRunner:
                         "confidence": contra_op.get("confidence", 0.0),
                     }
                 )
+            for merge_op in result.get("merges", []):
+                manifest.operations.append(
+                    {
+                        "type": "merge",
+                        "uris": merge_op.get("uris", []),
+                        "merged_content": merge_op.get("merged_content", ""),
+                        "reason": merge_op.get("reason", ""),
+                        "confidence": merge_op.get("confidence", 0.0),
+                    }
+                )
+            manifest.metrics = {
+                key: result.get(key)
+                for key in (
+                    "memory_count",
+                    "vector_count",
+                    "vector_missing",
+                    "candidates_screened",
+                    "llm_calls",
+                    "decision_calls",
+                    "chat_fallback_calls",
+                )
+            }
+            await self._attach_verification_ops(manifest, result)
+            manifest.metrics.update(self._op_type_counts(manifest.operations))
             manifest.notes = result.get("notes", "")
         except Exception as e:
             manifest.error = str(e)
             logger.warning(f"[简单长期记忆] 分析师执行失败: {e}")
 
         return manifest
+
+    async def _attach_verification_ops(
+        self, manifest: AgentManifest, result: dict[str, Any]
+    ) -> None:
+        """把核验产出的提案并入 manifest 操作与统计。
+
+        核验提案仍交审核员复核；未被核验的任务不直接执行（保留现状，
+        留待下周期重新评估）。
+        """
+        proposals, stats = await self._run_verifications(
+            list(result.get("verification_tasks", []))
+        )
+        manifest.operations.extend(proposals)
+        manifest.metrics.update(stats)
+        manifest.metrics["verification_proposals"] = len(proposals)
+
+    @staticmethod
+    def _op_type_counts(operations: list[dict[str, Any]]) -> dict[str, int]:
+        """按操作类型计数（dry-run 报告用，不含正文与理由）。"""
+        counts: dict[str, int] = {}
+        for op in operations:
+            op_type = str(op.get("type", "") or "")
+            key = f"op_{op_type}" if op_type else "op_unknown"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @staticmethod
+    def _organizer_merge_uris(manifest: AgentManifest | None) -> set[str]:
+        """提取整理师 merge 操作已消费的 URI，供分析师去重。"""
+        uris: set[str] = set()
+        if manifest is None:
+            return uris
+        for op in manifest.operations:
+            if op.get("type") != "merge":
+                continue
+            for uri in op.get("uris", []):
+                if isinstance(uri, str) and uri:
+                    uris.add(uri)
+        return uris
 
     async def _run_reviewer(
         self,
@@ -902,9 +1090,11 @@ class MaintenanceRunner:
             memory_mgr=self._memory_mgr,
             llm=self._llm,
             config=self._config,
+            persona_provider=self._get_persona_provider(),
         )
 
         # 源记录由审核员按操作逐条拉取（见 ReviewerAgent._get_op_source_data）
+        self._last_review_unresolved = {}
         try:
             verdicts = await reviewer.review(proposed_changes)
             self._last_review_unresolved = dict(reviewer.last_unresolved)
@@ -928,17 +1118,6 @@ class MaintenanceRunner:
         """拉取对话历史。"""
         # TODO: Phase 4 从 conversation_manager 拉取
         return "# 最近对话\n（暂无数据）"
-
-    async def _get_persona_summary(self) -> str:
-        """获取人格摘要。"""
-        mode = self._config.get("persona_mode", "auto")
-        if mode == "manual":
-            return self._config.get("persona_summary", "")
-        elif mode == "off":
-            return ""
-        else:
-            # auto: 从主人格提取（Phase 5 完善）
-            return ""
 
     async def _op_touches_global(self, op: dict[str, Any]) -> bool:
         """检查操作是否涉及 global 作用域记忆（查询实际 metadata）。"""
@@ -974,77 +1153,151 @@ class MaintenanceRunner:
         items: list[tuple[dict[str, Any], dict[str, Any]]],
         session_id: str,
     ) -> set[str]:
-        """周期结束批量写入待审队列：单次 KV 读写 + 签名去重 + 终态清理 + pending 容量上限 + 单调 id。"""
-        if not items or not self._kv_put or not self._kv_get:
+        """批量写入待审队列，并保存容量溢出的非提取操作。"""
+        if not self._kv_put or not self._kv_get:
             return set()
         try:
             import time as _time
 
             queue = await self._kv_get("maintenance_pending_review", None) or []
-            # A prior queue write may have succeeded before its journal acknowledgement.
+            raw_overflow = (
+                await self._kv_get("maintenance_pending_review_overflow", None) or []
+            )
+            if not isinstance(queue, list):
+                queue = []
+            if not isinstance(raw_overflow, list):
+                raw_overflow = []
+            overflow = [
+                entry
+                for entry in raw_overflow
+                if isinstance(entry, dict) and isinstance(entry.get("op"), dict)
+            ]
+
             settled_sigs = {
                 it.get("op_signature") or self._op_signature(it["op"])
                 for it in queue
-                if it.get("status") in {"approved", "rejected"}
+                if isinstance(it, dict)
+                and it.get("status") in {"approved", "rejected"}
+                and isinstance(it.get("op"), dict)
                 and it.get("op", {}).get("_extract_id")
             }
-
-            # 单调递增 id：从原始队列取最大 id 作为下限，清理终态后 id 不复用，
-            # 避免与管理员已见条目撞号
-            max_seen_id = max((it.get("id", 0) for it in queue), default=0)
+            max_seen_id = max(
+                (it.get("id", 0) for it in queue if isinstance(it, dict)),
+                default=0,
+            )
             seq = await self._kv_get("maintenance_pending_review_seq", None)
             if not isinstance(seq, int) or seq < max_seen_id:
                 seq = max_seen_id
 
-            # 清理终态条目（approved/rejected/failed），只保留 pending
-            pruned = sum(1 for it in queue if it.get("status") != "pending")
+            pruned = sum(
+                1
+                for it in queue
+                if not isinstance(it, dict) or it.get("status") != "pending"
+            )
             if pruned:
-                queue = [it for it in queue if it.get("status") == "pending"]
+                queue = [
+                    it
+                    for it in queue
+                    if isinstance(it, dict) and it.get("status") == "pending"
+                ]
 
             existing_sigs = {
                 it.get("op_signature") or self._op_signature(it.get("op", {}))
                 for it in queue
             } | settled_sigs
-            queue_max = self._config.get("maintenance_pending_queue_max", 500)
-
+            overflow_sigs = {self._op_signature(entry["op"]) for entry in overflow}
+            queue_max = max(
+                1, int(self._config.get("maintenance_pending_queue_max", 500))
+            )
             added = 0
+            drained = 0
             deduped = 0
-            dropped = 0
-            for op, verdict in items:
-                sig = self._op_signature(op)
-                if sig in existing_sigs:
-                    deduped += 1
-                    continue
-                # 容量只统计 pending（此处队列已清理终态，len 即 pending 数）
-                if len(queue) >= queue_max:
-                    dropped += 1
-                    continue
+            journal_deferred = 0
+            overflow_kept: list[dict[str, Any]] = []
+
+            def append_queue(
+                op: dict[str, Any],
+                verdict: dict[str, Any],
+                item_session_id: str,
+            ) -> None:
+                nonlocal added, seq
                 seq += 1
                 queue.append(
                     {
                         "id": seq,
-                        "session_id": session_id,
+                        "session_id": item_session_id,
                         "op_type": op.get("type", ""),
                         "op": op,
-                        "op_signature": sig,
+                        "op_signature": self._op_signature(op),
                         "verdict_reason": verdict.get("reason", ""),
                         "controversial": verdict.get("controversial", False),
                         "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": "pending",  # pending / approved / rejected
+                        "status": "pending",
                     }
                 )
-                existing_sigs.add(sig)
                 added += 1
 
+            for entry in overflow:
+                op = entry["op"]
+                sig = self._op_signature(op)
+                if sig in existing_sigs:
+                    continue
+                if op.get("_extract_id") or len(queue) >= queue_max:
+                    overflow_kept.append(entry)
+                    continue
+                append_queue(
+                    op,
+                    entry.get("verdict")
+                    if isinstance(entry.get("verdict"), dict)
+                    else {},
+                    str(entry.get("session_id") or session_id),
+                )
+                existing_sigs.add(sig)
+                overflow_sigs.discard(sig)
+                drained += 1
+
+            for op, verdict in items:
+                sig = self._op_signature(op)
+                if sig in existing_sigs or sig in overflow_sigs:
+                    deduped += 1
+                    continue
+                if len(queue) >= queue_max:
+                    if op.get("_extract_id"):
+                        # ExtractionJournal remains the retry source for extraction ops.
+                        journal_deferred += 1
+                    else:
+                        overflow_kept.append(
+                            {
+                                "session_id": session_id,
+                                "op": op,
+                                "verdict": verdict,
+                            }
+                        )
+                        overflow_sigs.add(sig)
+                    continue
+                append_queue(op, verdict, session_id)
+                existing_sigs.add(sig)
+
+            overflow_changed = overflow_kept != raw_overflow
             if added or pruned:
                 await self._kv_put("maintenance_pending_review", queue)
             if added:
                 await self._kv_put("maintenance_pending_review_seq", seq)
-            logger.info(
-                f"[简单长期记忆] 待审入队: 新增 {added}, 去重跳过 {deduped}, "
-                f"队列满丢弃 {dropped}, 清理终态 {pruned}, 当前待审 {len(queue)} 条"
-            )
-            # 待审通知推送（每周期最多一次）
+            if overflow_changed:
+                await self._kv_put("maintenance_pending_review_overflow", overflow_kept)
+
+            if items or overflow or pruned:
+                logger.info(
+                    "[简单长期记忆] 待审入队: 新增 %s, 溢出转存 %s, "
+                    "队列满保留 %s, 提取日志保留 %s, 去重跳过 %s, 清理终态 %s, 当前待审 %s",
+                    added,
+                    drained,
+                    len(overflow_kept),
+                    journal_deferred,
+                    deduped,
+                    pruned,
+                    len(queue),
+                )
             if added and self._config.get("review_notify_enabled", True):
                 await self._send_review_notification(len(queue))
             return existing_sigs

@@ -25,6 +25,9 @@ except ImportError:  # 测试环境：仓库根作为顶层目录直接在 sys.p
     from prompts import sanitize_memory_content
 
 
+SOURCE_EXCERPT_MAX_CHARS = 2000  # create 操作来源摘录上限，供审核员核对证据
+
+
 class CuratorAgent:
     """整理师（提取向）Agent。"""
 
@@ -113,6 +116,14 @@ class CuratorAgent:
         existing_text = (
             "\n".join(f"[{m['uri']}] {m['excerpt']}" for m in old_memories) or "（无）"
         )
+        realtime_note = (
+            "Note: this conversation block was already processed by the realtime "
+            "extractor; the existing memories above may already cover its content. "
+            "Only add clearly missing memories or propose updates to the listed "
+            "memories; do NOT create duplicates of already covered content.\n"
+            if getattr(block, "realtime_extracted", False)
+            else ""
+        )
         system = build_prompt(
             CURATOR_EXTRACTION_PROMPT,
             {
@@ -120,6 +131,7 @@ class CuratorAgent:
                 "session_type": parsed_umo.session_type,
                 "session_id": parsed_umo.session_id,
                 "existing_memories": existing_text,
+                "realtime_note": realtime_note,
                 "conversation": block.text,
                 "sender_ids": json.dumps(sender_ids, ensure_ascii=False),
             },
@@ -146,7 +158,7 @@ class CuratorAgent:
         memories = validate_extracted_memories(
             parsed_json.get("memories"), parsed_umo.session_type
         )
-        source_excerpt = " ".join(block.text.split())[:200]
+        source_excerpt = " ".join(block.text.split())[:SOURCE_EXCERPT_MAX_CHARS]
         creates = []
         for mem in memories:
             if mem["scope"] == "personal":

@@ -6,3 +6,12 @@ author: piexian
 repo: https://github.com/piexian/astrbot_plugin_simple_long_memory
 category: ai_context
 astrbot_version: ">=4.29.4"
+views:
+  - name: memory_review
+    target: chat_message
+    title: 记忆待审列表
+    description: 审核后台记忆整理产生的争议操作
+    version: 1
+    actions:
+      - approve
+      - reject

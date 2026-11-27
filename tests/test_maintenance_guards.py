@@ -94,39 +94,54 @@ class _FakeKV:
         self.store[key] = value
 
 
-class AnalystContradictionTests(unittest.TestCase):
+class AnalystClassificationTests(unittest.TestCase):
     def _analyst(self, config: dict | None = None) -> AnalystAgent:
         return AnalystAgent(None, None, None, config or {})
 
+    def _conflict_manifest(self, analyst: AnalystAgent, count: int) -> dict:
+        manifest = {
+            "new_links": [],
+            "contradictions": [],
+            "merges": [],
+            "verification_tasks": [],
+        }
+        classification = {
+            "verdict": "conflict",
+            "reason": "两条记忆对同一事实给出相反结论",
+            "confidence": 0.9,
+        }
+        for i in range(count):
+            analyst._apply_classification(
+                manifest,
+                _mem(f"u://{i}a", f"用户喜欢苹果{i}", "2026-01-01"),
+                _mem(f"u://{i}b", f"用户讨厌苹果{i}", "2026-02-01"),
+                classification,
+            )
+        return manifest
+
     def test_respects_max_contradictions(self):
         analyst = self._analyst({"maintenance_analyst_max_contradictions": 3})
-        pairs = [
-            (
-                _mem(f"u://{i}a", f"用户喜欢 苹果 香蕉 橙子 {i}", "2026-01-01"),
-                _mem(f"u://{i}b", f"用户喜欢 苹果 香蕉 西瓜 {i}", "2026-02-01"),
-                0.8,
-            )
-            for i in range(50)
-        ]
-        result = analyst._detect_contradictions(pairs)
-        self.assertEqual(len(result), 3)
+        manifest = self._conflict_manifest(analyst, 50)
+        self.assertEqual(len(manifest["contradictions"]), 3)
 
-    def test_excludes_linked_pairs_both_directions(self):
-        analyst = self._analyst()
-        a = _mem("u://a", "用户 喜欢 苹果 香蕉 橙子", "2026-01-01")
-        b = _mem("u://b", "用户 喜欢 苹果 香蕉 西瓜", "2026-02-01")
-        result = analyst._detect_contradictions(
-            [(a, b, 0.8)], exclude_pairs={("u://b", "u://a")}
+    def test_low_confidence_conflict_held_for_verification(self):
+        analyst = self._analyst({"maintenance_verification_confidence_threshold": 0.6})
+        manifest = self._conflict_manifest(analyst, 0)
+        analyst._apply_classification(
+            manifest,
+            _mem("u://a", "用户喜欢苹果", "2026-01-01"),
+            _mem("u://b", "用户讨厌苹果", "2026-02-01"),
+            {"verdict": "conflict", "reason": "相反结论", "confidence": 0.4},
         )
-        self.assertEqual(result, [])
+        self.assertEqual(manifest["contradictions"], [])
+        self.assertEqual(len(manifest["verification_tasks"]), 1)
 
-    def test_old_new_ordering_by_time(self):
+    def test_conflict_orientation_by_time(self):
         analyst = self._analyst()
-        a = _mem("u://a", "用户 喜欢 苹果 香蕉 橙子", "2026-02-01")
-        b = _mem("u://b", "用户 喜欢 苹果 香蕉 西瓜", "2026-01-01")
-        result = analyst._detect_contradictions([(a, b, 0.8)])
-        self.assertEqual(result[0]["old_uri"], "u://b")
-        self.assertEqual(result[0]["new_uri"], "u://a")
+        manifest = self._conflict_manifest(analyst, 1)
+        conflict = manifest["contradictions"][0]
+        self.assertEqual(conflict["old_uri"], "u://0a")
+        self.assertEqual(conflict["new_uri"], "u://0b")
 
     def test_same_scope_group_tenant_isolation(self):
         analyst = self._analyst()
@@ -403,7 +418,7 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-memory-body", output)
         self.assertIn("error_type=RuntimeError", output)
 
-    async def test_queue_max_drops_overflow(self):
+    async def test_queue_max_persists_overflow(self):
         kv = _FakeKV()
         runner = self._runner(kv, {"maintenance_pending_queue_max": 2})
         items = [
@@ -412,6 +427,27 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
         await runner._flush_pending_review(items, "s1")
         queue = kv.store["maintenance_pending_review"]
         self.assertEqual(len(queue), 2)
+        overflow = kv.store["maintenance_pending_review_overflow"]
+        self.assertEqual(len(overflow), 3)
+        self.assertEqual(
+            [entry["op"]["uri"] for entry in overflow], ["u://2", "u://3", "u://4"]
+        )
+
+    async def test_queue_overflow_drains_after_capacity_frees(self):
+        kv = _FakeKV()
+        runner = self._runner(kv, {"maintenance_pending_queue_max": 1})
+        items = [
+            ({"type": "archive", "uri": "u://1"}, {"reason": "x"}),
+            ({"type": "archive", "uri": "u://2"}, {"reason": "x"}),
+        ]
+
+        await runner._flush_pending_review(items, "s1")
+        kv.store["maintenance_pending_review"][0]["status"] = "approved"
+        await runner._flush_pending_review([], "s2")
+
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual([item["op"]["uri"] for item in queue], ["u://2"])
+        self.assertEqual(kv.store["maintenance_pending_review_overflow"], [])
 
     async def test_capacity_counts_pending_only(self):
         kv = _FakeKV()
@@ -514,7 +550,7 @@ class DryRunMaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 agent_type="organizer", parsed=True, operations=[{"type": "archive"}]
             )
 
-        async def analyst():
+        async def analyst(**kwargs):
             return AgentManifest(
                 agent_type="analyst", parsed=True, operations=[{"type": "new_link"}]
             )
@@ -554,7 +590,7 @@ class DryRunMaintenanceTests(unittest.IsolatedAsyncioTestCase):
             cache_states.append(("organizer", llm._cache_enabled))
             return AgentManifest(agent_type="organizer", parsed=True)
 
-        async def analyst():
+        async def analyst(**kwargs):
             cache_states.append(("analyst", llm._cache_enabled))
             return AgentManifest(agent_type="analyst", parsed=True)
 
@@ -687,6 +723,126 @@ class ContradictionExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(mgr.deprecate_calls, [("u://old", "contradiction resolved")])
+
+
+class BudgetDeferredExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def _runner(self, kv: _FakeKV) -> MaintenanceRunner:
+        return MaintenanceRunner(
+            context=None,
+            memory_mgr=_FakeMemoryMgr(),
+            llm=_FakeLLM(),
+            config={},
+            kv_put=kv.put_kv_data,
+            kv_get=kv.get_kv_data,
+        )
+
+    @staticmethod
+    def _report(ops: list[dict], verdicts: list[dict]) -> MaintenanceReport:
+        report = MaintenanceReport(
+            session_id="s1",
+            extract_manifest=AgentManifest(
+                agent_type="extract", parsed=True, operations=ops
+            ),
+        )
+        report.reviewer_verdicts = verdicts
+        return report
+
+    async def test_budget_exhausted_ops_are_persisted_for_human_review(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 0}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        ops = [
+            {"type": "create", "content": "c0"},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+        ]
+        report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
+        await runner._execute_operations(report)
+        self.assertEqual(report.executed_ops, 1)
+        self.assertEqual(report.skipped_ops, 2)
+        self.assertEqual(len(kv.store["maintenance_pending_review"]), 2)
+        # 预算耗尽项进入待审队列，并在持久化成功后销账
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 3)
+
+    async def test_budget_tail_from_all_agent_manifests_is_persisted(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 0}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        report = MaintenanceReport(
+            session_id="s1",
+            extract_manifest=AgentManifest(
+                agent_type="extract",
+                parsed=True,
+                operations=[{"type": "create", "content": "c0"}],
+            ),
+            organizer_manifest=AgentManifest(
+                agent_type="organizer",
+                parsed=True,
+                operations=[{"type": "archive", "uri": "u://1"}],
+            ),
+            analyst_manifest=AgentManifest(
+                agent_type="analyst",
+                parsed=True,
+                operations=[
+                    {
+                        "type": "new_link",
+                        "source": "u://1",
+                        "target": "u://2",
+                    }
+                ],
+            ),
+            reviewer_verdicts=[{"index": 0, "verdict": "approve", "reason": "ok"}],
+        )
+
+        await runner._execute_operations(report)
+
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(
+            {item["op"]["type"] for item in queue}, {"archive", "new_link"}
+        )
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 3)
+
+    async def test_invalid_output_still_fails_closed_to_pending(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 0, "invalid_output": 2}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        ops = [
+            {"type": "create", "content": "c0"},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+        ]
+        report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
+        await runner._execute_operations(report)
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(len(queue), 2)
+        self.assertTrue(all(item["status"] == "pending" for item in queue))
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 3)
+
+    async def test_mixed_invalid_output_and_budget_tail_split(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 1}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        ops = [
+            {"type": "create", "content": "c0"},
+            {"type": "archive", "uri": "u://1"},
+            {"type": "archive", "uri": "u://2"},
+            {"type": "archive", "uri": "u://3"},
+        ]
+        report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
+        await runner._execute_operations(report)
+        # 中间缺失（输出无效）与尾部预算耗尽都转入待审队列
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(len(queue), 3)
+        self.assertEqual(queue[0]["op"]["uri"], "u://1")
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 4)
 
 
 if __name__ == "__main__":

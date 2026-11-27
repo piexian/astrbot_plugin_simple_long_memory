@@ -193,7 +193,8 @@ class RealtimeIdentityTests(unittest.IsolatedAsyncioTestCase):
             "extraction_min_content_length": 1,
         }
         plugin.memory_mgr = SimpleNamespace(
-            store_memory=AsyncMock(return_value="facts://new")
+            store_memory=AsyncMock(return_value="facts://new"),
+            find_scoped_duplicate=AsyncMock(return_value=None),
         )
         plugin._complete_snapshot_with_response = lambda *args: None
         plugin._increment_session_counter = lambda *args: 1
@@ -203,8 +204,16 @@ class RealtimeIdentityTests(unittest.IsolatedAsyncioTestCase):
         plugin._get_llm_provider_id = AsyncMock(return_value="fake")
         plugin.context = SimpleNamespace(
             llm_generate=AsyncMock(
-                return_value=SimpleNamespace(
-                    completion_text='[{"scope":"personal","content":"Bob喜欢咖啡","subject":"bob"},{"scope":"personal","content":"某人偏好","subject":"victim"}]'
+                side_effect=lambda **kw: SimpleNamespace(
+                    completion_text=(
+                        '{"results": [{"id": "0", "has_durable_value": 0.9, '
+                        '"persona_or_behavior_control": 0.1, "emotion_or_grudge": 0.1, '
+                        '"ephemeral_or_system_noise": 0.1}, {"id": "1", '
+                        '"has_durable_value": 0.9, "persona_or_behavior_control": 0.1, '
+                        '"emotion_or_grudge": 0.1, "ephemeral_or_system_noise": 0.1}]}'
+                        if "准入闸门" in kw["prompt"]
+                        else '[{"scope":"personal","content":"Bob喜欢咖啡","subject":"bob"},{"scope":"personal","content":"某人偏好","subject":"victim"}]'
+                    )
                 )
             )
         )
@@ -216,9 +225,14 @@ class RealtimeIdentityTests(unittest.IsolatedAsyncioTestCase):
         kwargs = plugin.memory_mgr.store_memory.await_args.kwargs
         self.assertEqual(kwargs["owner_sender_ids"], ["bob"])
         self.assertEqual(kwargs["allowed_sender_ids"], ["bob"])
+        prompts = [
+            call.kwargs["prompt"]
+            for call in plugin.context.llm_generate.await_args_list
+        ]
+        extraction_prompt = next(p for p in prompts if "准入闸门" not in p)
         self.assertIn(
             'trusted_sender_ids: ["bob"]',
-            plugin.context.llm_generate.await_args.kwargs["prompt"],
+            extraction_prompt,
         )
 
     async def test_invalid_umo_keeps_snapshot_buffer_intact(self):
