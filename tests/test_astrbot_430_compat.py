@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import yaml
+from sqlalchemy import Column, DateTime
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlmodel import Field, SQLModel
 from test_memory_commands import MemoryManager, plugin_main
@@ -762,28 +763,11 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduler._tz_str, "Asia/Shanghai")
 
     async def test_review_notification_imports_message_chain_from_api_event(self):
+        from astrbot.api import star as astrbot_star
+        from astrbot.api.event import MessageChain
+
+        self.assertFalse(hasattr(astrbot_star, "MessageChain"))
         sent: list[tuple[str, object]] = []
-        unset = object()
-
-        class _MessageChain:
-            def __init__(self, chain):
-                self.chain = chain
-                self.markdown = unset
-
-            def use_markdown(self, value: bool):
-                self.markdown = value
-                return self
-
-        class _Plain:
-            def __init__(self, text: str):
-                self.text = text
-
-        event_mod = types.ModuleType("astrbot.api.event")
-        event_mod.MessageChain = _MessageChain
-        comp_mod = types.ModuleType("astrbot.api.message_components")
-        comp_mod.Plain = _Plain
-        # 刻意不在 astrbot.api.star 中提供 MessageChain，确保不再从错误路径导入
-        star_mod = types.ModuleType("astrbot.api.star")
 
         async def send_message(umo: str, msg):
             sent.append((umo, msg))
@@ -796,21 +780,61 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
             kv_put=None,
             kv_get=None,
         )
-        with patch.dict(
-            sys.modules,
-            {
-                "astrbot.api.event": event_mod,
-                "astrbot.api.message_components": comp_mod,
-                "astrbot.api.star": star_mod,
-            },
-        ):
-            await runner._send_review_notification(3)
+        await runner._send_review_notification(3)
 
         self.assertEqual(len(sent), 1)
         umo, msg = sent[0]
         self.assertEqual(umo, "qq:FriendMessage:admin")
-        self.assertIs(msg.markdown, False)
+        self.assertIsInstance(msg, MessageChain)
+        if hasattr(msg, "use_markdown_"):
+            self.assertIs(msg.use_markdown_, False)
         self.assertIn("3 条争议操作", msg.chain[0].text)
+
+    def test_plugin_registers_real_astrbot_handlers_and_commands(self):
+        from astrbot.core.star.filter.command import CommandFilter
+        from astrbot.core.star.filter.command_group import CommandGroupFilter
+        from astrbot.core.star.star_handler import EventType, star_handlers_registry
+
+        by_name = {h.handler_name: h for h in star_handlers_registry}
+        for name, expected_type in (
+            ("inject_memories", EventType.OnLLMRequestEvent),
+            ("extract_memories", EventType.OnLLMResponseEvent),
+            ("on_agent_begin", EventType.OnAgentBeginEvent),
+            ("on_agent_done", EventType.OnAgentDoneEvent),
+            ("on_loaded", EventType.OnAstrBotLoadedEvent),
+            ("memory_group", EventType.AdapterMessageEvent),
+            ("cmd_list", EventType.AdapterMessageEvent),
+            ("cmd_search", EventType.AdapterMessageEvent),
+            ("cmd_rebuild", EventType.AdapterMessageEvent),
+        ):
+            self.assertIn(name, by_name, f"missing registered handler: {name}")
+            self.assertEqual(by_name[name].event_type, expected_type)
+
+        group_filters = [
+            f
+            for f in by_name["memory_group"].event_filters
+            if isinstance(f, CommandGroupFilter)
+        ]
+        self.assertTrue(any(f.group_name == "memory" for f in group_filters))
+
+        for handler_name, expected_cmd in (
+            ("cmd_list", "list"),
+            ("cmd_search", "search"),
+            ("cmd_rebuild", "rebuild"),
+        ):
+            cmd_filters = [
+                f
+                for f in by_name[handler_name].event_filters
+                if isinstance(f, CommandFilter)
+            ]
+            self.assertTrue(
+                any(
+                    f.command_name == expected_cmd
+                    and list(f.parent_command_names) == ["memory"]
+                    for f in cmd_filters
+                ),
+                f"{handler_name} did not register /memory {expected_cmd}",
+            )
 
 
 class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
@@ -824,7 +848,7 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
             user_id: str
             sender_id: str | None = None
             sender_name: str | None = None
-            created_at: datetime
+            created_at: datetime = Field(sa_column=Column(DateTime, nullable=False))
             is_active: bool = Field(default=True)
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
