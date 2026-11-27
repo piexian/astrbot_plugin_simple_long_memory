@@ -170,22 +170,128 @@ class MaintenanceLLM:
         except Exception:
             return None
 
+    @staticmethod
+    def _extract_provider_id(provider: Any) -> str:
+        """从 Provider 实例提取 provider ID，兼容公开 meta() 与配置字典。"""
+        if provider is None:
+            return ""
+        meta_fn = getattr(provider, "meta", None)
+        if callable(meta_fn):
+            try:
+                meta = meta_fn()
+                provider_id = getattr(meta, "id", "")
+                if isinstance(provider_id, str) and provider_id:
+                    return provider_id
+            except Exception:
+                pass
+        provider_config = getattr(provider, "provider_config", None)
+        if isinstance(provider_config, dict):
+            provider_id = provider_config.get("id", "")
+            if isinstance(provider_id, str) and provider_id:
+                return provider_id
+        for attr in ("provider_id", "id"):
+            value = getattr(provider, attr, "")
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
     def _resolve_default_provider(self) -> str:
         """回退到 AstrBot 全局默认 provider（maintenance_model_id 留空时）。"""
+        provider_manager = getattr(self._context, "provider_manager", None)
+        inst_map = getattr(provider_manager, "inst_map", None)
+        known_ids = inst_map if isinstance(inst_map, dict) and inst_map else None
+
+        def _usable(candidate: Any) -> str:
+            if not isinstance(candidate, str) or not candidate:
+                return ""
+            if known_ids is not None and candidate not in known_ids:
+                return ""
+            return candidate
+
+        # 优先读取实时配置，避免控制台热切换默认模型后仍命中启动时缓存的旧模型 ID
         try:
-            config = self._context.get_config()
-            provider_settings = config.get("provider_settings", {})
-            default_id = provider_settings.get("default_provider_id", "")
+            get_config = getattr(self._context, "get_config", None)
+            config = (
+                get_config()
+                if callable(get_config)
+                else getattr(self._context, "astrbot_config", None)
+            )
+            if isinstance(config, dict):
+                # 4.30+: agent.config.model.provider_id
+                agent = config.get("agent")
+                if isinstance(agent, dict) and agent.get("runtime") in (
+                    None,
+                    "",
+                    "astrbot",
+                ):
+                    agent_cfg = agent.get("config")
+                    model_cfg = (
+                        agent_cfg.get("model") if isinstance(agent_cfg, dict) else None
+                    )
+                    default_id = _usable(
+                        model_cfg.get("provider_id", "")
+                        if isinstance(model_cfg, dict)
+                        else ""
+                    )
+                    if default_id:
+                        return default_id
+
+                # 4.29: agent_runner.config.model.provider_id
+                agent_runner = config.get("agent_runner")
+                if isinstance(agent_runner, dict) and agent_runner.get(
+                    "runner_type"
+                ) in (None, "", "local"):
+                    runner_cfg = agent_runner.get("config")
+                    model_cfg = (
+                        runner_cfg.get("model")
+                        if isinstance(runner_cfg, dict)
+                        else None
+                    )
+                    default_id = _usable(
+                        model_cfg.get("provider_id", "")
+                        if isinstance(model_cfg, dict)
+                        else ""
+                    )
+                    if default_id:
+                        return default_id
+
+                # 旧版配置兼容：provider_settings.default_provider_id
+                provider_settings = config.get("provider_settings")
+                if isinstance(provider_settings, dict):
+                    default_id = _usable(
+                        provider_settings.get("default_provider_id", "")
+                    )
+                    if default_id:
+                        return default_id
+        except Exception:
+            pass
+
+        try:
+            default_id = _usable(
+                getattr(provider_manager, "default_chat_provider_id", "")
+            )
             if default_id:
                 return default_id
         except Exception:
             pass
-        # 最后尝试取第一个可用 provider
+
+        # 回退到当前默认实例或第一个可用 chat provider
         try:
-            insts = self._context.provider_manager.provider_insts
+            curr_id = self._extract_provider_id(
+                getattr(provider_manager, "curr_provider_inst", None)
+            )
+            if curr_id:
+                return curr_id
+        except Exception:
+            pass
+
+        try:
+            insts = getattr(provider_manager, "provider_insts", None)
+            if not insts:
+                get_all = getattr(self._context, "get_all_providers", None)
+                insts = get_all() if callable(get_all) else None
             if insts:
-                first = insts[0]
-                return getattr(first, "provider_id", "") or getattr(first, "id", "")
+                return self._extract_provider_id(insts[0])
         except Exception:
             pass
         return ""

@@ -31,7 +31,11 @@
     },
     "global_memory": {
       "description": "Per-Person Cross-Session Sharing",
-      "hint": "Within the same platform instance, personal memories follow their owners across groups and DMs. Disable to restrict them to their original session. Does not control group or global memories."
+      "hint": "Within the same platform instance, personal memories follow their owners across groups and DMs and allow injecting cross-session contact summaries. Disable to restrict them to their original session without contact summaries. Does not control group or global memories."
+    },
+    "share_contacts_across_bots": {
+      "description": "Share Contact Records Across Bots",
+      "hint": "Share known session records for the same user ID across bots within the same platform instance. Affects only the contact index and does not change memory visibility or bypass sharing or admin checks."
     },
     "share_group_across_groups": {
       "description": "Cross-Group Sharing",
@@ -113,6 +117,58 @@
       "description": "Consolidation Batch Size",
       "hint": "Maximum number of memories processed per consolidation run"
     },
+    "maintenance_enabled": {
+      "description": "Enable Background Maintenance",
+      "hint": "Run scheduled memory maintenance tasks on a cron schedule (uses the maintenance model or default chat model)"
+    },
+    "maintenance_model_id": {
+      "description": "Maintenance Model",
+      "hint": "LLM used by background maintenance agents. A lightweight model is recommended; leave empty to use the default chat LLM"
+    },
+    "maintenance_window": {
+      "description": "Maintenance Time Window",
+      "hint": "Single time such as 03:00 or range such as 02:00-06:00; cron triggers outside this window are skipped with a DEBUG log"
+    },
+    "maintenance_cron": {
+      "description": "Maintenance Cron Expression",
+      "hint": "Standard 5-field cron expression; defaults to 03:00 daily to run the full maintenance pipeline (purge, extract, organizer, analyst, reviewer)"
+    },
+    "maintenance_max_llm_calls": {
+      "description": "Max LLM Calls per Cycle",
+      "hint": "Hard cap on total LLM calls across all agents within a single maintenance cycle"
+    },
+    "maintenance_max_ops_per_cycle": {
+      "description": "Max Operations per Cycle",
+      "hint": "Hard cap on total operations proposed by the organizer and analyst per cycle; excess items are deferred to the next cycle"
+    },
+    "maintenance_analyst_max_new_links": {
+      "description": "Max New Links per Analyst Run",
+      "hint": "Maximum number of new memory links the analyst may propose in one maintenance cycle"
+    },
+    "maintenance_analyst_detect_contradiction": {
+      "description": "Detect Contradictions in Analyst",
+      "hint": "Enable contradiction detection for pairs of conflicting memories during analyst runs"
+    },
+    "maintenance_analyst_max_contradictions": {
+      "description": "Max Contradictions Reported",
+      "hint": "Maximum number of contradictory memory pairs reported by the analyst per cycle"
+    },
+    "maintenance_reviewer_enabled": {
+      "description": "Enable Reviewer",
+      "hint": "Review proposed changes from extraction, organizer, and analyst before execution to prevent accidental deletions or edits"
+    },
+    "maintenance_reviewer_model_id": {
+      "description": "Reviewer Model",
+      "hint": "LLM used to review proposed operations; leave empty to use the global maintenance model"
+    },
+    "maintenance_organizer_enabled": {
+      "description": "Enable Organizer",
+      "hint": "Deduplicate and merge similar memories, refine phrasing, and archive low-value entries"
+    },
+    "maintenance_analyst_enabled": {
+      "description": "Enable Analyst",
+      "hint": "Read recent conversation history to discover implicit links and detect contradictions between memories"
+    },
     "maintenance_extract_enabled": {
       "description": "Enable Conversation Extraction",
       "hint": "During maintenance cycles, segment conversation history into blocks and extract new memories; when off, only existing memories are curated"
@@ -152,6 +208,64 @@
     "maintenance_extract_conv2_chunk_messages": {
       "description": "ConversationV2 Chunk Size",
       "hint": "ConversationV2 records carry no timestamps; every N messages are cut into one candidate block"
+    },
+    "review_notify_enabled": {
+      "description": "Enable Review Notifications",
+      "hint": "Proactively notify administrators when controversial maintenance operations await approval"
+    },
+    "review_notify_umo": {
+      "description": "Notification Target UMO",
+      "hint": "Select or enter the group or private chat unified_msg_origin for review notifications; leave empty to disable proactive notifications"
+    },
+    "review_notify_schedule": {
+      "description": "Notification Schedule (Reserved)",
+      "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than on a schedule",
+      "labels": ["Daily", "Weekly", "Monthly"]
+    },
+    "review_notify_time": {
+      "description": "Notification Time (Reserved)",
+      "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than at a fixed time"
+    },
+    "maintenance_pending_queue_max": {
+      "description": "Pending Review Queue Limit",
+      "hint": "Maximum pending items kept in the manual review queue; excess items are dropped and logged"
+    },
+    "auto_purge_enabled": {
+      "description": "Auto Purge Deprecated Memories",
+      "hint": "Periodically hard-delete memories marked deprecated past the retention window"
+    },
+    "auto_purge_after_days": {
+      "description": "Purge Grace Period (days)",
+      "hint": "Hard-delete memories marked deprecated for longer than this many days"
+    },
+    "auto_purge_cron": {
+      "description": "Purge Cron Expression",
+      "hint": "Standard 5-field cron expression; defaults to 05:00 daily"
+    },
+    "maintenance_tasks": {
+      "description": "Maintenance Team Orchestration",
+      "hint": "Configure background maintenance roles (organizer, analyst, reviewer) with schedule and behavior"
+    },
+    "context_max_rounds": {
+      "description": "Max Context Rounds",
+      "hint": "Maximum number of conversation turns fetched by the analyst"
+    },
+    "context_max_chars": {
+      "description": "Max Context Characters",
+      "hint": "Maximum total characters of conversation history fetched by the analyst"
+    },
+    "context_max_age_days": {
+      "description": "Max Context Lookback (days)",
+      "hint": "Only fetch conversations from the past N days in the analyst"
+    },
+    "persona_mode": {
+      "description": "Persona Loading Mode",
+      "hint": "auto = extract from default persona, manual = use custom summary below, off = disabled",
+      "labels": ["Auto", "Manual", "Off"]
+    },
+    "persona_summary": {
+      "description": "Custom Persona Summary",
+      "hint": "Used in manual mode to provide conversational context to maintenance agents"
     }
   }
 }

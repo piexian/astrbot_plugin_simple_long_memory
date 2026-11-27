@@ -17,6 +17,7 @@ import json
 import re
 import shlex
 import time
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -95,16 +96,136 @@ def _current_speaker_subject(event: AstrMessageEvent, scope: str) -> str:
 
 
 def _flatten_content(content: Any) -> str:
-    """将内容转换为字符串"""
+    """将内容转换为字符串，跳过临时块与非纯文本块。"""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(_flatten_content(item) for item in content)
+        return " ".join(part for item in content if (part := _flatten_content(item)))
     if isinstance(content, dict):
-        return content.get("text", "") or content.get("content", "")
+        if content.get("_no_save"):
+            return ""
+        part_type = content.get("type")
+        if part_type and part_type != "text":
+            return ""
+        return str(content.get("text") or content.get("content") or "")
+    if getattr(content, "_no_save", False):
+        return ""
+    part_type = getattr(content, "type", None)
+    if part_type is not None:
+        if part_type != "text":
+            return ""
+        return str(getattr(content, "text", "") or "")
     return str(content)
+
+
+def _noop_decorator(*args: Any, **kwargs: Any):
+    def decorator(func: Any) -> Any:
+        return func
+
+    return decorator
+
+
+def _on_agent_begin_decorator(*args: Any, **kwargs: Any):
+    factory = getattr(filter, "on_agent_begin", None)
+    if callable(factory):
+        return factory(*args, **kwargs)
+    return _noop_decorator(*args, **kwargs)
+
+
+def _on_agent_done_decorator(*args: Any, **kwargs: Any):
+    factory = getattr(filter, "on_agent_done", None)
+    if callable(factory):
+        return factory(*args, **kwargs)
+    return _noop_decorator(*args, **kwargs)
+
+
+def _is_wakeup_event(event: Any) -> bool:
+    """判断是否为 AstrBot 4.30+ 程序唤醒事件（定时任务、后台任务、run_turn）。"""
+    return getattr(event, "event_kind", "message") == "agent_wakeup"
+
+
+def _has_real_wakeup_sender(event: Any) -> bool:
+    """判断唤醒事件是否携带真实发送者，而非框架默认的 System/astrbot 占位身份。"""
+    get_sender_id = getattr(event, "get_sender_id", None)
+    sender_id = str((get_sender_id() if callable(get_sender_id) else "") or "").strip()
+    if not sender_id:
+        return False
+    get_sender_name = getattr(event, "get_sender_name", None)
+    sender_name = str(
+        (get_sender_name() if callable(get_sender_name) else "") or ""
+    ).strip()
+    if sender_id == "astrbot" and sender_name in ("", "System"):
+        return False
+    get_self_id = getattr(event, "get_self_id", None)
+    self_id = str((get_self_id() if callable(get_self_id) else "") or "").strip()
+    if self_id and sender_id == self_id:
+        return False
+    return True
+
+
+def _is_subagent_run(run_context: Any) -> bool:
+    """判断当前 Agent 运行上下文是否属于原生子代理。"""
+    return bool(getattr(getattr(run_context, "context", None), "is_subagent", False))
+
+
+def _read_astrbot_config(context: Any, umo: str | None = None) -> Any:
+    """安全读取 AstrBot 全局或会话级配置，兼容仅暴露 astrbot_config 的测试桩。"""
+    if context is None:
+        return None
+    get_config = getattr(context, "get_config", None)
+    if callable(get_config):
+        if umo:
+            try:
+                return get_config(umo=umo)
+            except TypeError:
+                pass
+        return get_config()
+    return getattr(context, "astrbot_config", None)
+
+
+def _extract_visible_message_text(message: Any) -> str:
+    """从 AstrBot Message 对象或字典中提取可持久化的纯文本内容。"""
+    if isinstance(message, dict):
+        if message.get("_no_save"):
+            return ""
+        content = message.get("content")
+    else:
+        if getattr(message, "_no_save", False):
+            return ""
+        content = getattr(message, "content", None)
+
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                parts.append(part)
+            continue
+        if isinstance(part, dict):
+            if part.get("_no_save") or part.get("type") != "text":
+                continue
+            text = str(part.get("text") or "")
+            if text:
+                parts.append(text)
+            continue
+        if getattr(part, "_no_save", False) or getattr(part, "type", None) != "text":
+            continue
+        text = str(getattr(part, "text", "") or "")
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+def _message_role(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role") or "")
+    return str(getattr(message, "role", "") or "")
 
 
 def _normalize_contexts(contexts: Any) -> list[dict[str, Any]]:
@@ -132,9 +253,12 @@ def _build_recall_query(
 def _make_memory_text_part(content: str) -> Any | None:
     """构造 AstrBot 用户内容块；新版支持标记为本轮临时内容。"""
     try:
-        from astrbot.core.agent.message import TextPart
+        from astrbot.api.agents import TextPart
     except Exception:
-        return None
+        try:
+            from astrbot.core.agent.message import TextPart
+        except Exception:
+            return None
 
     part = TextPart(text=content)
     mark_as_temp = getattr(part, "mark_as_temp", None)
@@ -402,6 +526,221 @@ def _get_confirmation_waiters(plugin: Any) -> set[SessionWaiter]:
     return waiters
 
 
+_SUBAGENT_RESULTS_REMINDER_RE = re.compile(
+    r"<system_reminder>\s*\[Subagent results\][\s\S]*?</system_reminder>",
+    re.IGNORECASE,
+)
+_ASTRBOT_INTERRUPTION_REQUEST = "Stop output."
+_ASTRBOT_INTERRUPTION_MESSAGE = "Output stopped."
+
+
+def _is_turn_continuation(message: Any) -> bool:
+    """判断消息是否带有 AstrBot Steering 续轮标记（兼容对象与字典）。"""
+    if isinstance(message, dict):
+        return bool(message.get("_turn_continuation", False))
+    return bool(getattr(message, "_turn_continuation", False))
+
+
+def _sanitize_turn_user_text(text: str) -> str:
+    """去除框架通过 Steering 注入的系统提醒与中断控制消息，保留真实用户输入。"""
+    cleaned = _SUBAGENT_RESULTS_REMINDER_RE.sub("", text).strip()
+    if not cleaned or cleaned == _ASTRBOT_INTERRUPTION_REQUEST:
+        return ""
+    return cleaned
+
+
+_MAX_UNWEAKREFABLE_EVENTS = 512
+
+
+def _get_agent_tracking(
+    plugin: Any,
+) -> tuple[
+    weakref.WeakSet[Any],
+    list[Any],
+    weakref.WeakKeyDictionary[Any, dict[str, Any]],
+    list[tuple[Any, dict[str, Any]]],
+    weakref.WeakKeyDictionary[Any, dict[str, str]],
+    list[tuple[Any, dict[str, str]]],
+]:
+    managed_events = getattr(plugin, "_agent_managed_events", None)
+    if managed_events is None:
+        managed_events = weakref.WeakSet()
+        setattr(plugin, "_agent_managed_events", managed_events)
+    managed_fallback = getattr(plugin, "_agent_managed_events_fallback", None)
+    if managed_fallback is None:
+        managed_fallback = []
+        setattr(plugin, "_agent_managed_events_fallback", managed_fallback)
+    run_states = getattr(plugin, "_agent_run_states", None)
+    if run_states is None:
+        run_states = weakref.WeakKeyDictionary()
+        setattr(plugin, "_agent_run_states", run_states)
+    run_states_fallback = getattr(plugin, "_agent_run_states_fallback", None)
+    if run_states_fallback is None:
+        run_states_fallback = []
+        setattr(plugin, "_agent_run_states_fallback", run_states_fallback)
+    pending_snapshots = getattr(plugin, "_pending_event_snapshots", None)
+    if pending_snapshots is None:
+        pending_snapshots = weakref.WeakKeyDictionary()
+        setattr(plugin, "_pending_event_snapshots", pending_snapshots)
+    pending_fallback = getattr(plugin, "_pending_event_snapshots_fallback", None)
+    if pending_fallback is None:
+        pending_fallback = []
+        setattr(plugin, "_pending_event_snapshots_fallback", pending_fallback)
+    return (
+        managed_events,
+        managed_fallback,
+        run_states,
+        run_states_fallback,
+        pending_snapshots,
+        pending_fallback,
+    )
+
+
+def _mark_agent_managed_event(plugin: Any, event: Any) -> None:
+    managed_events, managed_fallback, _, _, _, _ = _get_agent_tracking(plugin)
+    try:
+        managed_events.add(event)
+    except TypeError:
+        if not any(item is event for item in managed_fallback):
+            managed_fallback.append(event)
+            if len(managed_fallback) > _MAX_UNWEAKREFABLE_EVENTS:
+                del managed_fallback[:-_MAX_UNWEAKREFABLE_EVENTS]
+
+
+def _is_agent_managed_event(plugin: Any, event: Any) -> bool:
+    managed_events, managed_fallback, _, _, _, _ = _get_agent_tracking(plugin)
+    try:
+        if event in managed_events:
+            return True
+    except TypeError:
+        pass
+    return any(item is event for item in managed_fallback)
+
+
+def _set_agent_run_state(plugin: Any, event: Any, state: dict[str, Any]) -> None:
+    _, _, run_states, run_states_fallback, _, _ = _get_agent_tracking(plugin)
+    try:
+        run_states[event] = state
+    except TypeError:
+        for idx, (existing, _) in enumerate(run_states_fallback):
+            if existing is event:
+                run_states_fallback[idx] = (event, state)
+                return
+        run_states_fallback.append((event, state))
+        if len(run_states_fallback) > _MAX_UNWEAKREFABLE_EVENTS:
+            del run_states_fallback[:-_MAX_UNWEAKREFABLE_EVENTS]
+
+
+def _pop_agent_run_state(plugin: Any, event: Any) -> dict[str, Any] | None:
+    _, _, run_states, run_states_fallback, _, _ = _get_agent_tracking(plugin)
+    try:
+        state = run_states.pop(event, None)
+        if state is not None:
+            return state
+    except TypeError:
+        pass
+    for idx, (existing, state) in enumerate(run_states_fallback):
+        if existing is event:
+            run_states_fallback.pop(idx)
+            return state
+    return None
+
+
+def _set_pending_event_snapshot(
+    plugin: Any, event: Any, pending: dict[str, str]
+) -> None:
+    _, _, _, _, pending_snapshots, pending_fallback = _get_agent_tracking(plugin)
+    try:
+        pending_snapshots[event] = pending
+    except TypeError:
+        for idx, (existing, _) in enumerate(pending_fallback):
+            if existing is event:
+                pending_fallback[idx] = (event, pending)
+                return
+        pending_fallback.append((event, pending))
+        if len(pending_fallback) > _MAX_UNWEAKREFABLE_EVENTS:
+            del pending_fallback[:-_MAX_UNWEAKREFABLE_EVENTS]
+
+
+def _pop_pending_event_snapshot(plugin: Any, event: Any) -> dict[str, str] | None:
+    _, _, _, _, pending_snapshots, pending_fallback = _get_agent_tracking(plugin)
+    try:
+        pending = pending_snapshots.pop(event, None)
+        if pending is not None:
+            return pending
+    except TypeError:
+        pass
+    for idx, (existing, pending) in enumerate(pending_fallback):
+        if existing is event:
+            pending_fallback.pop(idx)
+            return pending
+    return None
+
+
+def _make_event_ref(event: Any) -> Any:
+    try:
+        return weakref.ref(event)
+    except TypeError:
+        return event
+
+
+def _resolve_event_ref(ref: Any) -> Any:
+    if isinstance(ref, weakref.ReferenceType):
+        return ref()
+    return ref
+
+
+def _collect_turn_messages(
+    run_context: Any, run_state: dict[str, Any] | None
+) -> list[tuple[str, str]]:
+    """按时间顺序提取本轮新增的真实用户追问与可见助手回复。"""
+    raw_messages = getattr(run_context, "messages", None)
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return []
+
+    new_messages: list[Any] | None = None
+    if run_state:
+        anchor = run_state.get("anchor")
+        start_len = int(run_state.get("start_len", 0) or 0)
+        if anchor is not None:
+            for idx in range(len(raw_messages) - 1, -1, -1):
+                if raw_messages[idx] is anchor:
+                    new_messages = raw_messages[idx + 1 :]
+                    break
+        elif start_len <= len(raw_messages):
+            new_messages = raw_messages[start_len:]
+
+    if new_messages is None:
+        # 轮内发生上下文压缩导致起始锚点变化时，从最后一个非 Steering 用户消息之后恢复本轮消息。
+        last_turn_start = -1
+        for idx in range(len(raw_messages) - 1, -1, -1):
+            msg = raw_messages[idx]
+            if _message_role(msg) == "user" and not _is_turn_continuation(msg):
+                last_turn_start = idx
+                break
+        new_messages = (
+            raw_messages[last_turn_start + 1 :] if last_turn_start >= 0 else []
+        )
+
+    end_reason = getattr(run_context, "run_end_reason", None)
+    turn_messages: list[tuple[str, str]] = []
+    for msg in new_messages:
+        role = _message_role(msg)
+        if role not in ("user", "assistant"):
+            continue
+        text = _extract_visible_message_text(msg)
+        if not text:
+            continue
+        if role == "user":
+            text = _sanitize_turn_user_text(text)
+            if not text:
+                continue
+        elif end_reason == "cancelled" and text == _ASTRBOT_INTERRUPTION_MESSAGE:
+            continue
+        turn_messages.append((role, text))
+    return turn_messages
+
+
 def authorize_memory_mutation(
     event: AstrMessageEvent,
     *,
@@ -492,6 +831,16 @@ class MemoryPlugin(Star):
         self._last_consolidation = 0.0
         self._background_tasks: set[asyncio.Task] = set()
         self._confirmation_waiters: set[SessionWaiter] = set()
+        self._agent_managed_events: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._agent_managed_events_fallback: list[Any] = []
+        self._agent_run_states: weakref.WeakKeyDictionary[Any, dict[str, Any]] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._agent_run_states_fallback: list[tuple[Any, dict[str, Any]]] = []
+        self._pending_event_snapshots: weakref.WeakKeyDictionary[
+            Any, dict[str, str]
+        ] = weakref.WeakKeyDictionary()
+        self._pending_event_snapshots_fallback: list[tuple[Any, dict[str, str]]] = []
         self._scheduler: MaintenanceScheduler | None = None
 
     async def initialize(self):
@@ -634,6 +983,12 @@ class MemoryPlugin(Star):
             self._scheduler = None
         self._request_snapshots.clear()
         self._session_counters.clear()
+        self._agent_managed_events.clear()
+        self._agent_managed_events_fallback.clear()
+        self._agent_run_states.clear()
+        self._agent_run_states_fallback.clear()
+        self._pending_event_snapshots.clear()
+        self._pending_event_snapshots_fallback.clear()
         logger.info("[简单长期记忆] 插件已卸载")
 
     async def _start_scheduler(self) -> None:
@@ -651,12 +1006,15 @@ class MemoryPlugin(Star):
         )
         await self._scheduler.start()
 
-    def _get_display_timezone(self) -> str | None:
-        """读取 AstrBot 全局时区，用于注入内容的时间展示。"""
+    def _get_display_timezone(self, umo: str | None = None) -> str | None:
+        """读取 AstrBot 全局或会话时区，用于注入内容的时间展示。"""
         try:
-            return self.context.astrbot_config.get("timezone") or None
+            cfg = _read_astrbot_config(self.context, umo)
+            if isinstance(cfg, dict):
+                return cfg.get("timezone") or None
         except Exception:
-            return None
+            pass
+        return None
 
     def _get_viewer_user_id(self, event: AstrMessageEvent) -> str | None:
         """获取当前会话用户 ID，用于标注共享记忆归属。"""
@@ -667,10 +1025,11 @@ class MemoryPlugin(Star):
         except Exception:
             return None
 
-    def _get_cmd_prefix(self) -> str:
+    def _get_cmd_prefix(self, umo: str | None = None) -> str:
         """从 AstrBot 配置读取命令前缀，默认 /"""
         try:
-            prefixes = self.context.astrbot_config.get("wake_prefix", [])
+            cfg = _read_astrbot_config(self.context, umo)
+            prefixes = cfg.get("wake_prefix", []) if isinstance(cfg, dict) else []
             if prefixes and isinstance(prefixes, list):
                 return prefixes[0]
         except Exception:
@@ -732,40 +1091,108 @@ class MemoryPlugin(Star):
                 "timestamp": current_time,
             }
 
-        # 存储待匹配的请求
-        self._request_snapshots[session_key]["pending_prompt"] = (request.prompt or "")[
-            : self.MAX_SNAPSHOT_CHARS
-        ]
-        self._request_snapshots[session_key]["pending_sender_id"] = (
-            event.get_sender_id()
+        prompt_text = (request.prompt or "")[: self.MAX_SNAPSHOT_CHARS]
+        sender_id = event.get_sender_id()
+
+        # 按事件保存待匹配请求，避免同会话重叠轮次互相覆盖或误清
+        _set_pending_event_snapshot(
+            self,
+            event,
+            {
+                "prompt": prompt_text,
+                "sender_id": sender_id,
+            },
+        )
+        self._request_snapshots[session_key]["pending_prompt"] = prompt_text
+        self._request_snapshots[session_key]["pending_sender_id"] = sender_id
+        self._request_snapshots[session_key]["pending_event_ref"] = _make_event_ref(
+            event
         )
         self._request_snapshots[session_key]["timestamp"] = current_time
 
         self._cleanup_expired_snapshots(current_time)
 
     def _complete_snapshot_with_response(
-        self, event: AstrMessageEvent, response_text: str
+        self,
+        event: AstrMessageEvent,
+        response_text: str,
+        *,
+        turn_messages: list[tuple[str, str]] | None = None,
     ) -> None:
         """用响应完成快照（在响应阶段调用）"""
         session_key = self._get_session_key(event)
         entry = self._request_snapshots.get(session_key)
+        pending = _pop_pending_event_snapshot(self, event)
 
-        if not entry or not entry.get("pending_prompt"):
+        if not entry:
             return
 
-        # 创建完整的快照
-        snapshot = {
-            "prompt": entry["pending_prompt"],
+        pending_owner = _resolve_event_ref(entry.get("pending_event_ref"))
+        if pending is not None:
+            prompt_text = pending.get("prompt") or ""
+            sender_id = pending.get("sender_id", event.get_sender_id())
+            if pending_owner is None or pending_owner is event:
+                entry["pending_prompt"] = None
+                entry["pending_sender_id"] = ""
+                entry["pending_event_ref"] = None
+        else:
+            if pending_owner is not None and pending_owner is not event:
+                return
+            prompt_text = entry.get("pending_prompt") or ""
+            sender_id = entry.get("pending_sender_id", event.get_sender_id())
+            entry["pending_prompt"] = None
+            entry["pending_sender_id"] = ""
+            entry["pending_event_ref"] = None
+
+        if not prompt_text:
+            return
+
+        snapshot: dict[str, Any] = {
+            "prompt": prompt_text,
             "response": response_text[: self.MAX_SNAPSHOT_CHARS],
-            "sender_id": entry.get("pending_sender_id", event.get_sender_id()),
+            "sender_id": sender_id,
         }
+
+        if turn_messages:
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            keep_steered_sender = (
+                parsed_umo.is_valid and parsed_umo.session_type == "private"
+            )
+            ordered_messages: list[dict[str, str]] = [
+                {
+                    "role": "user",
+                    "text": prompt_text,
+                    "sender_id": str(sender_id or ""),
+                }
+            ]
+            remaining_user = max(0, self.MAX_SNAPSHOT_CHARS - len(prompt_text))
+            remaining_assistant = self.MAX_SNAPSHOT_CHARS
+            for role, text in turn_messages:
+                if role == "user":
+                    if remaining_user <= 0:
+                        continue
+                    clipped = text[:remaining_user]
+                    remaining_user -= len(clipped)
+                    ordered_messages.append(
+                        {
+                            "role": "user",
+                            "text": clipped,
+                            "sender_id": (
+                                str(sender_id or "") if keep_steered_sender else ""
+                            ),
+                        }
+                    )
+                elif role == "assistant":
+                    if remaining_assistant <= 0:
+                        continue
+                    clipped = text[:remaining_assistant]
+                    remaining_assistant -= len(clipped)
+                    ordered_messages.append({"role": "assistant", "text": clipped})
+            snapshot["messages"] = ordered_messages
+
         entry["snapshots"].append(snapshot)
         if len(entry["snapshots"]) > self.MAX_SESSION_SNAPSHOTS:
             del entry["snapshots"][: -self.MAX_SESSION_SNAPSHOTS]
-
-        # 清除待匹配状态
-        entry["pending_prompt"] = None
-        entry["pending_sender_id"] = ""
 
     def _get_session_snapshot_count(self, event: AstrMessageEvent) -> int:
         """获取会话的快照数量"""
@@ -791,6 +1218,7 @@ class MemoryPlugin(Star):
 
     def _discard_session_snapshots(self, event: AstrMessageEvent) -> None:
         """清理当前会话快照和计数器"""
+        _pop_pending_event_snapshot(self, event)
         session_key = self._get_session_key(event)
         self._request_snapshots.pop(session_key, None)
         self._session_counters.pop(session_key, None)
@@ -934,6 +1362,20 @@ class MemoryPlugin(Star):
         """从快照列表构建对话文本"""
         lines = []
         for snapshot in snapshots:
+            ordered_messages = snapshot.get("messages")
+            if isinstance(ordered_messages, list) and ordered_messages:
+                for item in ordered_messages:
+                    role = item.get("role", "")
+                    text = item.get("text", "")
+                    if not text:
+                        continue
+                    if role == "user":
+                        sid = item.get("sender_id", "")
+                        sender_label = f"用户:{sid}" if sid else "用户"
+                        lines.append(f"[{sender_label}]: {text}")
+                    elif role == "assistant":
+                        lines.append(f"[助手]: {text}")
+                continue
             prompt = snapshot.get("prompt", "")
             response = snapshot.get("response", "")
             sender_id = snapshot.get("sender_id", "")
@@ -1017,16 +1459,22 @@ class MemoryPlugin(Star):
         if not self.config.get("auto_memorize", True):
             return
 
-        await self._maybe_observe_contact(event)
-        # P1 生命周期维护（节流；expire 轻量同步，consolidate 含 LLM 调用后台化以免阻塞用户首轮）
-        await self._maybe_expire_stale_memories()
-        task = asyncio.create_task(self._maybe_consolidate_memories(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        is_wakeup = _is_wakeup_event(event)
+        if is_wakeup:
+            if not _has_real_wakeup_sender(event):
+                return
+        else:
+            await self._maybe_observe_contact(event)
+            # P1 生命周期维护（节流；expire 轻量同步，consolidate 含 LLM 调用后台化以免阻塞用户首轮）
+            await self._maybe_expire_stale_memories()
+            task = asyncio.create_task(self._maybe_consolidate_memories(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         try:
-            # 累积请求快照（等待响应后完成）
-            self._accumulate_request_snapshot(event, request)
+            # 累积请求快照（等待响应后完成；程序唤醒不参与自动提取）
+            if not is_wakeup:
+                self._accumulate_request_snapshot(event, request)
 
             # 构建召回查询
             contexts = _normalize_contexts(request.contexts)
@@ -1067,12 +1515,12 @@ class MemoryPlugin(Star):
                         "[简单长期记忆] 查询优化降级: error_type=%s", type(e).__name__
                     )
 
-            # 召回相关记忆（注入路径：bump=True 计入 recall_count 反馈）
+            # 召回相关记忆（普通对话计入 recall_count，唤醒路径只读注入）
             memories = await self.memory_mgr.recall_memories(
                 event=event,
                 query=query,
                 top_k=self.config.get("max_memories_per_inject", 5),
-                bump=True,
+                bump=not is_wakeup,
                 source="auto_inject",
                 deadline=deadline,
             )
@@ -1082,7 +1530,7 @@ class MemoryPlugin(Star):
                 # format_memory_for_injection 已返回含 <user_context_reference> 包装的完整字符串
                 safe_memory_context = format_memory_for_injection(
                     memories,
-                    timezone_name=self._get_display_timezone(),
+                    timezone_name=self._get_display_timezone(event.unified_msg_origin),
                     viewer_user_id=self._get_viewer_user_id(event),
                 )
             injection_content = "\n".join(
@@ -1102,6 +1550,97 @@ class MemoryPlugin(Star):
         except Exception as e:
             logger.warning(f"[简单长期记忆] 注入记忆失败: {e}")
 
+    @_on_agent_begin_decorator()
+    async def on_agent_begin(self, event: AstrMessageEvent, run_context: Any):
+        """标记由 Agent 生命周期收口的事件，避免子代理与 Steering 重复触发提取。"""
+        if not self.memory_mgr or not self.config.get("auto_memorize", True):
+            return
+        if _is_wakeup_event(event):
+            return
+
+        _mark_agent_managed_event(self, event)
+        if _is_subagent_run(run_context):
+            return
+
+        raw_messages = getattr(run_context, "messages", None)
+        messages = raw_messages if isinstance(raw_messages, list) else []
+        _set_agent_run_state(
+            self,
+            event,
+            {
+                "start_len": len(messages),
+                "anchor": messages[-1] if messages else None,
+            },
+        )
+
+    @_on_agent_done_decorator()
+    async def on_agent_done(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: LLMResponse | None = None,
+    ):
+        """在主 Agent 单轮结束时收口快照并按间隔提取记忆。"""
+        if not self.memory_mgr or not self.config.get("auto_memorize", True):
+            return
+        if _is_wakeup_event(event) or _is_subagent_run(run_context):
+            return
+
+        _mark_agent_managed_event(self, event)
+        run_state = _pop_agent_run_state(self, event)
+        end_reason = getattr(run_context, "run_end_reason", None)
+        resp_role = getattr(response, "role", None)
+        turn_messages = _collect_turn_messages(run_context, run_state)
+
+        final_text = ""
+        if resp_role != "err":
+            candidate = (
+                getattr(response, "completion_text", "")
+                or getattr(response, "result", "")
+                or ""
+            ).strip()
+            if not (
+                end_reason == "cancelled" and candidate == _ASTRBOT_INTERRUPTION_MESSAGE
+            ):
+                final_text = candidate
+
+        if final_text:
+            last_assistant = next(
+                (text for role, text in reversed(turn_messages) if role == "assistant"),
+                "",
+            )
+            if final_text != last_assistant:
+                turn_messages.append(("assistant", final_text))
+
+        assistant_replies = [
+            text for role, text in turn_messages if role == "assistant"
+        ]
+        assistant_output = "\n".join(assistant_replies)
+        if not assistant_output and (
+            end_reason in {"cancelled", "error"} or resp_role == "err"
+        ):
+            self._clear_pending_snapshot(event)
+            return
+
+        await self._record_response_and_maybe_extract(
+            event, assistant_output, turn_messages=turn_messages
+        )
+
+    def _clear_pending_snapshot(self, event: AstrMessageEvent) -> None:
+        """取消或报错且无有效回复时仅清除当前事件对应的待匹配请求。"""
+        _pop_pending_event_snapshot(self, event)
+        snapshots = getattr(self, "_request_snapshots", None)
+        if not isinstance(snapshots, dict):
+            return
+        entry = snapshots.get(self._get_session_key(event))
+        if not entry:
+            return
+        pending_owner = _resolve_event_ref(entry.get("pending_event_ref"))
+        if pending_owner is None or pending_owner is event:
+            entry["pending_prompt"] = None
+            entry["pending_sender_id"] = ""
+            entry["pending_event_ref"] = None
+
     @filter.on_llm_response()
     async def extract_memories(self, event: AstrMessageEvent, response: LLMResponse):
         if not self.memory_mgr:
@@ -1110,6 +1649,23 @@ class MemoryPlugin(Star):
         if not self.config.get("auto_memorize", True):
             return
 
+        if _is_wakeup_event(event) or _is_agent_managed_event(self, event):
+            return
+
+        assistant_output = (
+            getattr(response, "completion_text", "")
+            or getattr(response, "result", "")
+            or ""
+        )
+        await self._record_response_and_maybe_extract(event, assistant_output)
+
+    async def _record_response_and_maybe_extract(
+        self,
+        event: AstrMessageEvent,
+        assistant_output: str,
+        *,
+        turn_messages: list[tuple[str, str]] | None = None,
+    ) -> None:
         try:
             extraction_interval = _read_positive_int(
                 self.config.get("extraction_interval", 20), 20
@@ -1118,15 +1674,13 @@ class MemoryPlugin(Star):
                 self._discard_session_snapshots(event)
                 return
 
-            # 获取响应文本
-            assistant_output = (
-                getattr(response, "completion_text", "")
-                or getattr(response, "result", "")
-                or ""
-            )
-
-            # 用响应完成快照
-            self._complete_snapshot_with_response(event, assistant_output)
+            # 用响应完成快照（仅在具备轮内有序消息时传关键字参数，兼容旧测试桩）
+            if turn_messages:
+                self._complete_snapshot_with_response(
+                    event, assistant_output, turn_messages=turn_messages
+                )
+            else:
+                self._complete_snapshot_with_response(event, assistant_output)
 
             # 递增会话对话计数器
             current_count = self._increment_session_counter(event)
@@ -1347,7 +1901,7 @@ class MemoryPlugin(Star):
             total=total,
             page_size=page_size,
             all_mode=all_users,
-            cmd_prefix=self._get_cmd_prefix(),
+            cmd_prefix=self._get_cmd_prefix(event.unified_msg_origin),
         )
         if truncated:
             result += (
@@ -1378,7 +1932,7 @@ class MemoryPlugin(Star):
             memories,
             total=len(memories),
             page_size=max(1, len(memories)),
-            cmd_prefix=self._get_cmd_prefix(),
+            cmd_prefix=self._get_cmd_prefix(event.unified_msg_origin),
         )
         yield event.plain_result(f"[{scope}搜索]\n{result}")
 
@@ -1691,7 +2245,7 @@ class MemoryPlugin(Star):
             if target_kb_name
             else source_kb_id
         )
-        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
+        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix(event.unified_msg_origin))
         source_count = await self.memory_mgr.count_kb_memory_records_by_name(
             self.memory_mgr.current_kb_name
         )
@@ -2238,7 +2792,7 @@ class MemoryPlugin(Star):
 
         result = format_memory_for_injection(
             memories,
-            timezone_name=self._get_display_timezone(),
+            timezone_name=self._get_display_timezone(event.unified_msg_origin),
             viewer_user_id=self._get_viewer_user_id(event),
         )
         return f"<user_history_info>\n{result}\n</user_history_info>"
@@ -2487,7 +3041,7 @@ class MemoryPlugin(Star):
             return "No active memories found"
         result = format_memory_for_injection(
             memories,
-            timezone_name=self._get_display_timezone(),
+            timezone_name=self._get_display_timezone(event.unified_msg_origin),
             viewer_user_id=self._get_viewer_user_id(event),
         )
         targets = []

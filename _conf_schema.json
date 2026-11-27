@@ -345,10 +345,11 @@
     "description": "通知目标 UMO",
     "type": "string",
     "default": "",
-    "hint": "填写群聊或私聊的 unified_msg_origin，留空则自动发给最近一次执行管理命令的管理员"
+    "_special": "umo",
+    "hint": "选择或填写接收待审通知的群聊或私聊 unified_msg_origin；留空则不发送主动通知"
   },
   "review_notify_schedule": {
-    "description": "通知频率",
+    "description": "通知频率（预留）",
     "type": "string",
     "default": "daily",
     "options": [
@@ -356,13 +357,13 @@
       "weekly",
       "monthly"
     ],
-    "hint": "daily=每天固定时间, weekly=每周固定日, monthly=每月固定日"
+    "hint": "预留配置项（保留兼容）：当前版本在产生新争议操作时立即通知，暂未按此频率定时汇总"
   },
   "review_notify_time": {
-    "description": "通知时间",
+    "description": "通知时间（预留）",
     "type": "string",
     "default": "10:00",
-    "hint": "daily 为每天时刻，weekly 为周几+时刻如 mon:10:00，monthly 为几号+时刻如 1:10:00"
+    "hint": "预留配置项（保留兼容）：当前版本在产生新争议操作时立即通知，暂未按此时间点定时发送"
   },
   "maintenance_pending_queue_max": {
     "description": "待审队列容量上限",
