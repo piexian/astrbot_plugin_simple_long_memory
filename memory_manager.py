@@ -1664,28 +1664,32 @@ class MemoryManager:
         session_id: str,
         umo: str,
         owner_user_id: str = "",
+        owner_user_ids: list[str] | None = None,
         threshold: float = SCOPED_DEDUP_SIMILARITY_THRESHOLD,
         vec_db: Any | None = None,
     ) -> str | None:
-        """同作用域、同归属的高相似度查重，命中返回已有记忆 URI。
-
-        仅供自动提取落库前调用；检索严格限定在当前归属分区内，不跨
-        作用域比对，检索失败时按无重复处理（不阻断写入）。
-        vec_db 仅供测试注入真实向量库实例，生产调用走 self.vec_db。
-        """
+        """按作用域和完整归属者集合查找高相似度记忆。"""
         if vec_db is None:
             if not self._kb_helper:
                 return None
             vec_db = self.vec_db
+
+        required_owners = {
+            str(owner).strip() for owner in (owner_user_ids or []) if str(owner).strip()
+        }
+        if owner_user_id:
+            required_owners.add(str(owner_user_id).strip())
+
         filters: dict[str, Any] = {
             "is_memory_record": True,
             "deprecated": False,
             "memory_scope": memory_scope,
         }
+        owner_filters: list[str | None] = [None]
         if memory_scope == MemoryScope.PERSONAL:
-            if not owner_user_id:
+            if not required_owners:
                 return None
-            filters["owner_user_id"] = owner_user_id
+            owner_filters = sorted(required_owners)
             if not self.config.get("global_memory", True):
                 filters["umo"] = umo
         elif memory_scope == MemoryScope.GROUP:
@@ -1694,30 +1698,61 @@ class MemoryManager:
             filters["umo"] = umo
         else:
             return None
-        try:
-            results = await vec_db.retrieve(
-                query=content,
-                k=3,
-                rerank=False,
-                metadata_filters=filters,
-            )
-        except Exception as e:
-            logger.debug(
-                f"[简单长期记忆] 提取查重检索失败（按无重复继续）: {type(e).__name__}"
-            )
-            return None
+
         best_uri = None
         best_similarity = 0.0
-        for item in results or []:
-            similarity = float(getattr(item, "similarity", 0) or 0)
-            if similarity < threshold or similarity <= best_similarity:
+        query_succeeded = False
+        for owner in owner_filters:
+            query_filters = dict(filters)
+            if owner is not None:
+                query_filters["owner_user_id"] = owner
+            try:
+                results = await vec_db.retrieve(
+                    query=content,
+                    k=3,
+                    rerank=False,
+                    metadata_filters=query_filters,
+                )
+                query_succeeded = True
+            except Exception as e:
+                logger.debug(
+                    "[简单长期记忆] 提取查重检索失败（按无重复继续）: %s",
+                    type(e).__name__,
+                )
                 continue
-            data = getattr(item, "data", None) or {}
-            metadata = _safe_parse_metadata(data.get("metadata", {}))
-            uri = metadata.get("uri")
-            if uri:
+
+            for item in results or []:
+                similarity = float(getattr(item, "similarity", 0) or 0)
+                if similarity < threshold or similarity <= best_similarity:
+                    continue
+                data = getattr(item, "data", None) or {}
+                metadata = _safe_parse_metadata(data.get("metadata", {}))
+                uri = metadata.get("uri")
+                if not uri:
+                    continue
+
+                if required_owners:
+                    stored_owners = metadata.get("owner_user_ids")
+                    if not isinstance(stored_owners, list):
+                        stored_owners = [metadata.get("owner_user_id", "")]
+                    stored_owner_set = {
+                        str(owner_id).strip()
+                        for owner_id in stored_owners
+                        if str(owner_id).strip()
+                    }
+                    if not required_owners.issubset(stored_owner_set):
+                        continue
+                    if (
+                        len(required_owners) > 1
+                        and metadata.get("visibility") != MemoryVisibility.GROUP
+                    ):
+                        continue
+
                 best_uri = uri
                 best_similarity = similarity
+
+        if not query_succeeded:
+            return None
         return best_uri
 
     async def _run_recall_channel(

@@ -552,6 +552,22 @@ class WriteQualityTests(unittest.TestCase):
         )
         self.assertEqual(plugin._snapshot_user_text_length(snapshots), 5)
 
+    def test_snapshot_builder_renders_absolute_message_time(self):
+        plugin = plugin_main.MemoryPlugin.__new__(plugin_main.MemoryPlugin)
+        conversation = plugin._build_conversation_from_snapshots(
+            [
+                {
+                    "prompt": "明天开会",
+                    "response": "",
+                    "sender_id": "u1",
+                    "timestamp": 0,
+                }
+            ]
+        )
+
+        self.assertIn("[用户:u1]: 明天开会", conversation)
+        self.assertIn("[消息时间: 1970-01-01 00:00:00 UTC]", conversation)
+
         legacy = [{"prompt": "短问题", "response": "答" * 500, "sender_id": "u2"}]
         conversation = plugin._build_conversation_from_snapshots(legacy)
         self.assertIn("[用户:u2]: 短问题", conversation)

@@ -20,12 +20,14 @@ from real_stack import (
 
 from maintenance.llm import MaintenanceLLM
 from maintenance.memory_gate import (
+    GATE_CONTENT_MAX_CHARS,
     GATE_DURABLE_MIN_PROBABILITY,
     GATE_RISK_MAX_PROBABILITY,
     GateCandidate,
     LlmGenerateJudge,
     MaintenanceLLMJudge,
     MemoryGate,
+    _candidate_payload,
 )
 
 _APPROVED_PROBABILITIES = [0.95, 0.05, 0.05, 0.05]
@@ -66,6 +68,15 @@ class MemoryGateRealChainTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
+
+    def test_long_payload_keeps_tail(self):
+        tail = "尾部有效事实"
+        candidate = GateCandidate("c1", "前文" * GATE_CONTENT_MAX_CHARS + tail)
+
+        payload = _candidate_payload(candidate)
+
+        self.assertLessEqual(len(payload["content"]), GATE_CONTENT_MAX_CHARS)
+        self.assertIn(tail, payload["content"])
 
     async def test_decision_path_approves_and_rejects(self):
         candidates = [

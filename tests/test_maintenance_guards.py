@@ -726,7 +726,7 @@ class BudgetDeferredExecutionTests(unittest.IsolatedAsyncioTestCase):
         report.reviewer_verdicts = verdicts
         return report
 
-    async def test_budget_exhausted_ops_deferred_without_pending_or_ack(self):
+    async def test_budget_exhausted_ops_are_persisted_for_human_review(self):
         kv = _FakeKV()
         runner = self._runner(kv)
         runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 0}
@@ -740,10 +740,50 @@ class BudgetDeferredExecutionTests(unittest.IsolatedAsyncioTestCase):
         report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
         await runner._execute_operations(report)
         self.assertEqual(report.executed_ops, 1)
-        self.assertEqual(report.skipped_ops, 0)
-        self.assertNotIn("maintenance_pending_review", kv.store)
-        # 只有已执行的 op0 销账；预算耗尽项不执行、不入待审、不销账
-        self.assertEqual(runner._extract_journal.acknowledge.await_count, 1)
+        self.assertEqual(report.skipped_ops, 2)
+        self.assertEqual(len(kv.store["maintenance_pending_review"]), 2)
+        # 预算耗尽项进入待审队列，并在持久化成功后销账
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 3)
+
+    async def test_budget_tail_from_all_agent_manifests_is_persisted(self):
+        kv = _FakeKV()
+        runner = self._runner(kv)
+        runner._last_review_unresolved = {"budget_exhausted": 2, "invalid_output": 0}
+        runner._execute_operation = AsyncMock(return_value=True)
+        runner._extract_journal.acknowledge = AsyncMock()
+        report = MaintenanceReport(
+            session_id="s1",
+            extract_manifest=AgentManifest(
+                agent_type="extract",
+                parsed=True,
+                operations=[{"type": "create", "content": "c0"}],
+            ),
+            organizer_manifest=AgentManifest(
+                agent_type="organizer",
+                parsed=True,
+                operations=[{"type": "archive", "uri": "u://1"}],
+            ),
+            analyst_manifest=AgentManifest(
+                agent_type="analyst",
+                parsed=True,
+                operations=[
+                    {
+                        "type": "new_link",
+                        "source": "u://1",
+                        "target": "u://2",
+                    }
+                ],
+            ),
+            reviewer_verdicts=[{"index": 0, "verdict": "approve", "reason": "ok"}],
+        )
+
+        await runner._execute_operations(report)
+
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual(
+            {item["op"]["type"] for item in queue}, {"archive", "new_link"}
+        )
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 3)
 
     async def test_invalid_output_still_fails_closed_to_pending(self):
         kv = _FakeKV()
@@ -777,11 +817,11 @@ class BudgetDeferredExecutionTests(unittest.IsolatedAsyncioTestCase):
         ]
         report = self._report(ops, [{"index": 0, "verdict": "approve", "reason": "ok"}])
         await runner._execute_operations(report)
-        # 中间缺失（输出无效）转待审，尾部预算耗尽留待下周期
+        # 中间缺失（输出无效）与尾部预算耗尽都转入待审队列
         queue = kv.store["maintenance_pending_review"]
-        self.assertEqual(len(queue), 1)
+        self.assertEqual(len(queue), 3)
         self.assertEqual(queue[0]["op"]["uri"], "u://1")
-        self.assertEqual(runner._extract_journal.acknowledge.await_count, 2)
+        self.assertEqual(runner._extract_journal.acknowledge.await_count, 4)
 
 
 if __name__ == "__main__":

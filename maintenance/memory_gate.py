@@ -378,12 +378,24 @@ class MemoryGate:
         return outcomes
 
 
+def _clip_gate_text(text: str, limit: int) -> str:
+    """保留超长判定文本的开头和结尾，避免尾部事实被截掉。"""
+    if len(text) <= limit:
+        return text
+    marker = "\n...[中间内容已截断]...\n"
+    if len(marker) >= limit:
+        return text[:limit]
+    head = (limit - len(marker)) // 2
+    tail = limit - len(marker) - head
+    return text[:head] + marker + text[-tail:]
+
+
 def _candidate_payload(candidate: GateCandidate) -> dict[str, str]:
     """构造判定输入，截断超长内容与证据。"""
     return {
         "id": candidate.candidate_id,
-        "content": candidate.content[:GATE_CONTENT_MAX_CHARS],
-        "evidence": candidate.evidence[:GATE_EVIDENCE_MAX_CHARS],
+        "content": _clip_gate_text(candidate.content, GATE_CONTENT_MAX_CHARS),
+        "evidence": _clip_gate_text(candidate.evidence, GATE_EVIDENCE_MAX_CHARS),
     }
 
 

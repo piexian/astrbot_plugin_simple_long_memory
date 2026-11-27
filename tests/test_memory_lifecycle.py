@@ -208,6 +208,19 @@ class ScopedDedupTests(unittest.IsolatedAsyncioTestCase):
                 "b",
             )
             await vec_db.insert(
+                "用户喜欢咖啡",
+                {
+                    **base,
+                    "uri": "facts://shared",
+                    "memory_scope": "personal",
+                    "owner_user_id": "qq_u1",
+                    "owner_user_ids": ["qq_u1", "qq_u2"],
+                    "visibility": "group",
+                    "umo": "qq:group:g1",
+                },
+                "shared",
+            )
+            await vec_db.insert(
                 "群友都喜欢咖啡",
                 {
                     **base,
@@ -219,7 +232,7 @@ class ScopedDedupTests(unittest.IsolatedAsyncioTestCase):
                 "c",
             )
 
-            async def dedup(content, scope, session_id, umo, owner=""):
+            async def dedup(content, scope, session_id, umo, owner="", owners=None):
                 return await mgr.find_scoped_duplicate(
                     content=content,
                     memory_scope=scope,
@@ -227,6 +240,7 @@ class ScopedDedupTests(unittest.IsolatedAsyncioTestCase):
                     session_id=session_id,
                     umo=umo,
                     owner_user_id=owner,
+                    owner_user_ids=owners,
                     vec_db=vec_db,
                 )
 
@@ -234,6 +248,26 @@ class ScopedDedupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 await dedup("喜欢咖啡", "personal", "u1", "qq:private:u1", "qq_u1"),
                 "facts://a",
+            )
+            # 旧记录归属集合不足时，不能阻止新共同归属者写入
+            self.assertIsNone(
+                await dedup(
+                    "喜欢咖啡",
+                    "personal",
+                    "u1",
+                    "qq:private:u1",
+                    owners=["qq_u1", "qq_u3"],
+                )
+            )
+            self.assertEqual(
+                await dedup(
+                    "喜欢咖啡",
+                    "personal",
+                    "u1",
+                    "qq:private:u1",
+                    owners=["qq_u1", "qq_u2"],
+                ),
+                "facts://shared",
             )
             # 同文不同主不命中（不跨归属查重）
             self.assertIsNone(

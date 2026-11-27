@@ -24,7 +24,12 @@ from .agents.reviewer import ReviewerAgent
 from .extraction_journal import ExtractionJournal
 from .inbox import STATUS_PROCESSED, STATUS_SKIPPED
 from .llm import MaintenanceLLM
-from .memory_gate import GateCandidate, MemoryGate, build_maintenance_gate
+from .memory_gate import (
+    GATE_CONTENT_MAX_CHARS,
+    GateCandidate,
+    MemoryGate,
+    build_maintenance_gate,
+)
 from .persona import PersonaSummaryProvider
 from .verifier import MaintenanceVerifier, VerificationTask
 
@@ -581,9 +586,19 @@ class MaintenanceRunner:
                                 f"op[{i}] {op.get('type')}: {type(e).__name__}"
                             )
                         continue
-                    # 预算耗尽而未轮到审核：不执行、不入待审、不销账，留待下周期
+                    # 预算耗尽而未轮到审核：转入待审队列，避免操作丢失或阻塞提取日志
                     if reviewer_enabled and i >= budget_tail_start:
                         budget_deferred += 1
+                        pending_items.append(
+                            (
+                                op,
+                                {
+                                    "verdict": "pending",
+                                    "reason": "审核预算耗尽，转人工审核",
+                                },
+                            )
+                        )
+                        skipped += 1
                         continue
                     # 其余情况（破坏性操作，或审核员启用但裁决缺失）→ 转待审队列
                     reason = (
@@ -711,9 +726,11 @@ class MaintenanceRunner:
             logger.warning("[简单长期记忆] 提取阶段跳过: 缓冲表不可用")
             return manifest
 
+        segment_max_chars = int(self._config.get("maintenance_segment_max_chars", 8000))
+        collect_max_chars = min(max(64, segment_max_chars), GATE_CONTENT_MAX_CHARS)
         collect = await inbox.collect_blocks(
             gap_minutes=self._config.get("maintenance_segment_time_gap_minutes", 30),
-            max_chars=self._config.get("maintenance_segment_max_chars", 8000),
+            max_chars=collect_max_chars,
             min_user_chars=self._config.get("extraction_min_content_length", 150),
             max_blocks=self._config.get("maintenance_extract_max_blocks_per_cycle", 20),
             commit=not dry_run,

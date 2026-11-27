@@ -61,7 +61,7 @@ class ReviewerAgent:
     ) -> list[dict[str, Any]]:
         """逐条复核操作建议，返回 verdicts。
 
-        LLM 预算耗尽时提前返回；预算耗尽而未审的操作由宿主留待下周期，
+        LLM 预算耗尽时提前返回；未审操作由宿主持久化为待审，
         其余未产出裁决的操作由宿主 fail closed 转待审。
 
         Args:

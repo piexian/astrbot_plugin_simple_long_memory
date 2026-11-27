@@ -17,7 +17,12 @@ import json
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.provider import DecisionChoiceAnswer, DecisionChoiceQuestion
+
+try:  # AstrBot 4.30+ 提供 Decision Choice 类型
+    from astrbot.api.provider import DecisionChoiceAnswer, DecisionChoiceQuestion
+except ImportError:  # AstrBot 4.29 仅走 Chat 降级
+    DecisionChoiceAnswer = None  # type: ignore[assignment]
+    DecisionChoiceQuestion = None  # type: ignore[assignment]
 
 from ..llm import MaintenanceLLM
 from ..memory_gate import _DECISION_PROVIDER_TYPE
@@ -291,6 +296,8 @@ class AnalystAgent:
         self, mem_a: dict[str, Any], mem_b: dict[str, Any], cosine: float
     ) -> dict[str, Any] | None:
         """真实 Decision 四分类：单次问答同时问关系与 link 类型，计入预算。"""
+        if DecisionChoiceAnswer is None or DecisionChoiceQuestion is None:
+            return None
         questions = {
             "relation": DecisionChoiceQuestion(
                 instructions=(

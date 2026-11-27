@@ -1310,10 +1310,16 @@ class MemoryPlugin(Star):
         if not prompt_text:
             return
 
+        snapshot_timestamp = getattr(event, "created_at", None)
+        try:
+            snapshot_timestamp = float(snapshot_timestamp)
+        except (TypeError, ValueError):
+            snapshot_timestamp = time.time()
         snapshot: dict[str, Any] = {
             "prompt": prompt_text,
             "response": response_text[: self.MAX_SNAPSHOT_CHARS],
             "sender_id": sender_id,
+            "timestamp": snapshot_timestamp,
         }
 
         if turn_messages:
@@ -1422,8 +1428,8 @@ class MemoryPlugin(Star):
             return
         if not self.config.get("memory_consolidation_enabled", True):
             return
-        # 后台整理启用时禁用旧巩固，避免并发竞态（spec: 旧 consolidation 迁移）
-        if self.config.get("maintenance_enabled", False):
+        # 仅在新后台整理实际可用时禁用旧巩固，旧版保留旧路径。
+        if self.config.get("maintenance_enabled", False) and maintenance_supported():
             return
         min_age_days = _read_positive_int(
             self.config.get("consolidation_min_age_days", 14), 14
@@ -1522,13 +1528,24 @@ class MemoryPlugin(Star):
     def _build_conversation_from_snapshots(
         self, snapshots: list[dict[str, Any]]
     ) -> str:
-        """从快照列表构建对话文本（用户/助手标签隔离，助手长回复截断）"""
+        """从快照列表构建带消息时间的对话文本。"""
         assistant_limit = self.EXTRACTION_ASSISTANT_MAX_CHARS
 
         def _clip_assistant(text: str) -> str:
             if len(text) <= assistant_limit:
                 return text
             return text[:assistant_limit] + "…"
+
+        def _timestamp_suffix(value: Any) -> str:
+            if value in (None, ""):
+                return ""
+            try:
+                rendered = time.strftime(
+                    "%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(value))
+                )
+            except (OverflowError, OSError, TypeError, ValueError):
+                return ""
+            return f" [消息时间: {rendered}]"
 
         lines = []
         for snapshot in snapshots:
@@ -1539,21 +1556,25 @@ class MemoryPlugin(Star):
                     text = item.get("text", "")
                     if not text:
                         continue
+                    suffix = _timestamp_suffix(
+                        item.get("timestamp", snapshot.get("timestamp"))
+                    )
                     if role == "user":
                         sid = item.get("sender_id", "")
                         sender_label = f"用户:{sid}" if sid else "用户"
-                        lines.append(f"[{sender_label}]: {text}")
+                        lines.append(f"[{sender_label}]: {text}{suffix}")
                     elif role == "assistant":
-                        lines.append(f"[助手]: {_clip_assistant(text)}")
+                        lines.append(f"[助手]: {_clip_assistant(text)}{suffix}")
                 continue
             prompt = snapshot.get("prompt", "")
             response = snapshot.get("response", "")
             sender_id = snapshot.get("sender_id", "")
+            suffix = _timestamp_suffix(snapshot.get("timestamp"))
             if prompt:
                 sender_label = f"用户:{sender_id}" if sender_id else "用户"
-                lines.append(f"[{sender_label}]: {prompt}")
+                lines.append(f"[{sender_label}]: {prompt}{suffix}")
             if response:
-                lines.append(f"[助手]: {_clip_assistant(response)}")
+                lines.append(f"[助手]: {_clip_assistant(response)}{suffix}")
         return "\n".join(lines)
 
     @staticmethod
@@ -2135,6 +2156,10 @@ class MemoryPlugin(Star):
                 disclosure = mem.get("disclosure", "")
                 importance = mem.get("importance", 3)
                 owner_sender_ids = subjects if scope == MemoryScope.PERSONAL else []
+                owner_user_ids = [
+                    build_user_id(parsed_umo.platform_id, sender_id)
+                    for sender_id in owner_sender_ids
+                ]
 
                 if not content:
                     skipped_empty_count += 1
@@ -2148,11 +2173,8 @@ class MemoryPlugin(Star):
                     platform_id=parsed_umo.platform_id,
                     session_id=parsed_umo.session_id,
                     umo=event.unified_msg_origin,
-                    owner_user_id=(
-                        build_user_id(parsed_umo.platform_id, subjects[0])
-                        if scope == MemoryScope.PERSONAL and subjects
-                        else ""
-                    ),
+                    owner_user_id=owner_user_ids[0] if owner_user_ids else "",
+                    owner_user_ids=owner_user_ids,
                 )
                 if duplicate_uri:
                     skipped_duplicate_count += 1

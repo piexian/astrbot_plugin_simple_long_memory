@@ -604,6 +604,49 @@ class RunnerExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(journal_state["operations"]), 1)
         self.assertEqual(len(journal_state["block_rows"]), 1)
 
+    async def test_gate_splits_long_block_before_judging_the_tail(self):
+        inbox, _storage = await _real_inbox(self)
+        await inbox.ensure_table()
+        await _seed_turn(
+            inbox,
+            text="吵架无价值" * 300,
+            minutes_ago=90,
+        )
+        await _seed_turn(
+            inbox,
+            text="有效事实" * 200,
+            minutes_ago=80,
+        )
+        kv = _KVLog()
+
+        async def cur_run(blocks, max_llm_calls):
+            self.assertEqual(len(blocks), 1)
+            return {
+                "create": [_create_op(blocks[0])],
+                "update": [],
+                "notes": "",
+                "blocks_processed": 1,
+                "blocks_nothing": 0,
+                "llm_calls": 1,
+                "outcomes": [(blocks[0], "created")],
+            }
+
+        curator = SimpleNamespace(run=cur_run)
+        runner = self._runner(memory_mgr=_StoreMemoryMgr(inbox=inbox), kv=kv)
+        patches = self._patches(_MarkerGate(), curator)
+        self._context(patches)
+        try:
+            manifest = await runner._run_extraction(dry_run=False)
+        finally:
+            self._exit(patches)
+
+        self.assertEqual(manifest.metrics["blocks"], 2)
+        self.assertEqual(manifest.metrics["gate_rejected"], 1)
+        self.assertEqual(manifest.metrics["gate_approved"], 1)
+        counts = await inbox.status_counts()
+        self.assertEqual(counts.get("skipped"), 1)
+        self.assertEqual(counts.get("pending"), 1)
+
     async def test_nothing_outcome_marks_rows_processed(self):
         inbox, _storage = await _real_inbox(self)
         await inbox.ensure_table()
