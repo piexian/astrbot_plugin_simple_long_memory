@@ -131,6 +131,34 @@ class SegmenterAgent:
         mgr = getattr(self._context, "message_history_manager", None)
         return getattr(mgr, "db", None) if mgr is not None else None
 
+    async def _list_all_pmh_conversations(
+        self, since: datetime
+    ) -> list[tuple[str, str]]:
+        """枚举 since 之后存在任意 PMH 记录（含已停用行）的会话，防止非活跃历史经由 conv2 回退重入。"""
+        db = self._history_db()
+        if db is None:
+            return []
+        try:
+            from astrbot.core.db.po import PlatformMessageHistory
+            from sqlmodel import select
+
+            if getattr(PlatformMessageHistory, "is_active", None) is None:
+                return []
+            async with db.get_db() as session:
+                stmt = (
+                    select(
+                        PlatformMessageHistory.platform_id,
+                        PlatformMessageHistory.user_id,
+                    )
+                    .where(PlatformMessageHistory.created_at >= self._naive(since))
+                    .distinct()
+                )
+                rows = (await session.execute(stmt)).all()
+                return [(str(r[0]), str(r[1])) for r in rows]
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 分段员读取全部 PMH 会话失败: {e}")
+            return []
+
     async def _list_active_conversations(
         self, since: datetime
     ) -> list[tuple[str, str]]:
@@ -271,6 +299,9 @@ class SegmenterAgent:
             [] if history_db_missing else await self._list_active_conversations(since)
         )
         pmh_keys = {f"{p}:{u}" for p, u in conversations}
+        if not history_db_missing and self._conv2_enabled:
+            all_pmh_convs = await self._list_all_pmh_conversations(since)
+            pmh_keys.update(f"{p}:{u}" for p, u in all_pmh_convs)
         pmh_resume = {
             key for key, value in cursors.items() if value.get("source") != "conv2"
         } | {key for key, value in carries.items() if not value.get("start_anchor")}

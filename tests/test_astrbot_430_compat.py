@@ -188,6 +188,27 @@ class DefaultProviderResolutionTests(unittest.TestCase):
             "prov-cfg-only",
         )
 
+    def test_live_config_overrides_stale_startup_default_chat_provider_id(self):
+        prov_a = SimpleNamespace(meta=lambda: SimpleNamespace(id="model-a"))
+        prov_b = SimpleNamespace(meta=lambda: SimpleNamespace(id="model-b"))
+        live_config = {
+            "agent": {
+                "runtime": "astrbot",
+                "config": {"model": {"provider_id": "model-b"}},
+            }
+        }
+        ctx = SimpleNamespace(
+            get_config=lambda: live_config,
+            provider_manager=SimpleNamespace(
+                default_chat_provider_id="model-a",
+                inst_map={"model-a": prov_a, "model-b": prov_b},
+                curr_provider_inst=prov_a,
+                provider_insts=[prov_a, prov_b],
+            ),
+        )
+        llm = MaintenanceLLM(context=ctx, cache_enabled=False)
+        self.assertEqual(llm._resolve_default_provider(), "model-b")
+
 
 class WakeupAndAgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthetic_wakeup_skips_contact_injection_and_extraction(self):
@@ -445,23 +466,274 @@ class WakeupAndAgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def test_collect_turn_messages_recovers_after_in_turn_compaction(self):
         original_anchor = _FakeMessage("user", "初始问题")
         run_state = {"start_len": 10, "anchor": original_anchor}
-        # 模拟轮内上下文压缩替换了原始消息列表，即使列表随后增长超过 start_len 也能正确找到本轮增量
+        # 模拟轮内上下文压缩替换了原始消息列表，并验证字典形态的 _turn_continuation
         compacted_messages = [
-            _FakeMessage("system", "历史摘要"),
-            _FakeMessage("user", "初始问题"),
-            _FakeMessage("assistant", [_FakePart("text", "第一段回复")]),
-            _FakeMessage(
-                "user",
-                [_FakePart("text", "追加限制条件")],
-                turn_continuation=True,
-            ),
-            _FakeMessage("assistant", [_FakePart("text", "第二段回复")]),
+            {"role": "system", "content": "历史摘要"},
+            {"role": "user", "content": "初始问题"},
+            {"role": "assistant", "content": [{"type": "text", "text": "第一段回复"}]},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "追加限制条件"}],
+                "_turn_continuation": True,
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "第二段回复"}]},
         ]
         rc = SimpleNamespace(messages=compacted_messages)
 
-        steered, replies = plugin_main._collect_turn_messages(rc, run_state)
-        self.assertEqual(steered, ["追加限制条件"])
-        self.assertEqual(replies, ["第一段回复", "第二段回复"])
+        turn_messages = plugin_main._collect_turn_messages(rc, run_state)
+        self.assertEqual(
+            turn_messages,
+            [
+                ("assistant", "第一段回复"),
+                ("user", "追加限制条件"),
+                ("assistant", "第二段回复"),
+            ],
+        )
+
+    def test_subagent_results_and_interruption_messages_are_filtered(self):
+        anchor = _FakeMessage("user", "帮我调研一下")
+        run_state = {"start_len": 1, "anchor": anchor}
+        rc = SimpleNamespace(
+            run_end_reason="cancelled",
+            messages=[
+                anchor,
+                _FakeMessage("assistant", [_FakePart("text", "正在安排调研")]),
+                _FakeMessage(
+                    "user",
+                    [
+                        _FakePart(
+                            "text",
+                            "<system_reminder>\n[Subagent results]\n"
+                            "[subagent-result:a1:t1]\n"
+                            '[{"summary": "子代理结论"}]\n'
+                            "</system_reminder>",
+                        )
+                    ],
+                    turn_continuation=True,
+                ),
+                _FakeMessage(
+                    "user",
+                    [
+                        _FakePart(
+                            "text",
+                            "<system_reminder>\n[Subagent results]\n"
+                            "internal\n</system_reminder>",
+                        ),
+                        _FakePart("text", "顺便重点看性能数据"),
+                    ],
+                    turn_continuation=True,
+                ),
+                _FakeMessage("user", [_FakePart("text", "Stop output.")]),
+                _FakeMessage("assistant", [_FakePart("text", "Output stopped.")]),
+            ],
+        )
+
+        turn_messages = plugin_main._collect_turn_messages(rc, run_state)
+        self.assertEqual(
+            turn_messages,
+            [
+                ("assistant", "正在安排调研"),
+                ("user", "顺便重点看性能数据"),
+            ],
+        )
+
+    async def test_err_response_with_non_empty_text_is_not_recorded_or_counted(self):
+        plugin = _make_plugin(
+            config={"extraction_interval": 1, "extraction_min_content_length": 1},
+            memory_mgr=SimpleNamespace(),
+        )
+        event = _Event(umo="qq:FriendMessage:u1", sender_id="u1")
+        plugin._accumulate_request_snapshot(
+            event, SimpleNamespace(prompt="今天天气怎么样", contexts=[])
+        )
+        rc = SimpleNamespace(
+            context=SimpleNamespace(is_subagent=False, event=event),
+            messages=[_FakeMessage("user", "今天天气怎么样")],
+            run_end_reason="error",
+        )
+        await plugin.on_agent_begin(event, rc)
+        await plugin.on_agent_done(
+            event,
+            rc,
+            SimpleNamespace(
+                role="err",
+                completion_text="All available chat models are unavailable.",
+            ),
+        )
+
+        self.assertEqual(plugin._session_counters, {})
+        self.assertEqual(
+            plugin._request_snapshots["qq:FriendMessage:u1"]["snapshots"], []
+        )
+        self.assertIsNone(
+            plugin._request_snapshots["qq:FriendMessage:u1"]["pending_prompt"]
+        )
+
+    async def test_steering_preserves_order_and_deidentifies_group_followups(self):
+        extracted_prompts: list[str] = []
+
+        async def fake_llm_generate(*, chat_provider_id: str, prompt: str):
+            extracted_prompts.append(prompt)
+            return SimpleNamespace(completion_text="[]")
+
+        ctx = SimpleNamespace(
+            get_config=lambda umo=None: {},
+            llm_generate=AsyncMock(side_effect=fake_llm_generate),
+        )
+        memory_mgr = SimpleNamespace(
+            is_kb_connected=False,
+            observe_contact=AsyncMock(return_value=True),
+            get_contact_summary=AsyncMock(return_value=""),
+            has_any_active_memory=AsyncMock(return_value=False),
+            store_memory=AsyncMock(),
+        )
+        plugin = _make_plugin(
+            config={"extraction_interval": 1, "extraction_min_content_length": 1},
+            context=ctx,
+            memory_mgr=memory_mgr,
+        )
+        plugin._get_llm_provider_id = AsyncMock(return_value="p1")
+
+        # 群聊场景：保持轮内先后顺序，且 Steering 追问不沿用发起人 sender_id
+        group_event = _Event(umo="qq:GroupMessage:g1", sender_id="u1")
+        await plugin.inject_memories(
+            group_event, SimpleNamespace(prompt="帮我规划一下方案", contexts=[])
+        )
+        anchor = _FakeMessage("user", "帮我规划一下方案")
+        group_rc = SimpleNamespace(
+            context=SimpleNamespace(is_subagent=False, event=group_event),
+            messages=[anchor],
+            run_end_reason="completed",
+        )
+        await plugin.on_agent_begin(group_event, group_rc)
+        group_rc.messages.extend(
+            [
+                _FakeMessage("assistant", [_FakePart("text", "我会按方案 A 规划")]),
+                _FakeMessage(
+                    "user",
+                    [_FakePart("text", "不要这个，换另一个")],
+                    turn_continuation=True,
+                ),
+                _FakeMessage("assistant", [_FakePart("text", "那就采用方案 B")]),
+            ]
+        )
+        await plugin.on_agent_done(
+            group_event,
+            group_rc,
+            SimpleNamespace(role="assistant", completion_text="那就采用方案 B"),
+        )
+
+        self.assertEqual(len(extracted_prompts), 1)
+        group_conv = extracted_prompts[0]
+        pos_init = group_conv.index("[用户:u1]: 帮我规划一下方案")
+        pos_a = group_conv.index("[助手]: 我会按方案 A 规划")
+        pos_steer = group_conv.index("[用户]: 不要这个，换另一个")
+        pos_b = group_conv.index("[助手]: 那就采用方案 B")
+        self.assertTrue(pos_init < pos_a < pos_steer < pos_b)
+        self.assertNotIn("[用户:u1]: 不要这个，换另一个", group_conv)
+
+        # 私聊场景：追问保留同一用户 sender_id 并保持时间顺序
+        private_event = _Event(umo="qq:FriendMessage:u1", sender_id="u1")
+        await plugin.inject_memories(
+            private_event, SimpleNamespace(prompt="推荐一本书", contexts=[])
+        )
+        p_anchor = _FakeMessage("user", "推荐一本书")
+        p_rc = SimpleNamespace(
+            context=SimpleNamespace(is_subagent=False, event=private_event),
+            messages=[p_anchor],
+            run_end_reason="completed",
+        )
+        await plugin.on_agent_begin(private_event, p_rc)
+        p_rc.messages.extend(
+            [
+                _FakeMessage("assistant", [_FakePart("text", "先推荐科幻类")]),
+                _FakeMessage(
+                    "user",
+                    [_FakePart("text", "换成历史类")],
+                    turn_continuation=True,
+                ),
+                _FakeMessage("assistant", [_FakePart("text", "推荐《万历十五年》")]),
+            ]
+        )
+        await plugin.on_agent_done(
+            private_event,
+            p_rc,
+            SimpleNamespace(role="assistant", completion_text="推荐《万历十五年》"),
+        )
+
+        self.assertEqual(len(extracted_prompts), 2)
+        priv_conv = extracted_prompts[1]
+        self.assertIn("[用户:u1]: 换成历史类", priv_conv)
+        self.assertLess(
+            priv_conv.index("[助手]: 先推荐科幻类"),
+            priv_conv.index("[用户:u1]: 换成历史类"),
+        )
+
+    async def test_overlapping_turns_isolate_pending_snapshots_and_clear(self):
+        plugin = _make_plugin(
+            config={"extraction_interval": 10}, memory_mgr=SimpleNamespace()
+        )
+        ev_a = _Event(umo="qq:GroupMessage:g1", sender_id="u1")
+        ev_b = _Event(umo="qq:GroupMessage:g1", sender_id="u2")
+
+        plugin._accumulate_request_snapshot(
+            ev_a, SimpleNamespace(prompt="请求 A", contexts=[])
+        )
+        plugin._accumulate_request_snapshot(
+            ev_b, SimpleNamespace(prompt="请求 B", contexts=[])
+        )
+
+        # 取消 A 不应清除仍在进行的 B 的待匹配请求
+        plugin._clear_pending_snapshot(ev_a)
+        self.assertEqual(
+            plugin._request_snapshots["qq:GroupMessage:g1"]["pending_prompt"], "请求 B"
+        )
+
+        plugin._complete_snapshot_with_response(ev_b, "回复 B")
+        snaps = plugin._request_snapshots["qq:GroupMessage:g1"]["snapshots"]
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["prompt"], "请求 B")
+        self.assertEqual(snaps[0]["response"], "回复 B")
+        self.assertEqual(snaps[0]["sender_id"], "u2")
+
+        # 两次重叠轮次错序完成时，各自匹配自己的提问
+        ev_c = _Event(umo="qq:GroupMessage:g2", sender_id="u1")
+        ev_d = _Event(umo="qq:GroupMessage:g2", sender_id="u2")
+        plugin._accumulate_request_snapshot(
+            ev_c, SimpleNamespace(prompt="请求 C", contexts=[])
+        )
+        plugin._accumulate_request_snapshot(
+            ev_d, SimpleNamespace(prompt="请求 D", contexts=[])
+        )
+        plugin._complete_snapshot_with_response(ev_c, "回复 C")
+        plugin._complete_snapshot_with_response(ev_d, "回复 D")
+        snaps_g2 = plugin._request_snapshots["qq:GroupMessage:g2"]["snapshots"]
+        self.assertEqual(
+            [(s["prompt"], s["response"], s["sender_id"]) for s in snaps_g2],
+            [("请求 C", "回复 C", "u1"), ("请求 D", "回复 D", "u2")],
+        )
+
+    def test_unweakrefable_event_tracking_uses_object_identity(self):
+        class _SlottedEvent:
+            __slots__ = ("name",)
+
+            def __init__(self, name: str):
+                self.name = name
+
+        plugin = _make_plugin()
+        ev1 = _SlottedEvent("first")
+        ev2 = _SlottedEvent("second")
+
+        plugin_main._mark_agent_managed_event(plugin, ev1)
+        plugin_main._set_agent_run_state(plugin, ev1, {"start_len": 3, "anchor": None})
+
+        self.assertTrue(plugin_main._is_agent_managed_event(plugin, ev1))
+        self.assertFalse(plugin_main._is_agent_managed_event(plugin, ev2))
+        self.assertEqual(
+            plugin_main._pop_agent_run_state(plugin, ev1),
+            {"start_len": 3, "anchor": None},
+        )
+        self.assertIsNone(plugin_main._pop_agent_run_state(plugin, ev1))
 
 
 class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
@@ -491,11 +763,12 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_review_notification_imports_message_chain_from_api_event(self):
         sent: list[tuple[str, object]] = []
+        unset = object()
 
         class _MessageChain:
             def __init__(self, chain):
                 self.chain = chain
-                self.markdown = None
+                self.markdown = unset
 
             def use_markdown(self, value: bool):
                 self.markdown = value
@@ -536,7 +809,7 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent), 1)
         umo, msg = sent[0]
         self.assertEqual(umo, "qq:FriendMessage:admin")
-        self.assertFalse(msg.markdown)
+        self.assertIs(msg.markdown, False)
         self.assertIn("3 条争议操作", msg.chain[0].text)
 
 
@@ -610,6 +883,26 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(convs, [("webchat", "s-mixed")])
         self.assertEqual([r.id for r in rows], [3])
 
+        # 仅有非活跃 PMH 行的会话也不应通过 ConversationV2 回退重新进入提取
+        conv2_seen: list[str] = []
+
+        async def fake_collect_conv2(conv, platform_id, user_id, *args, **kwargs):
+            conv2_seen.append(f"{platform_id}:{user_id}")
+
+        seg._list_conv2_conversations = AsyncMock(
+            return_value=[
+                SimpleNamespace(platform_id="webchat", user_id="s-inactive"),
+                SimpleNamespace(platform_id="webchat", user_id="s-conv2-only"),
+            ]
+        )
+        seg._collect_conv2_conversation = AsyncMock(side_effect=fake_collect_conv2)
+        seg._fetch_all = AsyncMock(return_value=[])
+
+        with patch.dict(sys.modules, {"astrbot.core.db.po": po_mod}):
+            await seg.collect_blocks(max_llm_calls=5)
+
+        self.assertEqual(conv2_seen, ["webchat:s-conv2-only"])
+
     async def test_analyst_extracts_plain_text_from_structured_content_parts(self):
         history = [
             {
@@ -643,6 +936,8 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("内部思考", text)
         self.assertNotIn("SECRET_SIG", text)
         self.assertNotIn("<temp>", text)
+        self.assertNotIn("data:...", text)
+        self.assertNotIn("image_url", text)
 
 
 class MetadataAndI18nSchemaTests(unittest.TestCase):

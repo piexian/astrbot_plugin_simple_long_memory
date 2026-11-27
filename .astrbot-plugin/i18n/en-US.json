@@ -215,16 +215,16 @@
     },
     "review_notify_umo": {
       "description": "Notification Target UMO",
-      "hint": "Select or enter the group or private chat unified_msg_origin; leave empty to notify the last admin who ran a management command"
+      "hint": "Select or enter the group or private chat unified_msg_origin for review notifications; leave empty to disable proactive notifications"
     },
     "review_notify_schedule": {
-      "description": "Notification Schedule",
-      "hint": "daily = fixed time every day, weekly = fixed weekday, monthly = fixed day of month",
+      "description": "Notification Schedule (Reserved)",
+      "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than on a schedule",
       "labels": ["Daily", "Weekly", "Monthly"]
     },
     "review_notify_time": {
-      "description": "Notification Time",
-      "hint": "HH:MM for daily, weekday:HH:MM such as mon:10:00 for weekly, or day:HH:MM such as 1:10:00 for monthly"
+      "description": "Notification Time (Reserved)",
+      "hint": "Reserved for compatibility: notifications are currently sent when new controversial operations are queued rather than at a fixed time"
     },
     "maintenance_pending_queue_max": {
       "description": "Pending Review Queue Limit",

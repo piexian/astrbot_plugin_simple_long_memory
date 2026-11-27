@@ -208,15 +208,7 @@ class MaintenanceLLM:
                 return ""
             return candidate
 
-        try:
-            default_id = _usable(
-                getattr(provider_manager, "default_chat_provider_id", "")
-            )
-            if default_id:
-                return default_id
-        except Exception:
-            pass
-
+        # 优先读取实时配置，避免控制台热切换默认模型后仍命中启动时缓存的旧模型 ID
         try:
             get_config = getattr(self._context, "get_config", None)
             config = (
@@ -271,6 +263,15 @@ class MaintenanceLLM:
                     )
                     if default_id:
                         return default_id
+        except Exception:
+            pass
+
+        try:
+            default_id = _usable(
+                getattr(provider_manager, "default_chat_provider_id", "")
+            )
+            if default_id:
+                return default_id
         except Exception:
             pass
 
