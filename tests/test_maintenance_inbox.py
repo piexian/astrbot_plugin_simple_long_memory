@@ -151,6 +151,17 @@ class InboxAggregationTests(unittest.IsolatedAsyncioTestCase):
         counts2 = await inbox2.status_counts()
         self.assertEqual(counts2.get("pending"), 1)  # dry-run 不写行状态
 
+    async def test_size_split_tail_bypasses_short_filter(self):
+        inbox = await self._inbox()
+        await self._append(inbox, minutes_ago=60, text="聊" * 200)
+        await self._append(inbox, minutes_ago=59, text="尾" * 10)
+
+        result = await self._collect(inbox, max_chars=300, min_user_chars=50)
+
+        self.assertEqual(len(result["blocks"]), 2)
+        self.assertEqual(result["blocks"][1].row_ids, [2])
+        self.assertEqual(result["stats"]["blocks_skipped_short"], 0)
+
     async def test_block_text_keeps_sender_labels_and_realtime_flag(self):
         inbox = await self._inbox()
         text = "用户喜欢美式咖啡，每天早上都要喝两杯，周末还会去店里手冲单品豆，最近换了深烘的肯尼亚豆，还说以后想学着自己在家里烘豆子。"

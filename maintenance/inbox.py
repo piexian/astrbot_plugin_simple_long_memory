@@ -295,8 +295,8 @@ class MaintenanceInbox:
     ) -> dict[str, Any]:
         """按 (umo, conversation_id) 分组做纯规则切块，返回对话块与统计。
 
-        commit 为 False（dry-run）时不写任何行状态；短块与无效 UMO 行在
-        commit 模式下直接标 skipped，不消耗任何 LLM 预算。
+        commit 为 False（dry-run）时不写任何行状态；普通短块与无效 UMO 行在
+        commit 模式下直接标 skipped，字符上限切开的块仍交给闸门判定。
         """
         stats: dict[str, Any] = {
             "rows_fetched": 0,
@@ -350,7 +350,8 @@ class MaintenanceInbox:
             if hold_last:
                 blocks = blocks[:-1]
                 stats["blocks_held_quiet"] += 1
-            for block_rows in blocks:
+            size_split_blocks = self._size_split_blocks(blocks, gap)
+            for block_index, block_rows in enumerate(blocks):
                 if len(result["blocks"]) >= max(1, int(max_blocks)):
                     stats["block_cap_reached"] = True
                     logger.info(
@@ -359,7 +360,10 @@ class MaintenanceInbox:
                     )
                     break
                 block = self._build_block(group_rows[0], block_rows)
-                if block.user_chars < max(0, int(min_user_chars)):
+                if (
+                    block.user_chars < max(0, int(min_user_chars))
+                    and block_index not in size_split_blocks
+                ):
                     stats["blocks_skipped_short"] += 1
                     skipped_ids.extend(row.id for row in block_rows)
                     continue
@@ -549,6 +553,17 @@ class MaintenanceInbox:
         except Exception as e:
             logger.warning(f"[简单长期记忆] 缓冲表读取失败: {type(e).__name__}")
             return []
+
+    @staticmethod
+    def _size_split_blocks(blocks: list[list[_InboxRow]], gap: timedelta) -> set[int]:
+        """返回由字符上限切开的块索引，不放宽时间间隙短块过滤。"""
+        size_split: set[int] = set()
+        for index in range(1, len(blocks)):
+            previous = blocks[index - 1][-1]
+            first = blocks[index][0]
+            if first.created_at - previous.created_at <= gap:
+                size_split.update((index - 1, index))
+        return size_split
 
     @staticmethod
     def _split_group(

@@ -271,6 +271,28 @@ class ReviewViewRealStackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive", text)
         self.assertIn("/memory review approve <id>", text)
 
+    async def test_overflow_is_visible_and_clearable(self):
+        await self._seed_queue()
+        await self.plugin.put_kv_data(
+            "maintenance_pending_review_overflow",
+            [{"op": {"type": "archive", "uri": "facts://overflow"}}],
+        )
+
+        listed = await self._collect(
+            self.plugin.cmd_review(self._admin_event(message_str="memory review list"))
+        )
+        self.assertIn("1 条操作等待队列容量释放", listed[0].chain[0].text)
+
+        cleared = await self._collect(
+            self.plugin.cmd_review(self._admin_event(message_str="memory review clear"))
+        )
+        self.assertIn("溢出暂存已清空", cleared[0].chain[0].text)
+        self.assertEqual(await self._queue(), [])
+        self.assertEqual(
+            await self.plugin.get_kv_data("maintenance_pending_review_overflow", None),
+            [],
+        )
+
     async def test_ui_action_non_admin_is_rejected(self):
         op = {
             "type": "create",

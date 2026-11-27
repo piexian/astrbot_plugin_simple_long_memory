@@ -2895,9 +2895,18 @@ class MemoryPlugin(Star):
 
         if action == "list":
             queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            overflow = (
+                await self.get_kv_data("maintenance_pending_review_overflow", None)
+                or []
+            )
             pending = [q for q in queue if q.get("status") == "pending"]
             if not pending:
-                yield event.plain_result("✅ 无待审争议项")
+                if overflow:
+                    yield event.plain_result(
+                        f"✅ 当前无待审争议项，另有 {len(overflow)} 条操作等待队列容量释放"
+                    )
+                else:
+                    yield event.plain_result("✅ 无待审争议项")
                 return
             lines = [f"📝 待审争议 ({len(pending)} 条)："]
             for item in pending:
@@ -2905,6 +2914,10 @@ class MemoryPlugin(Star):
                     f"#{item['id']} [{item.get('op_type', '?')}] "
                     f"{item.get('verdict_reason', '')} "
                     f"({item.get('created_at', '')})"
+                )
+            if overflow:
+                lines.append(
+                    f"\n另有 {len(overflow)} 条操作等待队列容量释放后自动进入待审"
                 )
             lines.append("\n/memory review approve <id> 批准")
             lines.append("/memory review reject <id> 废案")
@@ -2924,7 +2937,8 @@ class MemoryPlugin(Star):
         elif action == "clear":
             async with self._review_lock:
                 await self.put_kv_data("maintenance_pending_review", [])
-            yield event.plain_result("✅ 待审队列已清空")
+                await self.put_kv_data("maintenance_pending_review_overflow", [])
+            yield event.plain_result("✅ 待审队列及溢出暂存已清空")
 
         elif action in ("approve", "reject"):
             if len(args) < 2:

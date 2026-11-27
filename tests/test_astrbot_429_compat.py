@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
+
+from maintenance.version_gate import parse_release_tuple
 
 
 class AstrBot429ImportTests(TestCase):
@@ -39,8 +41,11 @@ class LegacyMaintenanceFallbackTests(IsolatedAsyncioTestCase):
         plugin._last_consolidation = 0.0
         plugin._get_llm_provider_id = AsyncMock(return_value=None)
         event = SimpleNamespace(unified_msg_origin="qq:FriendMessage:u1")
-
-        with patch.object(main_module, "maintenance_supported", return_value=False):
-            await plugin._maybe_consolidate_memories(event)
+        astrbot = importlib.import_module("astrbot")
+        version = str(getattr(astrbot, "__version__", ""))
+        if parse_release_tuple(version) != (4, 29, 4):
+            self.skipTest(f"requires AstrBot 4.29.4, got {version}")
+        self.assertFalse(main_module.maintenance_supported())
+        await plugin._maybe_consolidate_memories(event)
 
         fetch_candidates.assert_awaited_once_with(event, 14, 1, 30)

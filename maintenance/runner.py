@@ -1153,77 +1153,151 @@ class MaintenanceRunner:
         items: list[tuple[dict[str, Any], dict[str, Any]]],
         session_id: str,
     ) -> set[str]:
-        """周期结束批量写入待审队列：单次 KV 读写 + 签名去重 + 终态清理 + pending 容量上限 + 单调 id。"""
-        if not items or not self._kv_put or not self._kv_get:
+        """批量写入待审队列，并保存容量溢出的非提取操作。"""
+        if not self._kv_put or not self._kv_get:
             return set()
         try:
             import time as _time
 
             queue = await self._kv_get("maintenance_pending_review", None) or []
-            # A prior queue write may have succeeded before its journal acknowledgement.
+            raw_overflow = (
+                await self._kv_get("maintenance_pending_review_overflow", None) or []
+            )
+            if not isinstance(queue, list):
+                queue = []
+            if not isinstance(raw_overflow, list):
+                raw_overflow = []
+            overflow = [
+                entry
+                for entry in raw_overflow
+                if isinstance(entry, dict) and isinstance(entry.get("op"), dict)
+            ]
+
             settled_sigs = {
                 it.get("op_signature") or self._op_signature(it["op"])
                 for it in queue
-                if it.get("status") in {"approved", "rejected"}
+                if isinstance(it, dict)
+                and it.get("status") in {"approved", "rejected"}
+                and isinstance(it.get("op"), dict)
                 and it.get("op", {}).get("_extract_id")
             }
-
-            # 单调递增 id：从原始队列取最大 id 作为下限，清理终态后 id 不复用，
-            # 避免与管理员已见条目撞号
-            max_seen_id = max((it.get("id", 0) for it in queue), default=0)
+            max_seen_id = max(
+                (it.get("id", 0) for it in queue if isinstance(it, dict)),
+                default=0,
+            )
             seq = await self._kv_get("maintenance_pending_review_seq", None)
             if not isinstance(seq, int) or seq < max_seen_id:
                 seq = max_seen_id
 
-            # 清理终态条目（approved/rejected/failed），只保留 pending
-            pruned = sum(1 for it in queue if it.get("status") != "pending")
+            pruned = sum(
+                1
+                for it in queue
+                if not isinstance(it, dict) or it.get("status") != "pending"
+            )
             if pruned:
-                queue = [it for it in queue if it.get("status") == "pending"]
+                queue = [
+                    it
+                    for it in queue
+                    if isinstance(it, dict) and it.get("status") == "pending"
+                ]
 
             existing_sigs = {
                 it.get("op_signature") or self._op_signature(it.get("op", {}))
                 for it in queue
             } | settled_sigs
-            queue_max = self._config.get("maintenance_pending_queue_max", 500)
-
+            overflow_sigs = {self._op_signature(entry["op"]) for entry in overflow}
+            queue_max = max(
+                1, int(self._config.get("maintenance_pending_queue_max", 500))
+            )
             added = 0
+            drained = 0
             deduped = 0
-            dropped = 0
-            for op, verdict in items:
-                sig = self._op_signature(op)
-                if sig in existing_sigs:
-                    deduped += 1
-                    continue
-                # 容量只统计 pending（此处队列已清理终态，len 即 pending 数）
-                if len(queue) >= queue_max:
-                    dropped += 1
-                    continue
+            journal_deferred = 0
+            overflow_kept: list[dict[str, Any]] = []
+
+            def append_queue(
+                op: dict[str, Any],
+                verdict: dict[str, Any],
+                item_session_id: str,
+            ) -> None:
+                nonlocal added, seq
                 seq += 1
                 queue.append(
                     {
                         "id": seq,
-                        "session_id": session_id,
+                        "session_id": item_session_id,
                         "op_type": op.get("type", ""),
                         "op": op,
-                        "op_signature": sig,
+                        "op_signature": self._op_signature(op),
                         "verdict_reason": verdict.get("reason", ""),
                         "controversial": verdict.get("controversial", False),
                         "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": "pending",  # pending / approved / rejected
+                        "status": "pending",
                     }
                 )
-                existing_sigs.add(sig)
                 added += 1
 
+            for entry in overflow:
+                op = entry["op"]
+                sig = self._op_signature(op)
+                if sig in existing_sigs:
+                    continue
+                if op.get("_extract_id") or len(queue) >= queue_max:
+                    overflow_kept.append(entry)
+                    continue
+                append_queue(
+                    op,
+                    entry.get("verdict")
+                    if isinstance(entry.get("verdict"), dict)
+                    else {},
+                    str(entry.get("session_id") or session_id),
+                )
+                existing_sigs.add(sig)
+                overflow_sigs.discard(sig)
+                drained += 1
+
+            for op, verdict in items:
+                sig = self._op_signature(op)
+                if sig in existing_sigs or sig in overflow_sigs:
+                    deduped += 1
+                    continue
+                if len(queue) >= queue_max:
+                    if op.get("_extract_id"):
+                        # ExtractionJournal remains the retry source for extraction ops.
+                        journal_deferred += 1
+                    else:
+                        overflow_kept.append(
+                            {
+                                "session_id": session_id,
+                                "op": op,
+                                "verdict": verdict,
+                            }
+                        )
+                        overflow_sigs.add(sig)
+                    continue
+                append_queue(op, verdict, session_id)
+                existing_sigs.add(sig)
+
+            overflow_changed = overflow_kept != raw_overflow
             if added or pruned:
                 await self._kv_put("maintenance_pending_review", queue)
             if added:
                 await self._kv_put("maintenance_pending_review_seq", seq)
-            logger.info(
-                f"[简单长期记忆] 待审入队: 新增 {added}, 去重跳过 {deduped}, "
-                f"队列满丢弃 {dropped}, 清理终态 {pruned}, 当前待审 {len(queue)} 条"
-            )
-            # 待审通知推送（每周期最多一次）
+            if overflow_changed:
+                await self._kv_put("maintenance_pending_review_overflow", overflow_kept)
+
+            if items or overflow or pruned:
+                logger.info(
+                    "[简单长期记忆] 待审入队: 新增 %s, 溢出转存 %s, "
+                    "队列满保留 %s, 提取日志保留 %s, 去重跳过 %s, 清理终态 %s, 当前待审 %s",
+                    added,
+                    drained,
+                    len(overflow_kept),
+                    journal_deferred,
+                    deduped,
+                    pruned,
+                    len(queue),
+                )
             if added and self._config.get("review_notify_enabled", True):
                 await self._send_review_notification(len(queue))
             return existing_sigs

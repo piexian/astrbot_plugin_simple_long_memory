@@ -418,7 +418,7 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-memory-body", output)
         self.assertIn("error_type=RuntimeError", output)
 
-    async def test_queue_max_drops_overflow(self):
+    async def test_queue_max_persists_overflow(self):
         kv = _FakeKV()
         runner = self._runner(kv, {"maintenance_pending_queue_max": 2})
         items = [
@@ -427,6 +427,27 @@ class PendingFlushTests(unittest.IsolatedAsyncioTestCase):
         await runner._flush_pending_review(items, "s1")
         queue = kv.store["maintenance_pending_review"]
         self.assertEqual(len(queue), 2)
+        overflow = kv.store["maintenance_pending_review_overflow"]
+        self.assertEqual(len(overflow), 3)
+        self.assertEqual(
+            [entry["op"]["uri"] for entry in overflow], ["u://2", "u://3", "u://4"]
+        )
+
+    async def test_queue_overflow_drains_after_capacity_frees(self):
+        kv = _FakeKV()
+        runner = self._runner(kv, {"maintenance_pending_queue_max": 1})
+        items = [
+            ({"type": "archive", "uri": "u://1"}, {"reason": "x"}),
+            ({"type": "archive", "uri": "u://2"}, {"reason": "x"}),
+        ]
+
+        await runner._flush_pending_review(items, "s1")
+        kv.store["maintenance_pending_review"][0]["status"] = "approved"
+        await runner._flush_pending_review([], "s2")
+
+        queue = kv.store["maintenance_pending_review"]
+        self.assertEqual([item["op"]["uri"] for item in queue], ["u://2"])
+        self.assertEqual(kv.store["maintenance_pending_review_overflow"], [])
 
     async def test_capacity_counts_pending_only(self):
         kv = _FakeKV()

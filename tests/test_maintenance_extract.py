@@ -609,12 +609,12 @@ class RunnerExtractionTests(unittest.IsolatedAsyncioTestCase):
         await inbox.ensure_table()
         await _seed_turn(
             inbox,
-            text="吵架无价值" * 300,
+            text="吵架无价值" * 400,
             minutes_ago=90,
         )
         await _seed_turn(
             inbox,
-            text="有效事实" * 200,
+            text="有效事实" * 20,
             minutes_ago=80,
         )
         kv = _KVLog()
