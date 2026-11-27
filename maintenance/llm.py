@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -332,8 +333,6 @@ class MaintenanceLLM:
             len(user_prompt),
         )
         try:
-            import asyncio
-
             timeout = self._llm_timeout
             response = await asyncio.wait_for(
                 self._context.llm_generate(
@@ -353,6 +352,40 @@ class MaintenanceLLM:
             return None
 
     # ─── 任务接口 ───────────────────────────────────────────
+
+    async def ask_decisions(
+        self, questions: Any, state: Any, *, timeout_seconds: int = 30
+    ) -> Any:
+        """受控 Decision 问答：计入周期预算，超预算或失败返回 None。
+
+        与 _chat 相同的硬约束：调用前计数（失败也计入限额）、超时与
+        错误统计；不落磁盘缓存，日志不记录问题与状态内容。
+        """
+        if self._calls >= self._max_calls_per_cycle:
+            logger.warning(
+                f"[简单长期记忆] 本周期 LLM 调用已达上限 "
+                f"{self._max_calls_per_cycle}，跳过 Decision 问答"
+            )
+            return None
+        decision_service = getattr(self._context, "decision", None)
+        ask = getattr(decision_service, "ask", None)
+        if not callable(ask):
+            logger.debug("[简单长期记忆] 上下文无 Decision 服务，跳过 Decision 问答")
+            return None
+        # 在调用前计数，确保失败也计入限额
+        self._calls += 1
+        try:
+            return await asyncio.wait_for(
+                ask(questions, state), timeout=timeout_seconds
+            )
+        except TimeoutError:
+            self._errors += 1
+            logger.warning("[简单长期记忆] Decision 问答超时")
+            return None
+        except Exception as e:
+            self._errors += 1
+            logger.warning(f"[简单长期记忆] Decision 问答失败: {type(e).__name__}")
+            return None
 
     async def chat_json(
         self, system_prompt: str, user_prompt: str, model_id: str = ""

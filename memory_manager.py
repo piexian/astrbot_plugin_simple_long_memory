@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from astrbot.api import logger
 
 from .contact_index import ContactIndex, ContactObservation
+from .maintenance.inbox import INBOX_RETENTION_DAYS, MaintenanceInbox
 from .maintenance.links import MemoryLinkManager
 from .memory_protocol import (
     MemoryMetadata,
@@ -266,6 +267,8 @@ class MemoryManager:
         # 关联表管理器（connect_kb 后初始化）
         self._link_manager: MemoryLinkManager | None = None
         self._contact_index: ContactIndex | None = None
+        # 后台提取缓冲表（connect_kb 后初始化；插件与后台整理共用）
+        self.inbox: MaintenanceInbox | None = None
         self._last_active_memory_stats: dict[str, Any] = {}
 
     # ---------- public state accessors ----------
@@ -431,13 +434,19 @@ class MemoryManager:
             }
         from .maintenance.purge import purge_deprecated_memories
 
-        return await purge_deprecated_memories(
+        result = await purge_deprecated_memories(
             vec_db=self.vec_db,
             kb_helper=self._kb_helper,
             link_manager=self._link_manager,
             after_days=after_days,
             dry_run=dry_run,
         )
+        # 超期终态的缓冲行一并清理；pending 行不因超期删除
+        if self.inbox is not None:
+            result["inbox"] = await self.inbox.purge_terminal(
+                INBOX_RETENTION_DAYS, dry_run=dry_run
+            )
+        return result
 
     def load_pending_writes(self, records: list[dict[str, Any]]) -> None:
         """从外部恢复重建期间未落盘的写入缓冲（启动恢复用）"""
@@ -480,6 +489,10 @@ class MemoryManager:
 
         self._contact_index = ContactIndex(self.vec_db)
         await self._contact_index.ensure_table()
+
+        # 后台提取缓冲表：插件采集与 Scheduler/Runner 共用同一实例
+        self.inbox = MaintenanceInbox(self.vec_db)
+        await self.inbox.ensure_table()
 
     async def cleanup_orphan_links(self) -> int:
         """在中断重建恢复完成后清理真正缺失端点的关联。"""

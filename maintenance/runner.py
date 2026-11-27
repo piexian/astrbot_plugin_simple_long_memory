@@ -21,9 +21,10 @@ from .agents.analyst import AnalystAgent
 from .agents.curator import CuratorAgent
 from .agents.organizer import OrganizerAgent
 from .agents.reviewer import ReviewerAgent
-from .agents.segmenter import CARRY_KV_KEY, CURSOR_KV_KEY, SegmenterAgent
 from .extraction_journal import ExtractionJournal
+from .inbox import STATUS_PROCESSED, STATUS_SKIPPED
 from .llm import MaintenanceLLM
+from .memory_gate import GateCandidate, MaintenanceLLMJudge, MemoryGate
 
 try:  # 正常插件加载（包内相对导入）
     from ..extraction_utils import normalize_extracted_scope
@@ -177,6 +178,8 @@ class MaintenanceRunner:
         # 最近一次审核未产出裁决的原因分布（由 _run_reviewer 回填）
         self._last_review_unresolved: dict[str, int] = {}
         self._extract_journal = ExtractionJournal(kv_get, kv_put)
+        # 后台闸门懒加载后跨提取调用复用（Decision 未配置缓存只探测一次）
+        self._gate: MemoryGate | None = None
 
     async def run_cycle(self, *, dry_run: bool = False) -> MaintenanceReport:
         """执行一次完整整理周期；dry_run 时不执行阶段 4 写入。"""
@@ -595,7 +598,7 @@ class MaintenanceRunner:
             for op, _ in pending_items:
                 if self._op_signature(op) in persisted:
                     await self._extract_journal.acknowledge(op)
-            await self._finish_extract_progress()
+            await self._settle_inbox_blocks()
 
             report.executed_ops = executed
             report.skipped_ops = skipped
@@ -623,67 +626,146 @@ class MaintenanceRunner:
             return await self._execute_operation(op)
 
     async def _run_extraction(self, *, dry_run: bool) -> AgentManifest:
-        """提取阶段：分段员切对话块 → 整理师提取 create/update 操作。
+        """提取阶段：Inbox 纯规则切块 → 闸门 → 整理师提取 create/update 操作。
 
+        闸门明确拒收的块标 skipped；判定失败或预算耗尽的块保留 pending 下周期；
+        已产出操作的块在操作最终执行完成后才由 _settle_inbox_blocks 标 processed。
         LLM 预算占每周期上限的 maintenance_extract_llm_budget_ratio（默认 60%），
-        分段最多使用提取预算的一半，其余留给整理师；两者也受全局预算约束。
+        闸门与整理师共享提取预算，不再消耗任何分段判定调用。
         """
         manifest = AgentManifest(agent_type="extract")
         journal = (
             ExtractionJournal(self._kv_get, None) if dry_run else self._extract_journal
         )
         if await journal.load():
+            # 上一周期未完成的操作先走完审核与执行，本周期不再新提取
             manifest.parsed = True
             manifest.operations = journal.pending
             manifest.metrics = journal.state.get("metrics", {})
             manifest.notes = journal.state.get("notes", "")
             return manifest
+
+        inbox = getattr(self._memory_mgr, "inbox", None)
+        if inbox is None or not inbox.ready:
+            manifest.error = "maintenance inbox unavailable"
+            logger.warning("[简单长期记忆] 提取阶段跳过: 缓冲表不可用")
+            return manifest
+
+        collect = await inbox.collect_blocks(
+            gap_minutes=self._config.get("maintenance_segment_time_gap_minutes", 30),
+            max_chars=self._config.get("maintenance_segment_max_chars", 8000),
+            min_user_chars=self._config.get("extraction_min_content_length", 150),
+            max_blocks=self._config.get("maintenance_extract_max_blocks_per_cycle", 20),
+            commit=not dry_run,
+        )
+        blocks = collect["blocks"]
+        collect_stats = collect["stats"]
+
+        gate = self._get_gate()
+        gate_outcomes = await gate.evaluate(
+            [
+                GateCandidate(candidate_id=block.key, content=block.text)
+                for block in blocks
+            ]
+        )
+        approved_blocks = [
+            block for block in blocks if gate_outcomes[block.key].approved
+        ]
+
         max_calls = int(self._config.get("maintenance_max_llm_calls", 50))
         ratio = float(self._config.get("maintenance_extract_llm_budget_ratio", 0.6))
         extract_budget = max(0, int(max_calls * ratio))
+        curator_budget = max(0, extract_budget - self._llm.calls)
 
-        segmenter = SegmenterAgent(
-            context=self._context,
-            llm=self._llm,
-            config=self._config,
-            kv_get=self._kv_get,
-            kv_put=self._kv_put,
-        )
-        seg_result = await segmenter.collect_blocks(extract_budget // 2)
-        seg_stats = seg_result.get("stats", {})
-        blocks = seg_result.get("blocks", [])
-
-        curator_budget = max(0, extract_budget - int(seg_stats.get("llm_calls", 0)))
         curator = CuratorAgent(
             context=self._context,
             memory_mgr=self._memory_mgr,
             llm=self._llm,
             config=self._config,
         )
-        cur_result = await curator.run(blocks, curator_budget)
+        if approved_blocks:
+            cur_result = await curator.run(approved_blocks, curator_budget)
+        else:
+            cur_result = {
+                "create": [],
+                "update": [],
+                "notes": "",
+                "blocks_processed": 0,
+                "blocks_nothing": 0,
+                "llm_calls": 0,
+                "outcomes": [],
+            }
+        curator_outcomes = {
+            block.key: outcome for block, outcome in cur_result.get("outcomes", [])
+        }
 
+        # 块级最终结局：gate 拒收 → skipped；gate 失败/预算耗尽 → 留 pending
+        skipped_rows: list[int] = []
+        processed_rows: list[int] = []
+        failed_rows: list[int] = []
+        op_block_rows: dict[str, list[int]] = {}
+        for block in blocks:
+            gate_outcome = gate_outcomes[block.key]
+            if gate_outcome.status == "rejected":
+                outcome = "skipped"
+            elif gate_outcome.status == "unavailable":
+                outcome = "deferred"
+            else:
+                outcome = curator_outcomes.get(block.key, "deferred")
+            if outcome == "skipped":
+                skipped_rows.extend(block.row_ids)
+            elif outcome == "nothing":
+                processed_rows.extend(block.row_ids)
+            elif outcome in ("created", "updated"):
+                op_block_rows[block.key] = block.row_ids
+            elif outcome == "failed":
+                failed_rows.extend(block.row_ids)
+
+        operations = list(cur_result.get("create", [])) + list(
+            cur_result.get("update", [])
+        )
+        gate_approved = len(approved_blocks)
+        gate_rejected = sum(1 for o in gate_outcomes.values() if o.status == "rejected")
+        gate_unavailable = len(blocks) - gate_approved - gate_rejected
         manifest.parsed = True
         manifest.notes = str(cur_result.get("notes", "") or "")
-        manifest.operations.extend(cur_result.get("create", []))
-        manifest.operations.extend(cur_result.get("update", []))
+        manifest.operations = operations
         manifest.metrics = {
-            "segmenter": seg_stats,
+            "inbox": collect_stats,
             "blocks": len(blocks),
+            "gate_approved": gate_approved,
+            "gate_rejected": gate_rejected,
+            "gate_unavailable": gate_unavailable,
             "blocks_processed": cur_result.get("blocks_processed", 0),
             "blocks_nothing": cur_result.get("blocks_nothing", 0),
             "created": len(cur_result.get("create", [])),
             "updated": len(cur_result.get("update", [])),
-            "llm_calls": int(seg_stats.get("llm_calls", 0))
-            + cur_result.get("llm_calls", 0),
+            "llm_calls": cur_result.get("llm_calls", 0),
         }
+
         if not dry_run:
-            await journal.prepare(seg_result, cur_result, manifest.metrics)
-            manifest.operations = journal.pending
-            await self._finish_extract_progress()
+            if skipped_rows:
+                await inbox.mark_rows(skipped_rows, STATUS_SKIPPED)
+            if processed_rows:
+                await inbox.mark_rows(processed_rows, STATUS_PROCESSED)
+            if failed_rows:
+                await inbox.mark_failed(failed_rows)
+            if operations:
+                await journal.prepare(
+                    operations=operations,
+                    block_rows=op_block_rows,
+                    metrics=manifest.metrics,
+                    notes=manifest.notes,
+                )
+                manifest.operations = journal.pending
         logger.debug(
-            "[简单长期记忆] 提取阶段完成: blocks=%s, processed=%s, create=%s, "
-            "update=%s, llm_calls=%s, dry_run=%s",
+            "[简单长期记忆] 提取阶段完成: blocks=%s, approved=%s, rejected=%s, "
+            "unavailable=%s, processed=%s, create=%s, update=%s, llm_calls=%s, "
+            "dry_run=%s",
             len(blocks),
+            gate_approved,
+            gate_rejected,
+            gate_unavailable,
             manifest.metrics["blocks_processed"],
             manifest.metrics["created"],
             manifest.metrics["updated"],
@@ -692,87 +774,49 @@ class MaintenanceRunner:
         )
         return manifest
 
-    async def _finish_extract_progress(self) -> None:
-        journal = self._extract_journal
-        if journal.state:
-            await self._commit_extract_progress(
-                journal.state["segment"], journal.outcomes()
-            )
-            await journal.clear_if_finished()
+    def _get_gate(self) -> MemoryGate:
+        """后台闸门：懒加载并复用同一实例，Decision 未配置缓存跨提取调用有效。
 
-    async def _commit_extract_progress(
-        self,
-        seg_result: dict[str, Any],
-        outcomes: list[tuple[Any, str]],
-    ) -> None:
-        """按块提交提取游标并应用 carry 更新（整字典读改写，数据量小）。
-
-        游标只随已持久化完成的连续块推进，失败或未完成块及其后续块保留；
-        无产出块会话（短块/毒块跳过）直接采用分段员游标，避免每周期重扫。
+        Decision 走 MaintenanceLLM 受控包装计入总预算；Chat 降级复用 maintenance_model_id。
         """
-        if not self._kv_put or not self._kv_get:
-            return
-        now_iso = datetime.now(timezone.utc).isoformat()
-        try:
-            cursors = await self._kv_get(CURSOR_KV_KEY, None)
-            cursors = dict(cursors) if isinstance(cursors, dict) else {}
-            for key, value in seg_result.get("discovered", {}).items():
-                cursors.setdefault(key, value)
-            if seg_result.get("discovered"):
-                await self._kv_put(CURSOR_KV_KEY, dict(cursors))
-            grouped: dict[str, list[tuple[Any, str]]] = {}
-            for block, outcome in outcomes:
-                grouped.setdefault(block.conv_key, []).append((block, outcome))
-            for conv_key, items in grouped.items():
-                for block, outcome in items:
-                    if outcome not in {"created", "updated", "nothing"}:
-                        break
-                    if getattr(block, "source", "pmh") == "conv2":
-                        # conv2 无行 id，游标为内容锚点 + 消息下标
-                        cursors[conv_key] = {
-                            "source": "conv2",
-                            "anchor": str(getattr(block, "end_anchor", "") or ""),
-                            "idx": block.last_id,
-                            "ts": now_iso,
-                        }
-                    else:
-                        cursors[conv_key] = {"id": block.last_id, "ts": now_iso}
-                    if getattr(block, "last_offset", 0):
-                        cursors[conv_key]["offset"] = block.last_offset
-                    # 逐块提交：崩溃后已处理块不重拉、未处理块不丢
-                    await self._kv_put(CURSOR_KV_KEY, dict(cursors))
-            block_convs = set(grouped)
-            for conv_key, value in (seg_result.get("cursor_updates") or {}).items():
-                if conv_key in block_convs:
-                    continue  # 有块会话由 outcome 驱动，避免跳过未提取块
-                if isinstance(value, dict) and value.get("source") == "conv2":
-                    cursors[conv_key] = {
-                        "source": "conv2",
-                        "anchor": str(value.get("anchor") or ""),
-                        "idx": int(value.get("idx") or 0),
-                        "ts": now_iso,
-                    }
-                    if value.get("offset"):
-                        cursors[conv_key]["offset"] = value["offset"]
-                elif isinstance(value, dict):
-                    cursors[conv_key] = {**value, "ts": now_iso}
-                else:
-                    cursors[conv_key] = {"id": value, "ts": now_iso}
-                await self._kv_put(CURSOR_KV_KEY, dict(cursors))
+        gate = getattr(self, "_gate", None)
+        if gate is None:
+            gate = MemoryGate(
+                decision_service=getattr(self._context, "decision", None),
+                provider_manager=getattr(self._context, "provider_manager", None),
+                decision_ask=self._llm.ask_decisions,
+                chat_judge=MaintenanceLLMJudge(
+                    self._llm, self._config.get("maintenance_model_id", "")
+                ),
+            )
+            self._gate = gate
+        return gate
 
-            carry_updates = seg_result.get("carry_updates") or {}
-            if carry_updates:
-                carries = await self._kv_get(CARRY_KV_KEY, None)
-                carries = dict(carries) if isinstance(carries, dict) else {}
-                for conv_key, value in carry_updates.items():
-                    if value is None:
-                        carries.pop(conv_key, None)  # None = 清除该键
-                    else:
-                        carries[conv_key] = value
-                    await self._kv_put(CARRY_KV_KEY, carries)
-        except Exception as e:
-            logger.warning(f"[简单长期记忆] 提交提取进度失败: {e}")
-            raise
+    async def _settle_inbox_blocks(self) -> None:
+        """把操作已全部完成的块对应缓冲行标 processed，全部成功后才清理日志。
+
+        缓冲表不可用或任一行状态提交失败时保留日志，下周期重试；
+        避免行仍为 pending 时日志被清导致同一对话块重复提取。
+        """
+        journal = self._extract_journal
+        if not journal.state:
+            return
+        settled = journal.settled_block_rows()
+        if settled:
+            inbox = getattr(self._memory_mgr, "inbox", None)
+            if inbox is None:
+                logger.warning("[简单长期记忆] 缓冲表不可用，提取日志保留待下周期重试")
+                return
+            for block_key, row_ids in settled.items():
+                if not await inbox.mark_rows(row_ids, STATUS_PROCESSED):
+                    logger.warning(
+                        "[简单长期记忆] 缓冲行状态提交失败: block=%s, rows=%s，"
+                        "提取日志保留待下周期重试",
+                        block_key,
+                        len(row_ids),
+                    )
+                    return
+        await journal.clear_if_finished()
 
     async def _run_organizer(self) -> AgentManifest:
         """运行整理师：去重合并、质量精炼。"""

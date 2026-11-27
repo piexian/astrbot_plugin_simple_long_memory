@@ -3,23 +3,15 @@
 from __future__ import annotations
 
 import json
-import sys
-import types
 import unittest
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import yaml
-from sqlalchemy import Column, DateTime
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlmodel import Field, SQLModel
 from test_memory_commands import MemoryManager, plugin_main
 
 from maintenance.agents.analyst import AnalystAgent
-from maintenance.agents.segmenter import SegmenterAgent
 from maintenance.llm import MaintenanceLLM
 from maintenance.runner import MaintenanceRunner
 from maintenance.scheduler import MaintenanceScheduler
@@ -837,102 +829,7 @@ class ConfigAndNotificationFixTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
-class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_segmenter_filters_inactive_platform_message_history_rows(self):
-        class _PMH(SQLModel, table=True):
-            __tablename__ = "platform_message_history_compat_test"
-            __table_args__ = {"extend_existing": True}
-
-            id: int | None = Field(default=None, primary_key=True)
-            platform_id: str
-            user_id: str
-            sender_id: str | None = None
-            sender_name: str | None = None
-            created_at: datetime = Field(sa_column=Column(DateTime, nullable=False))
-            is_active: bool = Field(default=True)
-
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        self.addAsyncCleanup(engine.dispose)
-        async with engine.begin() as conn:
-            await conn.run_sync(
-                lambda sync_conn: _PMH.__table__.create(sync_conn, checkfirst=True)
-            )
-
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        async with AsyncSession(engine) as session:
-            session.add_all(
-                [
-                    _PMH(
-                        id=1,
-                        platform_id="webchat",
-                        user_id="webchat:FriendMessage:s-inactive",
-                        created_at=now,
-                        is_active=False,
-                    ),
-                    _PMH(
-                        id=2,
-                        platform_id="webchat",
-                        user_id="webchat:FriendMessage:s-mixed",
-                        created_at=now,
-                        is_active=False,
-                    ),
-                    _PMH(
-                        id=3,
-                        platform_id="webchat",
-                        user_id="webchat:FriendMessage:s-mixed",
-                        created_at=now,
-                        is_active=True,
-                    ),
-                ]
-            )
-            await session.commit()
-
-        class _FakeDB:
-            @asynccontextmanager
-            async def get_db(self):
-                async with AsyncSession(engine) as s:
-                    yield s
-
-        ctx = SimpleNamespace(message_history_manager=SimpleNamespace(db=_FakeDB()))
-        seg = SegmenterAgent(ctx, SimpleNamespace(), {}, None, None)
-
-        po_mod = types.ModuleType("astrbot.core.db.po")
-        po_mod.PlatformMessageHistory = _PMH
-        with patch.dict(sys.modules, {"astrbot.core.db.po": po_mod}):
-            convs = await seg._list_active_conversations(
-                datetime(2000, 1, 1, tzinfo=timezone.utc)
-            )
-            rows = await seg._fetch_rows(
-                "webchat", "webchat:FriendMessage:s-mixed", after_id=0, limit=10
-            )
-
-        self.assertEqual(convs, [("webchat", "webchat:FriendMessage:s-mixed")])
-        self.assertEqual([r.id for r in rows], [3])
-
-        # 仅有非活跃 PMH 行的会话也不应通过 ConversationV2 回退重新进入提取
-        conv2_seen: list[str] = []
-
-        async def fake_collect_conv2(conv, platform_id, user_id, *args, **kwargs):
-            conv2_seen.append(f"{platform_id}:{user_id}")
-
-        seg._list_conv2_conversations = AsyncMock(
-            return_value=[
-                SimpleNamespace(
-                    platform_id="webchat", user_id="webchat:FriendMessage:s-inactive"
-                ),
-                SimpleNamespace(
-                    platform_id="webchat", user_id="webchat:FriendMessage:s-conv2-only"
-                ),
-            ]
-        )
-        seg._collect_conv2_conversation = AsyncMock(side_effect=fake_collect_conv2)
-        seg._fetch_all = AsyncMock(return_value=[])
-
-        with patch.dict(sys.modules, {"astrbot.core.db.po": po_mod}):
-            await seg.collect_blocks(max_llm_calls=5)
-
-        self.assertEqual(conv2_seen, ["webchat:webchat:FriendMessage:s-conv2-only"])
-
+class AnalystContentTests(unittest.IsolatedAsyncioTestCase):
     async def test_analyst_extracts_plain_text_from_structured_content_parts(self):
         history = [
             {
