@@ -262,7 +262,10 @@ class ExtractionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kv.store[CURSOR_KV_KEY][block.conv_key]["id"], 10)
 
     async def test_retry_repairs_partial_faiss_write(self):
-        from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
+        try:
+            from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
+        except ModuleNotFoundError:
+            self.skipTest("astrbot 未安装，跳过 FaissVecDB 集成测试")
 
         for operation in ("create", "update"):
             for failure_point in ("insert", "save_index"):

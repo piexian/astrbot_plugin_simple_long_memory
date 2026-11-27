@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import yaml
+from sqlalchemy import Column, DateTime
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlmodel import Field, SQLModel
 from test_memory_commands import MemoryManager, plugin_main
@@ -824,7 +825,7 @@ class SegmenterIsActiveAndAnalystContentTests(unittest.IsolatedAsyncioTestCase):
             user_id: str
             sender_id: str | None = None
             sender_name: str | None = None
-            created_at: datetime
+            created_at: datetime = Field(sa_column=Column(DateTime, nullable=False))
             is_active: bool = Field(default=True)
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
