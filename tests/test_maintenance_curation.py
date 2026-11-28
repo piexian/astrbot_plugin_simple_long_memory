@@ -1066,6 +1066,7 @@ class PurgeDeprecatedTests(_SeededMemoryCase):
         self.assertEqual(preview["purged"], 0)
         self.assertEqual(len(await self._docs(self.expired_uri)), 1)
         self.assertEqual(await self.mgr.link_manager.count_links(), 2)
+        self.assertEqual(self.mgr.vec_db.embedding_storage.index.ntotal, 3)
         result = await self.mgr.purge_deprecated(after_days=7)
         self.assertEqual(result["purged"], 1)
         self.assertGreaterEqual(result["links_cleaned"], 1)
@@ -1080,6 +1081,7 @@ class PurgeDeprecatedTests(_SeededMemoryCase):
         }
         self.assertEqual(remaining, {(self.grace_uri, self.active_uri)})
         kb_document_ids = await self._kb_document_ids()
+        self.assertEqual(self.mgr.vec_db.embedding_storage.index.ntotal, 2)
         self.assertNotIn(self.doc_ids[self.expired_uri], kb_document_ids)
         self.assertIn(self.doc_ids[self.grace_uri], kb_document_ids)
         self.assertIn(self.doc_ids[self.active_uri], kb_document_ids)

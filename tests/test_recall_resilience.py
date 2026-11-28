@@ -272,22 +272,25 @@ class RecallResilienceTests(RealStackTestCase):
 
     async def test_server_error_keeps_disclosure_hit_without_network_retry(self):
         await self._seed(disclosure="咖啡 饮品")
+        await self.mgr.vec_db.insert(
+            "用户喜欢喝咖啡",
+            make_memory_meta(
+                "facts://global-hit",
+                scope="global",
+                created_at=RECENT_CREATED_AT,
+                disclosure="咖啡 饮品",
+            ),
+            "doc-global-hit",
+        )
         before = len(self._embedding_requests())
-        filters = {
-            "memory_scope": "personal",
-            "owner_user_id": OWNER_USER_ID,
-            "is_memory_record": True,
-            "deprecated": False,
-        }
         self.server.queue_embedding_error(500, "server down")
 
-        memories = await self.mgr._retrieve_with_filter(
-            "咖啡", 3, filters, event=_private_event()
-        )
+        memories = await self.mgr.recall_memories(_private_event(), "咖啡", top_k=3)
 
-        self.assertEqual(len(self._embedding_requests()) - before, 1)
+        self.assertEqual(len(self._embedding_requests()) - before, 3)
         self.assertEqual(
-            [memory["metadata"]["uri"] for memory in memories], ["facts://coffee"]
+            sorted(memory["metadata"]["uri"] for memory in memories),
+            ["facts://coffee", "facts://global-hit"],
         )
 
 

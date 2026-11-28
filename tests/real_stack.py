@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import shutil
 import sys
 import tempfile
 import threading
@@ -611,9 +612,11 @@ class RealStackTestCase(unittest.IsolatedAsyncioTestCase):
         """构造走本地脚本化 chat provider 的后台整理 LLM。"""
         from maintenance.llm import MaintenanceLLM
 
+        cache_dir = tempfile.mkdtemp(prefix="real-stack-llm-cache-")
+        self.addCleanup(shutil.rmtree, cache_dir, True)
         return MaintenanceLLM(
             context=self.context,
-            cache_dir=tempfile.mkdtemp(prefix="real-stack-llm-cache-"),
+            cache_dir=cache_dir,
             cache_enabled=cache_enabled,
             default_model_id=CHAT_PROVIDER_ID,
             max_calls_per_cycle=max_calls,
