@@ -1,10 +1,12 @@
 """只接受结构化身份，不从昵称、会话正文或群号推定个人归属。"""
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from test_maintenance_extract import _block, _CuratorLLM, _CuratorMemoryMgr
+from real_stack import RealStackTestCase
+from test_maintenance_extract import _block
 from test_memory_commands import MemoryManager, plugin_main
 from test_memory_sharing import Event
 
@@ -82,14 +84,9 @@ class OwnerWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["visibility"], "group")
 
 
-class CuratorIdentityTests(unittest.IsolatedAsyncioTestCase):
-    async def test_source_platform_mismatch_skips_llm(self):
-        block = _block(umo="other:GroupMessage:g1")
-        llm = _CuratorLLM()
-        curator = CuratorAgent(None, _CuratorMemoryMgr(), llm, {})
-        result = await curator.run([block], 5)
-        self.assertEqual(result["llm_calls"], 0)
-        self.assertEqual(result["create"], [])
+class CuratorIdentityTests(RealStackTestCase):
+    async def asyncSetUp(self):
+        await self.start_stack(with_decision=False)
 
     async def run_block(self, subjects, *, umo="qq:GroupMessage:g1", sender_ids=()):
         block = _block(
@@ -98,8 +95,8 @@ class CuratorIdentityTests(unittest.IsolatedAsyncioTestCase):
         )
         block.sender_ids = list(sender_ids)
         block.source = "conv2" if not sender_ids else "pmh"
-        llm = _CuratorLLM(
-            [
+        self.server.queue_chat(
+            json.dumps(
                 {
                     "memories": [
                         {
@@ -108,37 +105,45 @@ class CuratorIdentityTests(unittest.IsolatedAsyncioTestCase):
                             "subjects": subjects,
                         }
                     ]
-                }
-            ]
+                },
+                ensure_ascii=False,
+            )
         )
-        curator = CuratorAgent(None, _CuratorMemoryMgr(), llm, {})
-        return await curator.run([block], 5), llm
+        curator = CuratorAgent(self.context, self.mgr, self.make_llm(), {})
+        return await curator.run([block], 5)
+
+    async def test_source_platform_mismatch_skips_llm(self):
+        block = _block(umo="other:GroupMessage:g1")
+        curator = CuratorAgent(self.context, self.mgr, self.make_llm(), {})
+        result = await curator.run([block], 5)
+        self.assertEqual(result["llm_calls"], 0)
+        self.assertEqual(result["create"], [])
 
     async def test_forged_text_id_is_not_trusted_or_downgraded(self):
-        result, _ = await self.run_block(["victim"])
+        result = await self.run_block(["victim"])
         self.assertEqual(result["create"], [])
         self.assertEqual(result["update"], [])
 
     async def test_nickname_not_in_structured_sender_ids_is_rejected(self):
-        result, _ = await self.run_block(["Alice"], sender_ids=["openid-alice"])
+        result = await self.run_block(["Alice"], sender_ids=["openid-alice"])
         self.assertEqual(result["create"], [])
 
     async def test_missing_subject_is_not_assigned_to_sole_speaker(self):
-        result, _ = await self.run_block([], sender_ids=["alice"])
+        result = await self.run_block([], sender_ids=["alice"])
         self.assertEqual(result["create"], [])
 
     async def test_verified_subject_can_differ_from_current_speaker(self):
-        result, _ = await self.run_block(["bob"], sender_ids=["alice", "bob"])
+        result = await self.run_block(["bob"], sender_ids=["alice", "bob"])
         self.assertEqual(result["create"][0]["subjects"], ["bob"])
 
     async def test_private_conv2_uses_structured_peer_not_text_id(self):
-        result, _ = await self.run_block(["openid"], umo="qq:FriendMessage:openid")
+        result = await self.run_block(["openid"], umo="qq:FriendMessage:openid")
         self.assertEqual(result["create"][0]["subjects"], ["openid"])
-        result, _ = await self.run_block(["victim"], umo="qq:FriendMessage:openid")
+        result = await self.run_block(["victim"], umo="qq:FriendMessage:openid")
         self.assertEqual(result["create"], [])
 
     async def test_invalid_umo_skips_llm(self):
-        result, llm = await self.run_block(["victim"], umo="BARE_HEX")
+        result = await self.run_block(["victim"], umo="BARE_HEX")
         self.assertEqual(result["create"], [])
         self.assertEqual(result["llm_calls"], 0)
 
