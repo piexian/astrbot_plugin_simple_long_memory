@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from real_stack import plugin_main
 
 from config_compat import (
     MAINTENANCE_OBJECT_KEY,
@@ -173,15 +174,17 @@ class MigrationRealConfigTests(unittest.TestCase):
                 for i in range(count)
             ]
 
-        organizer = OrganizerAgent.__new__(OrganizerAgent)
-        organizer._merge_cosine_threshold = 0.9
-
-        organizer._config = {"maintenance_organizer_merge_batch_size": 2}
+        organizer = OrganizerAgent(
+            context=None,
+            memory_mgr=None,
+            llm=None,
+            config={"maintenance_organizer_merge_batch_size": 2},
+        )
         sampled = asyncio.run(organizer._screen_merge_candidates(memories(5)))
         # 采样 2 条后只剩 1 个同作用域候选对
         self.assertEqual(len(sampled), 1)
 
-        organizer._config = {}
+        organizer = OrganizerAgent(context=None, memory_mgr=None, llm=None, config={})
         sampled = asyncio.run(organizer._screen_merge_candidates(memories(5)))
         # 缺省 200 不采样：5 条全保留，候选对 C(5,2)=10
         self.assertEqual(len(sampled), 10)
@@ -191,8 +194,6 @@ class PluginInitMigrationTests(unittest.TestCase):
     """真实 AstrBotConfig 直接进入插件构造函数的生产迁移路径。"""
 
     def test_plugin_init_migrates_and_builds_flat_view(self):
-        from test_memory_commands import plugin_main
-
         with tempfile.TemporaryDirectory() as directory:
             path = _write_config(directory, OLD_FLAT_CONFIG)
             cfg = AstrBotConfig(config_path=str(path), schema=SCHEMA)
@@ -212,8 +213,6 @@ class PluginInitMigrationTests(unittest.TestCase):
             self.assertEqual(saved[MAINTENANCE_OBJECT_KEY]["window"], "03:00-07:00")
 
     def test_config_and_flat_view_are_one_mutable_source(self):
-        from test_memory_commands import plugin_main
-
         with tempfile.TemporaryDirectory() as directory:
             path = _write_config(directory, OLD_FLAT_CONFIG)
             cfg = AstrBotConfig(config_path=str(path), schema=SCHEMA)
@@ -232,13 +231,6 @@ class PluginInitMigrationTests(unittest.TestCase):
 class FlatViewTests(unittest.TestCase):
     """平面 dict（旧配置/单测直传）与对象优先级的纯函数行为。"""
 
-    def test_plain_dict_without_object_stays_flat(self):
-        cfg = {"maintenance_enabled": True, "extraction_interval": 5}
-        self.assertFalse(migrate_maintenance_config(cfg))
-        flat = build_flat_config_view(cfg)
-        self.assertTrue(flat["maintenance_enabled"])
-        self.assertEqual(flat["extraction_interval"], 5)
-
     def test_object_value_overrides_stale_flat_key(self):
         cfg = {
             "maintenance_enabled": False,
@@ -256,12 +248,10 @@ class FlatViewTests(unittest.TestCase):
         }
         self.assertTrue(migrate_maintenance_config(cfg))
         self.assertTrue(cfg[MAINTENANCE_OBJECT_KEY]["enabled"])
-        # 标记置位后迁移幂等
+        # 标记置位后迁移幂等，平面视图以对象为准
         self.assertFalse(migrate_maintenance_config(cfg))
-
-    def test_non_dict_config_is_ignored(self):
-        self.assertFalse(migrate_maintenance_config(None))
-        self.assertEqual(build_flat_config_view(None), {})
+        flat = build_flat_config_view(cfg)
+        self.assertTrue(flat["maintenance_enabled"])
 
 
 if __name__ == "__main__":

@@ -3,11 +3,39 @@
 from __future__ import annotations
 
 import importlib
-from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, PropertyMock, patch
+
+from astrbot.core.platform.astr_message_event import AstrMessageEvent
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.platform_metadata import PlatformMetadata
 
 from maintenance.version_gate import parse_release_tuple
+
+
+def _real_message_event(umo: str = "qq:FriendMessage:u1") -> AstrMessageEvent:
+    """构造真实 AstrMessageEvent；4.29 的 PlatformMetadata 没有 UI 交互字段。"""
+    platform_id, kind, session_id = umo.split(":", 2)
+    message = AstrBotMessage()
+    message.type = (
+        MessageType.GROUP_MESSAGE
+        if kind == "GroupMessage"
+        else MessageType.FRIEND_MESSAGE
+    )
+    message.session_id = session_id
+    message.sender = MessageMember(user_id=session_id, nickname="测试用户")
+    message.self_id = "bot"
+    return AstrMessageEvent(
+        message_str="今天聊点什么",
+        message_obj=message,
+        platform_meta=PlatformMetadata(
+            name=platform_id,
+            description="test platform",
+            id=platform_id,
+        ),
+        session_id=session_id,
+    )
 
 
 class AstrBot429ImportTests(TestCase):
@@ -28,24 +56,33 @@ class AstrBot429ImportTests(TestCase):
 class LegacyMaintenanceFallbackTests(IsolatedAsyncioTestCase):
     async def test_429_keeps_legacy_consolidation_available(self):
         main_module = importlib.import_module("astrbot_plugin_simple_long_memory.main")
-        plugin = main_module.MemoryPlugin.__new__(main_module.MemoryPlugin)
-        fetch_candidates = AsyncMock(return_value=[])
-        plugin.config = {
-            "maintenance_enabled": True,
-            "memory_consolidation_enabled": True,
-        }
-        plugin.memory_mgr = SimpleNamespace(
-            is_kb_connected=True,
-            fetch_consolidation_candidates=fetch_candidates,
+        memory_manager_module = importlib.import_module(
+            "astrbot_plugin_simple_long_memory.memory_manager"
         )
-        plugin._last_consolidation = 0.0
-        plugin._get_llm_provider_id = AsyncMock(return_value=None)
-        event = SimpleNamespace(unified_msg_origin="qq:FriendMessage:u1")
         astrbot = importlib.import_module("astrbot")
         version = str(getattr(astrbot, "__version__", ""))
         if parse_release_tuple(version) != (4, 29, 4):
             self.skipTest(f"requires AstrBot 4.29.4, got {version}")
+
+        plugin = main_module.MemoryPlugin(
+            None,
+            {"maintenance_enabled": True, "memory_consolidation_enabled": True},
+        )
+        manager = memory_manager_module.MemoryManager(None, {})
+        plugin.memory_mgr = manager
+        fetch_candidates = AsyncMock(return_value=[])
+        event = _real_message_event()
+
         self.assertFalse(main_module.maintenance_supported())
-        await plugin._maybe_consolidate_memories(event)
+        with (
+            patch.object(manager, "fetch_consolidation_candidates", fetch_candidates),
+            patch.object(
+                type(manager),
+                "is_kb_connected",
+                new_callable=PropertyMock,
+                return_value=True,
+            ),
+        ):
+            await plugin._maybe_consolidate_memories(event)
 
         fetch_candidates.assert_awaited_once_with(event, 14, 1, 30)

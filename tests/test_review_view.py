@@ -14,8 +14,7 @@ import yaml
 from astrbot.api.interactive_ui import ViewSpec
 from astrbot.core.star.filter.ui_action import UIActionFilter
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
-from real_stack import build_real_context, real_message_event, start_server
-from test_memory_commands import MemoryManager, plugin_main
+from real_stack import RealStackTestCase, plugin_main, real_message_event
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VIEW_DIR = PROJECT_ROOT / "views" / "memory_review"
@@ -150,7 +149,7 @@ class ReviewViewContractTests(unittest.TestCase):
                 self.assertTrue(str(view_text.get(key, "")).strip(), f"{locale}:{key}")
 
 
-class ReviewViewRealStackTests(unittest.IsolatedAsyncioTestCase):
+class ReviewViewRealStackTests(RealStackTestCase):
     """真实 Context + 真实 KB + 真实事件下的卡片与回调行为。"""
 
     def _queue_item(self, item_id: int, op: dict) -> dict:
@@ -167,33 +166,16 @@ class ReviewViewRealStackTests(unittest.IsolatedAsyncioTestCase):
         }
 
     async def asyncSetUp(self):
-        self.server = start_server()
-        self.kb_name = f"review-{uuid.uuid4().hex[:10]}"
-        self.context = await build_real_context(
-            self.server, with_decision=False, kb_name=self.kb_name
-        )
-        self.mgr = MemoryManager(
-            kb_mgr=self.context.kb_manager, config={"kb_name": self.kb_name}
-        )
-        self.mgr.initialize()
-        await self.mgr.connect_kb()
-        self.plugin = plugin_main.MemoryPlugin(
-            self.context,
-            {
-                "kb_name": [self.kb_name],
-                "maintenance_enabled": False,
-                "auto_memorize": False,
-            },
+        await self.start_stack(
+            kb_name=f"review-{uuid.uuid4().hex[:10]}",
+            with_decision=False,
+            with_plugin=True,
+            config={"maintenance_enabled": False, "auto_memorize": False},
         )
         self.plugin.plugin_id = f"memory-review-{uuid.uuid4().hex[:12]}"
-        self.plugin.memory_mgr = self.mgr
         # 走真实启动路径：maintenance_enabled 关闭时不创建后台循环
         await self.plugin._start_scheduler()
         self.assertIsNotNone(self.plugin._scheduler)
-
-    def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
 
     async def _seed_queue(self, *items: dict) -> None:
         await self.plugin.put_kv_data("maintenance_pending_review", list(items))
