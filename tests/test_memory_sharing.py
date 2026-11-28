@@ -1,62 +1,87 @@
-"""共享开关、关联权限和多主体候选查询回归。"""
+"""共享开关、关联权限和多主体候选查询回归：真实 AstrBot 栈底座。
+
+MemoryManager、SQLite/FAISS 知识库与 AstrMessageEvent 全部使用真实实现，
+LLM/Embedding 请求由标准库本地 HTTP 服务应答。
+"""
+
+from __future__ import annotations
 
 import json
-import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
-from test_memory_commands import MemoryManager, plugin_main
+from real_stack import (
+    MemoryManager,
+    RealStackTestCase,
+    make_memory_meta,
+    plugin_main,
+    real_message_event,
+)
 
 UMOInfo = plugin_main.UMOInfo
 
-
-class Event:
-    def __init__(self, umo="sl:FriendMessage:bob", sender="bob"):
-        self.unified_msg_origin = umo
-        self.sender = sender
-
-    def get_sender_id(self):
-        return self.sender
-
-    def get_platform_id(self):
-        return self.unified_msg_origin.split(":", 1)[0]
+GROUP_UMO = "qq:GroupMessage:g1"
+OTHER_GROUP_UMO = "qq:GroupMessage:g2"
+PRIVATE_UMO = "qq:FriendMessage:bob"
 
 
-def memory(scope="personal", owner="sl_bob", umo="sl:GroupMessage:g1", **extra):
+def _meta(
+    uri="facts://coffee", scope="personal", owner="qq_bob", umo=GROUP_UMO, **extra
+):
+    """按运行期写入形状构造记忆元数据。"""
     parsed = UMOInfo.parse(umo)
-    return {
-        "text": "喜欢咖啡 coffee",
-        "metadata": {
-            "uri": "facts://coffee",
-            "is_memory_record": True,
-            "deprecated": False,
-            "memory_scope": scope,
-            "owner_user_id": owner,
-            "owner_user_ids": [owner],
-            "platform_id": parsed.platform_id,
-            "owner_session_id": f"{parsed.platform_id}_{parsed.session_id}",
-            "umo": umo,
-            "visibility": "private",
-            **extra,
-        },
-    }
+    return make_memory_meta(
+        uri,
+        scope=scope,
+        owner=owner,
+        umo=umo,
+        platform_id=parsed.platform_id,
+        owner_session_id=f"{parsed.platform_id}_{parsed.session_id}",
+        owner_user_ids=extra.pop("owner_user_ids", [owner]),
+        visibility=extra.pop("visibility", "private"),
+        **extra,
+    )
 
 
-class SharingConfigTests(unittest.TestCase):
-    def test_legacy_key_and_new_defaults_are_preserved(self):
+def _memory(**kwargs):
+    return {"text": "喜欢咖啡 coffee", "metadata": _meta(**kwargs)}
+
+
+def _group_event(umo=GROUP_UMO, sender="bob"):
+    return real_message_event(umo=umo, sender_id=sender, group_id=umo.split(":", 2)[2])
+
+
+def _schema_defaults():
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
+    return schema, {key: item.get("default") for key, item in schema.items()}
+
+
+class SharingConfigTests(RealStackTestCase):
+    async def test_legacy_key_and_new_defaults_are_preserved(self):
         root = Path(__file__).resolve().parents[1]
-        schema = json.loads((root / "_conf_schema.json").read_text())
+        schema, upgraded = _schema_defaults()
         self.assertEqual(schema["global_memory"]["type"], "bool")
         self.assertNotIn("share_personal_across_sessions", schema)
         self.assertIs(schema["share_group_across_groups"]["default"], False)
-        upgraded = {key: item.get("default") for key, item in schema.items()}
+
+        upgraded.pop("kb_name")
         upgraded["global_memory"] = False
-        mgr = MemoryManager(None, upgraded)
-        self.assertFalse(mgr._is_memory_visible(Event(), memory()))
+        await self.start_stack(with_decision=False, config=upgraded)
+
+        group_event = _group_event()
+        await self.mgr.store_memory(group_event, "喜欢咖啡", "facts")
+        docs = await self.active_docs()
+        self.assertEqual(len(docs), 1)
+
+        self.assertTrue(self.mgr._is_memory_visible(group_event, docs[0]))
+        stranger = real_message_event(umo="qq:private:u9", sender_id="u9")
+        self.assertFalse(self.mgr._is_memory_visible(stranger, docs[0]))
+
         for locale in ("zh-CN", "en-US"):
             translations = json.loads(
-                (root / ".astrbot-plugin" / "i18n" / f"{locale}.json").read_text()
+                (root / ".astrbot-plugin" / "i18n" / f"{locale}.json").read_text(
+                    encoding="utf-8"
+                )
             )["config"]
             for key in (
                 "global_memory",
@@ -68,7 +93,17 @@ class SharingConfigTests(unittest.TestCase):
                 self.assertTrue(translations[key]["hint"])
 
 
-class SharingPolicyTests(unittest.TestCase):
+class SharingPolicyTests(RealStackTestCase):
+    async def asyncSetUp(self):
+        await self.start_stack(with_decision=False)
+
+    def manager(self, **config):
+        mgr = MemoryManager(
+            self.context.kb_manager, {"kb_name": self.kb_name, **config}
+        )
+        mgr.initialize()
+        return mgr
+
     def test_umo_normalizes_without_rewriting_origin(self):
         for raw, expected in (
             ("GroupMessage", "group"),
@@ -76,378 +111,435 @@ class SharingPolicyTests(unittest.TestCase):
             ("OtherMessage", "other"),
             ("group", "group"),
         ):
-            parsed = UMOInfo.parse(f"sl:{raw}:id:with:colons")
+            parsed = UMOInfo.parse(f"qq:{raw}:id:with:colons")
             self.assertEqual(parsed.session_type, expected)
             self.assertEqual(parsed.session_id, "id:with:colons")
             self.assertTrue(parsed.is_valid)
-        for raw in ("HEX", "sl::id", "sl:unknown:id", ":group:id", "sl:private:"):
+        for raw in ("HEX", "qq::id", "qq:unknown:id", ":group:id", "qq:private:"):
             self.assertFalse(UMOInfo.parse(raw).is_valid)
 
+        event = _group_event()
+        self.assertEqual(event.unified_msg_origin, GROUP_UMO)
+        self.assertEqual(UMOInfo.parse(event.unified_msg_origin).session_type, "group")
+
     def test_independent_switch_matrix(self):
+        destinations = (GROUP_UMO, OTHER_GROUP_UMO, PRIVATE_UMO)
         for personal in (False, True):
             for group in (False, True):
-                mgr = MemoryManager(
-                    None,
-                    {"global_memory": personal, "share_group_across_groups": group},
+                mgr = self.manager(
+                    global_memory=personal, share_group_across_groups=group
                 )
-                for destination in (
-                    "sl:GroupMessage:g1",
-                    "sl:GroupMessage:g2",
-                    "sl:FriendMessage:bob",
-                ):
-                    event = Event(destination)
+                for destination in destinations:
+                    event = real_message_event(
+                        umo=destination,
+                        sender_id="bob",
+                        group_id=destination.split(":", 2)[2]
+                        if ":GroupMessage:" in destination
+                        else "",
+                    )
+                    same = destination == GROUP_UMO
+                    is_group_destination = ":GroupMessage:" in destination
                     with self.subTest(
                         personal=personal, group=group, destination=destination
                     ):
-                        same = destination == "sl:GroupMessage:g1"
                         self.assertEqual(
-                            mgr._is_memory_visible(event, memory()), personal or same
+                            mgr._is_memory_visible(event, _memory()),
+                            personal or same,
                         )
                         self.assertFalse(
-                            mgr._is_memory_visible(event, memory(owner="sl_alice"))
+                            mgr._is_memory_visible(event, _memory(owner="qq_alice"))
                         )
-                        multi = memory(
-                            owner="sl_alice",
+                        multi = _memory(
+                            owner="qq_alice",
                             visibility="group",
-                            owner_user_ids=["sl_alice", "sl_bob"],
+                            owner_user_ids=["qq_alice", "qq_bob"],
                         )
                         self.assertEqual(
                             mgr._is_memory_visible(event, multi), personal or same
                         )
                         self.assertEqual(
-                            mgr._is_memory_visible(event, memory(scope="group")),
-                            same,
-                        )
-                        self.assertEqual(
                             mgr._is_memory_visible(
-                                event, memory(scope="group", domain="facts")
-                            ),
-                            same or (group and ":GroupMessage:" in destination),
-                        )
-                        self.assertEqual(
-                            mgr._is_memory_visible(
-                                event, memory(scope="group", domain="preferences")
+                                event, _memory(scope="group", domain="")
                             ),
                             same,
                         )
                         self.assertEqual(
                             mgr._is_memory_visible(
-                                event, memory(scope="group", domain="events")
+                                event, _memory(scope="group", domain="facts")
+                            ),
+                            same or (group and is_group_destination),
+                        )
+                        self.assertEqual(
+                            mgr._is_memory_visible(
+                                event, _memory(scope="group", domain="preferences")
                             ),
                             same,
                         )
                         self.assertEqual(
-                            mgr._is_memory_visible(event, memory(scope="conversation")),
+                            mgr._is_memory_visible(
+                                event, _memory(scope="group", domain="events")
+                            ),
+                            same,
+                        )
+                        self.assertEqual(
+                            mgr._is_memory_visible(
+                                event, _memory(scope="conversation")
+                            ),
                             same,
                         )
                         self.assertTrue(
-                            mgr._is_memory_visible(event, memory(scope="global"))
+                            mgr._is_memory_visible(event, _memory(scope="global"))
                         )
                         self.assertFalse(
-                            mgr._is_memory_visible(event, memory(deprecated=True))
+                            mgr._is_memory_visible(event, _memory(deprecated=True))
                         )
                         self.assertFalse(
                             mgr._is_memory_visible(
                                 event,
-                                memory(umo="other:GroupMessage:g1", owner="other_bob"),
+                                _memory(umo="tg:GroupMessage:g1", owner="tg_other_bob"),
                             )
                         )
                         self.assertFalse(
                             mgr._is_memory_visible(
-                                event,
-                                memory(scope="group", umo="other:GroupMessage:g1"),
+                                event, _memory(scope="group", umo="tg:GroupMessage:g1")
                             )
                         )
 
     def test_explicit_group_search_in_private_has_no_filters(self):
-        mgr = MemoryManager(None, {"share_group_across_groups": True})
+        mgr = self.manager(share_group_across_groups=True)
+        private_event = real_message_event(umo=PRIVATE_UMO, sender_id="bob")
         self.assertEqual(
-            mgr._build_recall_filters(Event(), True, memory_scope="group"), []
+            mgr._build_recall_filters(private_event, True, memory_scope="group"), []
         )
-        self.assertEqual(mgr._build_recall_filters(Event("HEX"), True), [])
+        broken = real_message_event(umo=":GroupMessage:g1", sender_id="bob")
+        self.assertEqual(mgr._build_recall_filters(broken, True), [])
         self.assertFalse(
             mgr._is_memory_visible(
-                Event("sl:FriendMessage:g1", "g1"), memory(scope="group")
+                real_message_event(umo="qq:private:g1", sender_id="g1"),
+                _memory(scope="group"),
             )
         )
 
     def test_group_filter_never_relaxes_personal_scope(self):
-        mgr = MemoryManager(
-            None, {"global_memory": False, "share_group_across_groups": True}
-        )
-        event = Event("sl:GroupMessage:g2")
+        mgr = self.manager(global_memory=False, share_group_across_groups=True)
+        event = _group_event(OTHER_GROUP_UMO)
         personal_filter = mgr._scope_filter(event, "personal")
         self.assertEqual(personal_filter["umo"], event.unified_msg_origin)
-        self.assertEqual(personal_filter["owner_user_id"], "sl_bob")
+        self.assertEqual(personal_filter["owner_user_id"], "qq_bob")
         group_filter = mgr._scope_filter(event, "group")
-        self.assertEqual(group_filter["owner_session_id"], "sl_g2")
+        self.assertEqual(group_filter["owner_session_id"], "qq_g2")
         self.assertNotIn("platform_id", group_filter)
+
         recall_filters = mgr._build_recall_filters(event, True)
-        cross = [f for f in recall_filters if f.get("platform_id") == "sl"]
+        cross = [f for f in recall_filters if f.get("platform_id") == "qq"]
         self.assertEqual({f["domain"] for f in cross}, {"fact", "facts"})
         self.assertTrue(all("owner_session_id" not in f for f in cross))
+
         # 显式 domain 参数保持精确语义：fact 只查 fact，facts 只查 facts
         fact_filters = mgr._build_recall_filters(event, True, domain="fact")
         self.assertEqual(
-            {f["domain"] for f in fact_filters if f.get("platform_id") == "sl"},
+            {f["domain"] for f in fact_filters if f.get("platform_id") == "qq"},
             {"fact"},
         )
         facts_filters = mgr._build_recall_filters(event, True, domain="facts")
         self.assertEqual(
-            {f["domain"] for f in facts_filters if f.get("platform_id") == "sl"},
+            {f["domain"] for f in facts_filters if f.get("platform_id") == "qq"},
             {"facts"},
         )
         pref_filters = mgr._build_recall_filters(event, True, domain="preferences")
-        self.assertEqual([f for f in pref_filters if f.get("platform_id") == "sl"], [])
-        self.assertEqual(mgr._build_user_filter(event), {"user_id": "sl_bob"})
+        self.assertEqual([f for f in pref_filters if f.get("platform_id") == "qq"], [])
+        self.assertEqual(mgr._build_user_filter(event), {"user_id": "qq_bob"})
 
 
-class SharingReadTests(unittest.IsolatedAsyncioTestCase):
+class SharingReadTests(RealStackTestCase):
+    async def restart(self, **kwargs):
+        server = getattr(self, "server", None)
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        await self.start_stack(with_decision=False, **kwargs)
+
+    def stack_config(self, **overrides):
+        return {
+            "use_reranker": False,
+            "recall_sparse_fusion": False,
+            "max_memories_per_inject": 5,
+            **overrides,
+        }
+
     async def test_list_does_not_bypass_sharing_or_owner_checks(self):
+        seeded = [
+            ("foreign", "喜欢咖啡 coffee", _meta("facts://foreign", owner="qq_alice")),
+            ("own", "喜欢咖啡 coffee", _meta("facts://own")),
+            ("group", "喜欢咖啡 coffee", _meta("facts://group", scope="group")),
+            ("global", "喜欢咖啡 coffee", _meta("facts://global", scope="global")),
+        ]
         for personal in (False, True):
-            mgr = MemoryManager(
-                None, {"global_memory": personal, "share_group_across_groups": True}
+            await self.restart(
+                config=self.stack_config(global_memory=personal),
+                memories=seeded,
             )
-            docs = [
-                memory(owner="sl_alice", uri="facts://foreign"),
-                memory(),
-                memory(scope="group", uri="facts://group"),
-                memory(scope="global", uri="facts://global"),
-            ]
-            mgr._kb_helper = SimpleNamespace(
-                vec_db=SimpleNamespace(
-                    document_storage=SimpleNamespace(
-                        get_documents=AsyncMock(return_value=docs)
-                    )
-                )
-            )
-            mgr._shared_personal_documents = AsyncMock(return_value=[])
-            visible, total, truncated = await mgr.list_memories(Event())
-            expected = (
-                {"facts://global", "facts://coffee"} if personal else {"facts://global"}
-            )
+            event = real_message_event(umo=PRIVATE_UMO, sender_id="bob")
+            visible, total, truncated = await self.mgr.list_memories(event)
+            expected = {"facts://global"} | ({"facts://own"} if personal else set())
             self.assertEqual({d["metadata"]["uri"] for d in visible}, expected)
             self.assertEqual(total, len(expected))
             self.assertFalse(truncated)
 
     async def test_linked_foreign_private_memory_is_not_injected(self):
-        mgr = MemoryManager(None, {"global_memory": False})
-        mgr._link_manager = SimpleNamespace(
-            get_links_for_uri=AsyncMock(
-                return_value=[
-                    {"target_uri": "facts://foreign", "relation_type": "related"}
-                ]
-            ),
-            get_links_to_uri=AsyncMock(return_value=[]),
+        await self.start_stack(
+            with_decision=False,
+            config=self.stack_config(global_memory=False),
+            memories=[
+                ("global", "喜欢咖啡 coffee", _meta("facts://global", scope="global")),
+                (
+                    "foreign",
+                    "喜欢咖啡 coffee",
+                    _meta("facts://foreign", owner="qq_alice"),
+                ),
+                ("own", "喜欢咖啡 coffee", _meta("facts://own", umo=PRIVATE_UMO)),
+            ],
         )
-        for candidate in (memory(owner="sl_alice"), memory()):
-            mgr._get_memory_by_uri = AsyncMock(return_value=candidate)
-            self.assertEqual(
-                await mgr._inject_linked_memories([memory(scope="global")], Event()), []
-            )
+        await self.mgr._link_manager.add_link(
+            "facts://global", "facts://foreign", "related"
+        )
+        await self.mgr._link_manager.add_link(
+            "facts://global", "facts://own", "related"
+        )
+        event = real_message_event(umo=PRIVATE_UMO, sender_id="bob")
+        main_memory = {
+            "text": "喜欢咖啡 coffee",
+            "metadata": await self.doc_meta("facts://global"),
+        }
+
+        linked = await self.mgr._inject_linked_memories([main_memory], event)
+
+        self.assertEqual({m["metadata"]["uri"] for m in linked}, {"facts://own"})
+        recalled = await self.mgr.recall_memories(event, "coffee", top_k=5)
+        self.assertNotIn("facts://foreign", {m["metadata"]["uri"] for m in recalled})
 
     async def test_shared_personal_forget_requires_primary_owner(self):
-        shared = memory(
-            owner="sl_alice",
-            visibility="group",
-            owner_user_ids=["sl_alice", "sl_bob"],
-            kb_doc_id="doc-shared",
+        await self.start_stack(
+            with_decision=False, config=self.stack_config(global_memory=True)
         )
-        mgr = MemoryManager(None, {"global_memory": True})
-        mgr._kb_helper = SimpleNamespace(
-            vec_db=SimpleNamespace(
-                document_storage=SimpleNamespace(
-                    get_documents=AsyncMock(return_value=[shared])
-                )
+        await self.mgr.store_memory(
+            _group_event(sender="alice"),
+            "喜欢咖啡",
+            "facts",
+            uri="facts://coffee",
+            owner_sender_ids=["alice", "bob"],
+            allowed_sender_ids=["alice", "bob"],
+        )
+        shared = await self.doc_meta("facts://coffee")
+        self.assertEqual(shared["owner_user_id"], "qq_alice")
+        self.assertEqual(shared["owner_user_ids"], ["qq_alice", "qq_bob"])
+        self.assertEqual(shared["visibility"], "group")
+
+        secondary = _group_event(sender="bob")
+        self.assertEqual(await self.mgr.forget_memory(secondary, "facts://coffee"), 0)
+        self.assertEqual(
+            (await self.doc_meta("facts://coffee"))["uri"], "facts://coffee"
+        )
+
+        primary = _group_event(sender="alice")
+        self.assertEqual(await self.mgr.forget_memory(primary, "facts://coffee"), 1)
+        self.assertFalse(
+            await self.mgr.vec_db.document_storage.get_documents(
+                metadata_filters={"uri": "facts://coffee"}, limit=1
             )
         )
-        mgr._delete_by_filters = AsyncMock(return_value=0)
-
-        secondary_result = await mgr.forget_memory(Event(), "facts://coffee")
-
-        self.assertEqual(secondary_result, 0)
-        self.assertEqual(mgr._delete_by_filters.await_count, 1)
-
-        mgr._delete_by_filters.reset_mock()
-        mgr._delete_by_filters.side_effect = [0, 1]
-        primary_result = await mgr.forget_memory(
-            Event(sender="alice"), "facts://coffee"
-        )
-
-        self.assertEqual(primary_result, 1)
-        self.assertEqual(mgr._delete_by_filters.await_count, 2)
 
     async def test_membership_query_filters_before_limit_and_rechecks_switches(self):
-        from sqlalchemy import text
-        from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        self.addAsyncCleanup(engine.dispose)
-        async with engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)"
-                )
-            )
-            own = memory(
-                owner="sl_alice",
+        own = (
+            "own",
+            "喜欢咖啡 coffee",
+            _meta(
+                "facts://own",
+                owner="qq_alice",
                 visibility="group",
-                owner_user_ids=["sl_alice", "sl_bob"],
-            )
-            await conn.execute(
-                text("INSERT INTO documents VALUES (1, :text, :metadata)"),
-                {"text": own["text"], "metadata": json.dumps(own["metadata"])},
-            )
-            for i in range(2, 15):
-                foreign = memory(
-                    owner="sl_carol",
-                    visibility="group",
-                    owner_user_ids=["sl_carol", "sl_dan"],
-                )
-                await conn.execute(
-                    text("INSERT INTO documents VALUES (:id, :text, :metadata)"),
-                    {
-                        "id": i,
-                        "text": foreign["text"],
-                        "metadata": json.dumps(foreign["metadata"]),
-                    },
-                )
-        mgr = MemoryManager(None, {"global_memory": True})
-        mgr._kb_helper = SimpleNamespace(
-            vec_db=SimpleNamespace(
-                document_storage=SimpleNamespace(
-                    get_session=lambda: AsyncSession(engine)
-                )
-            )
-        )
-        found = await mgr._shared_personal_documents(Event(), limit=1)
-        self.assertEqual([d["id"] for d in found], [1])
-        mgr.has_any_active_memory = AsyncMock(return_value=True)
-        mgr._retrieve_with_filter = AsyncMock(return_value=[])
-        mgr._sparse_tokenize = False
-        recalled = await mgr.recall_memories(Event(), "coffee")
-        self.assertEqual(
-            [doc["metadata"]["uri"] for doc in recalled], ["facts://coffee"]
-        )
-        mgr.config["global_memory"] = False
-        mgr.config["share_group_across_groups"] = True
-        self.assertEqual(await mgr._shared_personal_documents(Event(), limit=1), [])
-        self.assertEqual(
-            len(
-                await mgr._shared_personal_documents(
-                    Event("sl:GroupMessage:g1"), limit=1
-                )
+                owner_user_ids=["qq_alice", "qq_bob"],
             ),
+        )
+        foreign = [
+            (
+                f"foreign-{index}",
+                "喜欢咖啡 coffee",
+                _meta(
+                    uri=f"facts://foreign-{index}",
+                    owner="qq_carol",
+                    visibility="group",
+                    owner_user_ids=["qq_carol", "qq_dan"],
+                ),
+            )
+            for index in range(13)
+        ]
+        await self.start_stack(
+            with_decision=False,
+            config=self.stack_config(global_memory=True),
+            memories=[own, *foreign],
+        )
+        # 本群之外的候选不得挤占 limit 窗口：成员过滤发生在 limit 之前
+        found = await self.mgr._shared_personal_documents(_group_event(), limit=1)
+        self.assertEqual([d["metadata"]["uri"] for d in found], ["facts://own"])
+
+        shared = await self.mgr._retrieve_shared_personal(
+            _group_event(), "coffee", 5, None
+        )
+        self.assertEqual([d["metadata"]["uri"] for d in shared], ["facts://own"])
+
+        self.mgr.config["global_memory"] = False
+        friend_event = real_message_event(umo=PRIVATE_UMO, sender_id="bob")
+        self.assertEqual(
+            await self.mgr._shared_personal_documents(friend_event, limit=1), []
+        )
+        self.assertEqual(
+            len(await self.mgr._shared_personal_documents(_group_event(), limit=1)),
             1,
         )
 
-    async def test_final_read_guard_applies_even_after_candidate_selection(self):
-        mgr = MemoryManager(None, {"global_memory": False})
-        mgr._kb_helper = SimpleNamespace()
-        mgr.has_any_active_memory = AsyncMock(return_value=True)
-        mgr._retrieve_with_filter = AsyncMock(
-            return_value=[memory(owner="sl_alice"), memory(scope="global")]
+        recalled = await self.mgr.recall_memories(_group_event(), "coffee")
+        self.assertIn("facts://own", {m["metadata"]["uri"] for m in recalled})
+        self.assertFalse(
+            any(m["metadata"]["uri"].startswith("facts://foreign") for m in recalled)
         )
-        mgr._retrieve_shared_personal = AsyncMock(return_value=[])
-        mgr._link_manager = None
-        result = await mgr.recall_memories(Event(), "coffee", top_k=5)
-        self.assertTrue(result)
+
+    async def test_final_read_guard_applies_even_after_candidate_selection(self):
+        await self.start_stack(
+            with_decision=False,
+            config=self.stack_config(global_memory=False),
+            memories=[
+                ("global", "喜欢咖啡 coffee", _meta("facts://global", scope="global")),
+                (
+                    "foreign",
+                    "喜欢咖啡 coffee",
+                    _meta("facts://foreign", owner="qq_alice"),
+                ),
+                (
+                    "shared-other-umo",
+                    "喜欢咖啡 coffee",
+                    _meta(
+                        "facts://shared-other-umo",
+                        owner="qq_alice",
+                        umo="qq:GroupMessage:g9",
+                        visibility="group",
+                        owner_user_ids=["qq_alice", "qq_bob"],
+                    ),
+                ),
+            ],
+        )
+        event = real_message_event(umo=PRIVATE_UMO, sender_id="bob")
+
+        recalled = await self.mgr.recall_memories(event, "coffee", top_k=5)
+        self.assertTrue(recalled)
+        self.assertEqual(
+            {item["metadata"]["memory_scope"] for item in recalled}, {"global"}
+        )
+
+        candidates = [
+            {"text": "喜欢咖啡 coffee", "metadata": await self.doc_meta(uri)}
+            for uri in ("facts://global", "facts://foreign", "facts://shared-other-umo")
+        ]
+        visible = self.mgr._filter_visible_shared_personal(event, candidates)
+        self.assertEqual([d["metadata"]["uri"] for d in visible], ["facts://global"])
+
+        sharing_mgr = MemoryManager(
+            self.context.kb_manager,
+            {"kb_name": self.kb_name, "global_memory": True},
+        )
+        sharing_mgr.initialize()
         self.assertTrue(
-            all(item["metadata"]["memory_scope"] == "global" for item in result)
+            sharing_mgr._is_memory_visible(
+                event, {"metadata": candidates[2]["metadata"]}
+            )
         )
 
     async def test_cross_group_prefilter_sql_only_matches_facts(self):
-        from sqlalchemy import text
-        from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        self.addAsyncCleanup(engine.dispose)
-        async with engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)"
-                )
-            )
-            rows = [
-                memory(
+        rows = [
+            (
+                "own-pref",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://own-pref",
                     scope="group",
-                    uri="facts://own-pref",
                     domain="preferences",
-                    umo="sl:GroupMessage:g2",
+                    umo=OTHER_GROUP_UMO,
                 ),
-                memory(
+            ),
+            (
+                "own-fact",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://own-fact",
                     scope="group",
-                    uri="facts://own-fact",
                     domain="facts",
-                    umo="sl:GroupMessage:g2",
+                    umo=OTHER_GROUP_UMO,
                 ),
-                memory(
-                    scope="group",
-                    uri="facts://other-fact",
-                    domain="facts",
-                    umo="sl:GroupMessage:g1",
+            ),
+            (
+                "other-fact",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://other-fact", scope="group", domain="facts", umo=GROUP_UMO
                 ),
-                memory(
+            ),
+            (
+                "other-fact-legacy",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://other-fact-legacy",
                     scope="group",
-                    uri="facts://other-fact-legacy",
                     domain="fact",
-                    umo="sl:GroupMessage:g1",
+                    umo=GROUP_UMO,
                 ),
-                memory(
+            ),
+            (
+                "other-pref",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://other-pref",
                     scope="group",
-                    uri="facts://other-pref",
                     domain="preferences",
-                    umo="sl:GroupMessage:g1",
+                    umo=GROUP_UMO,
                 ),
-                memory(
-                    scope="group",
-                    uri="facts://other-event",
-                    domain="events",
-                    umo="sl:GroupMessage:g1",
+            ),
+            (
+                "other-event",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://other-event", scope="group", domain="events", umo=GROUP_UMO
                 ),
-                memory(
-                    scope="group",
-                    uri="facts://other-nodomain",
-                    umo="sl:GroupMessage:g1",
+            ),
+            (
+                "other-nodomain",
+                "喜欢咖啡 coffee",
+                _meta(
+                    "facts://other-nodomain", scope="group", domain="", umo=GROUP_UMO
                 ),
-            ]
-            for i, doc in enumerate(rows, start=1):
-                await conn.execute(
-                    text("INSERT INTO documents VALUES (:id, :text, :metadata)"),
-                    {
-                        "id": i,
-                        "text": doc["text"],
-                        "metadata": json.dumps(doc["metadata"]),
-                    },
-                )
-        mgr = MemoryManager(None, {"share_group_across_groups": True})
+            ),
+        ]
+        await self.start_stack(
+            with_decision=False,
+            config=self.stack_config(share_group_across_groups=True),
+            memories=rows,
+        )
 
-        async def run_filters(session, filters):
+        async def run_filters(filters):
             hits = {}
             for item in filters:
-                where, params = MemoryManager._filters_to_sql(item)
-                result = await session.execute(
-                    text(f"SELECT metadata FROM documents WHERE {where}"), params
+                docs = await self.mgr.vec_db.document_storage.get_documents(
+                    metadata_filters=item, limit=100
                 )
-                for (raw,) in result.all():
-                    uri = json.loads(raw)["uri"]
+                for doc in docs:
+                    metadata = doc.get("metadata", {})
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    uri = metadata["uri"]
                     hits[uri] = hits.get(uri, 0) + 1
             return hits
 
-        event = Event("sl:GroupMessage:g2")
-        filters_list = mgr._build_recall_filters(event, True)
-        async with AsyncSession(engine) as session:
-            hits = await run_filters(session, filters_list)
-            # 显式 domain 参数：fact 只查 fact，facts 只查 facts，其他域不跨群
-            fact_hits = await run_filters(
-                session, mgr._build_recall_filters(event, True, domain="fact")
-            )
-            facts_hits = await run_filters(
-                session, mgr._build_recall_filters(event, True, domain="facts")
-            )
-            pref_hits = await run_filters(
-                session, mgr._build_recall_filters(event, True, domain="preferences")
-            )
+        event = _group_event(OTHER_GROUP_UMO)
+        filters_list = self.mgr._build_recall_filters(event, True)
+        hits = await run_filters(filters_list)
         # 本群记忆不受限，跨群 fact/facts 新旧别名均可召回
         self.assertEqual(
             set(hits),
@@ -458,16 +550,33 @@ class SharingReadTests(unittest.IsolatedAsyncioTestCase):
                 "facts://other-fact-legacy",
             },
         )
-        self.assertEqual(fact_hits, {"facts://other-fact-legacy": 1})
-        self.assertEqual(set(facts_hits), {"facts://own-fact", "facts://other-fact"})
-        self.assertEqual(pref_hits, {"facts://own-pref": 1})
+        self.assertEqual(
+            await run_filters(
+                self.mgr._build_recall_filters(event, True, domain="fact")
+            ),
+            {"facts://other-fact-legacy": 1},
+        )
+        self.assertEqual(
+            set(
+                await run_filters(
+                    self.mgr._build_recall_filters(event, True, domain="facts")
+                )
+            ),
+            {"facts://own-fact", "facts://other-fact"},
+        )
+        self.assertEqual(
+            await run_filters(
+                self.mgr._build_recall_filters(event, True, domain="preferences")
+            ),
+            {"facts://own-pref": 1},
+        )
         # 本群 facts 被本群与跨群过滤器重复命中，按 uri 去重后分页不受影响
         self.assertGreater(hits["facts://own-fact"], 1)
+
         # 稀疏通道本地过滤与 SQL 预过滤一致
-        for doc in rows:
-            meta = doc["metadata"]
+        for _, _, metadata in rows:
             local_hit = any(
-                MemoryManager._matches_filters(meta, filters)
+                MemoryManager._matches_filters(metadata, filters)
                 for filters in filters_list
             )
-            self.assertEqual(meta["uri"] in hits, local_hit, meta["uri"])
+            self.assertEqual(metadata["uri"] in hits, local_hit, metadata["uri"])

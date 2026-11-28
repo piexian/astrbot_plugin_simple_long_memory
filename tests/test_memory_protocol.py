@@ -14,34 +14,26 @@ def _memory(index: int) -> dict:
 
 
 class FormatMemoryForUserTests(unittest.TestCase):
-    def test_empty_memory_store(self):
-        result = format_memory_for_user([], page=1, total=0)
+    def test_user_formatting_pagination_boundaries(self):
+        self.assertEqual(format_memory_for_user([], page=1, total=0), "暂无记忆")
+        self.assertEqual(format_memory_for_user([], page=3, total=20), "当前分页不存在")
 
-        self.assertEqual(result, "暂无记忆")
-
-    def test_out_of_range_page(self):
-        result = format_memory_for_user([], page=3, total=20)
-
-        self.assertEqual(result, "当前分页不存在")
-
-    def test_last_page_does_not_show_next_page_hint(self):
-        result = format_memory_for_user(
+        # 末页不再提示下一页
+        last_page = format_memory_for_user(
             [_memory(index) for index in range(11, 21)],
             page=2,
             total=20,
         )
+        self.assertNotIn("查看下一页", last_page)
 
-        self.assertNotIn("查看下一页", result)
-
-    def test_non_last_global_page_shows_next_page_hint(self):
-        result = format_memory_for_user(
+        # 非末页的全局列表给出翻页命令
+        first_page = format_memory_for_user(
             [_memory(index) for index in range(1, 11)],
             page=1,
             total=20,
             all_mode=True,
         )
-
-        self.assertIn("提示: /memory list --all 2 查看下一页", result)
+        self.assertIn("提示: /memory list --all 2 查看下一页", first_page)
 
     def test_injection_uses_configured_timezone_and_update_state(self):
         result = format_memory_for_injection(

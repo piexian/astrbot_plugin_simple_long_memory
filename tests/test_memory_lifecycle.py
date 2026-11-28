@@ -1,27 +1,35 @@
-"""TTL 生命周期与自动提取同归属查重回归。
+"""TTL 生命周期、归属查重、启动恢复、待写缓冲与重建闭环回归。
 
 全部基于真实 AstrBot 组件：DocumentStorage/FaissVecDB（真实 SQLite/FAISS）、
-OpenAIEmbeddingProvider 经本地 HTTP 测试服务驱动，不模拟任何 AstrBot 接口。
+MemoryPlugin/MemoryManager 真实实例，Embedding 请求由 real_stack 的本地 HTTP
+测试服务应答，不模拟任何 AstrBot 接口。
 """
+
+from __future__ import annotations
 
 import json
 import tempfile
-import threading
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from astrbot.core.db.vec_db.faiss_impl.document_storage import DocumentStorage
-from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
-from astrbot.core.provider.sources.openai_embedding_source import (
-    OpenAIEmbeddingProvider,
+from real_stack import (
+    RealStackTestCase,
+    make_memory_meta,
+    memory_manager_module,
+    real_message_event,
 )
 from sqlalchemy import text as sa_text
-from test_memory_commands import MemoryManager, memory_manager_module
 
+MemoryManager = memory_manager_module.MemoryManager
 TTL_EXPIRE_SET_CLAUSE = memory_manager_module.TTL_EXPIRE_SET_CLAUSE
 TTL_EXPIRE_WHERE_CLAUSE = memory_manager_module.TTL_EXPIRE_WHERE_CLAUSE
+
+COFFEE_VECTOR = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+RUNNING_VECTOR = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+RECENT_CREATED_AT = "2026-11-27T00:00:00+00:00"
 
 
 def _meta(
@@ -50,6 +58,11 @@ def _meta(
     if last_recalled_at is not None:
         meta["last_recalled_at"] = last_recalled_at
     return meta
+
+
+def _doc_metadata(doc: dict) -> dict:
+    raw = doc.get("metadata", {})
+    return json.loads(raw) if isinstance(raw, str) else raw
 
 
 class TtlExpiryTests(unittest.IsolatedAsyncioTestCase):
@@ -119,179 +132,285 @@ class TtlExpiryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(marked, len(deprecated))
 
 
-class _EmbeddingsHandler(BaseHTTPRequestHandler):
-    """本地 OpenAI embeddings 测试服务：按文本内容返回确定性向量。"""
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        payload = json.loads(self.rfile.read(length) or b"{}")
-        texts = payload.get("input", [])
-        if isinstance(texts, str):
-            texts = [texts]
-        data = [
-            {
-                "object": "embedding",
-                "index": index,
-                "embedding": [1.0, 0.0] if "咖啡" in str(text) else [0.0, 1.0],
-            }
-            for index, text in enumerate(texts)
-        ]
-        body = json.dumps(
-            {
-                "object": "list",
-                "data": data,
-                "model": payload.get("model", "test-model"),
-                "usage": {"prompt_tokens": 1, "total_tokens": 1},
-            }
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
-
-class ScopedDedupTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dedup_stays_within_scope_and_owner(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingsHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        port = server.server_address[1]
-
-        provider = OpenAIEmbeddingProvider(
-            {
-                "id": "test-embed",
-                "embedding_api_base": f"http://127.0.0.1:{port}/v1",
-                "embedding_api_key": "test-key",
-                "embedding_model": "test-model",
-                "embedding_dimensions": "2",
-                "timeout": 10,
-            },
-            {},
+class ScopedDedupTests(RealStackTestCase):
+    async def asyncSetUp(self):
+        await self.start_stack(with_decision=False)
+        # 用真实 embedding 服务为不同文本返回精确向量：咖啡 与 跑步 正交
+        self.server.set_embedding_vectors(
+            {"咖啡": COFFEE_VECTOR, "跑步": RUNNING_VECTOR}
         )
-        self.addAsyncCleanup(provider.terminate)
-        with tempfile.TemporaryDirectory() as directory:
-            vec_db = FaissVecDB(
-                str(Path(directory) / "documents.db"),
-                str(Path(directory) / "vectors.faiss"),
-                provider,
-            )
-            await vec_db.initialize()
-            self.addAsyncCleanup(vec_db.close)
-            mgr = MemoryManager(None, {})
-            base = {"is_memory_record": True, "deprecated": False, "kb_id": "kb1"}
-            await vec_db.insert(
-                "用户喜欢咖啡",
-                {
-                    **base,
-                    "uri": "facts://a",
-                    "memory_scope": "personal",
-                    "owner_user_id": "qq_u1",
-                    "umo": "qq:private:u1",
-                },
-                "a",
-            )
-            await vec_db.insert(
-                "用户喜欢咖啡",
-                {
-                    **base,
-                    "uri": "facts://b",
-                    "memory_scope": "personal",
-                    "owner_user_id": "qq_u2",
-                    "umo": "qq:private:u2",
-                },
-                "b",
-            )
-            await vec_db.insert(
-                "用户喜欢咖啡",
-                {
-                    **base,
-                    "uri": "facts://shared",
-                    "memory_scope": "personal",
-                    "owner_user_id": "qq_u1",
-                    "owner_user_ids": ["qq_u1", "qq_u2"],
-                    "visibility": "group",
-                    "umo": "qq:group:g1",
-                },
-                "shared",
-            )
-            await vec_db.insert(
-                "群友都喜欢咖啡",
-                {
-                    **base,
-                    "uri": "facts://c",
-                    "memory_scope": "group",
-                    "owner_session_id": "qq_g1",
-                    "umo": "qq:group:g1",
-                },
-                "c",
-            )
+        kb_id = self.mgr._kb_helper.kb.kb_id
+        base = {
+            "is_memory_record": True,
+            "deprecated": False,
+            "kb_id": kb_id,
+            "created_at": RECENT_CREATED_AT,
+        }
+        await self.mgr.vec_db.insert(
+            "用户喜欢咖啡",
+            {
+                **base,
+                "uri": "facts://a",
+                "memory_scope": "personal",
+                "owner_user_id": "qq_u1",
+                "umo": "qq:private:u1",
+            },
+            "a",
+        )
+        await self.mgr.vec_db.insert(
+            "用户喜欢咖啡",
+            {
+                **base,
+                "uri": "facts://b",
+                "memory_scope": "personal",
+                "owner_user_id": "qq_u2",
+                "umo": "qq:private:u2",
+            },
+            "b",
+        )
+        await self.mgr.vec_db.insert(
+            "用户喜欢咖啡",
+            {
+                **base,
+                "uri": "facts://shared",
+                "memory_scope": "personal",
+                "owner_user_id": "qq_u1",
+                "owner_user_ids": ["qq_u1", "qq_u2"],
+                "visibility": "group",
+                "umo": "qq:group:g1",
+            },
+            "shared",
+        )
+        await self.mgr.vec_db.insert(
+            "群友都喜欢咖啡",
+            {
+                **base,
+                "uri": "facts://c",
+                "memory_scope": "group",
+                "owner_session_id": "qq_g1",
+                "umo": "qq:group:g1",
+            },
+            "c",
+        )
 
-            async def dedup(content, scope, session_id, umo, owner="", owners=None):
-                return await mgr.find_scoped_duplicate(
-                    content=content,
-                    memory_scope=scope,
-                    platform_id="qq",
-                    session_id=session_id,
-                    umo=umo,
-                    owner_user_id=owner,
-                    owner_user_ids=owners,
-                    vec_db=vec_db,
-                )
+    async def _dedup(self, content, scope, session_id, umo, owner="", owners=None):
+        return await self.mgr.find_scoped_duplicate(
+            content=content,
+            memory_scope=scope,
+            platform_id="qq",
+            session_id=session_id,
+            umo=umo,
+            owner_user_id=owner,
+            owner_user_ids=owners,
+            vec_db=self.mgr.vec_db,
+        )
 
-            # 同作用域同归属高相似命中
-            self.assertEqual(
-                await dedup("喜欢咖啡", "personal", "u1", "qq:private:u1", "qq_u1"),
-                "facts://a",
+    async def test_dedup_stays_within_scope_and_owner(self):
+        # 同作用域同归属高相似命中
+        self.assertEqual(
+            await self._dedup("喜欢咖啡", "personal", "u1", "qq:private:u1", "qq_u1"),
+            "facts://a",
+        )
+        # 旧记录归属集合不足时，不能阻止新共同归属者写入
+        self.assertIsNone(
+            await self._dedup(
+                "喜欢咖啡",
+                "personal",
+                "u1",
+                "qq:private:u1",
+                owners=["qq_u1", "qq_u3"],
             )
-            # 旧记录归属集合不足时，不能阻止新共同归属者写入
-            self.assertIsNone(
-                await dedup(
-                    "喜欢咖啡",
-                    "personal",
-                    "u1",
-                    "qq:private:u1",
-                    owners=["qq_u1", "qq_u3"],
-                )
+        )
+        self.assertEqual(
+            await self._dedup(
+                "喜欢咖啡",
+                "personal",
+                "u1",
+                "qq:private:u1",
+                owners=["qq_u1", "qq_u2"],
+            ),
+            "facts://shared",
+        )
+        # 同文不同主不命中（不跨归属查重）
+        self.assertIsNone(
+            await self._dedup("喜欢咖啡", "personal", "u3", "qq:private:u3", "qq_u3")
+        )
+        # 群分区只命中本群记忆
+        self.assertEqual(
+            await self._dedup("喜欢咖啡", "group", "g1", "qq:group:g1"),
+            "facts://c",
+        )
+        self.assertIsNone(await self._dedup("喜欢咖啡", "group", "g2", "qq:group:g2"))
+        # 低相似度不命中
+        self.assertIsNone(
+            await self._dedup("讨厌跑步", "personal", "u1", "qq:private:u1", "qq_u1")
+        )
+        # global_memory=False 时 personal 查重限定同一会话
+        self.mgr.config["global_memory"] = False
+        self.assertEqual(
+            await self._dedup("喜欢咖啡", "personal", "u1", "qq:private:u1", "qq_u1"),
+            "facts://a",
+        )
+        self.assertIsNone(
+            await self._dedup("喜欢咖啡", "personal", "u1", "qq:group:g9", "qq_u1")
+        )
+
+
+class _KvPluginCase(RealStackTestCase):
+    """真实 MemoryPlugin + 真实 KV 回调的公共装配方。"""
+
+    async def start_kv_stack(self):
+        await self.start_stack(with_decision=False, with_plugin=True)
+        self.plugin.plugin_id = f"test/{uuid.uuid4().hex}"
+        self.wire_kv(self.mgr)
+        return self.mgr
+
+    def wire_kv(self, manager):
+        manager._kv_put = self.plugin.put_kv_data
+        manager._kv_get = self.plugin.get_kv_data
+        manager._kv_delete = self.plugin.delete_kv_data
+        self.plugin.memory_mgr = manager
+
+
+class StartupRecoveryTests(_KvPluginCase):
+    async def _record_order(self, manager):
+        order = []
+        original_connect = manager.connect_kb
+        original_cleanup = manager.cleanup_orphan_links
+        original_recover = self.plugin._recover_interrupted_rebuild
+        original_scheduler = self.plugin._start_scheduler
+
+        async def connect():
+            order.append("connect")
+            return await original_connect()
+
+        async def cleanup():
+            order.append("cleanup")
+            return await original_cleanup()
+
+        async def recover():
+            order.append("recover")
+            return await original_recover()
+
+        async def scheduler():
+            order.append("scheduler")
+            return await original_scheduler()
+
+        manager.connect_kb = connect
+        manager.cleanup_orphan_links = cleanup
+        self.plugin._recover_interrupted_rebuild = recover
+        self.plugin._start_scheduler = scheduler
+        return order
+
+    async def _seed_orphan_link(self, manager):
+        await manager.link_manager.add_link(
+            "facts://ghost", "facts://missing", "related", reason="孤儿关联"
+        )
+        self.assertEqual(await manager.link_manager.count_links(), 1)
+
+    async def test_orphan_cleanup_follows_recovery_when_kb_already_connected(self):
+        await self.start_kv_stack()
+        await self._seed_orphan_link(self.mgr)
+        order = await self._record_order(self.mgr)
+
+        await self.plugin.on_loaded()
+
+        self.assertEqual(order, ["recover", "cleanup"])
+        self.assertEqual(await self.mgr.link_manager.count_links(), 0)
+
+    async def test_reconnect_path_orders_connect_recover_cleanup_scheduler(self):
+        await self.start_kv_stack()
+        await self._seed_orphan_link(self.mgr)
+        restarted = MemoryManager(self.context.kb_manager, dict(self.config))
+        restarted.initialize()
+        self.assertFalse(restarted.is_kb_connected)
+        self.wire_kv(restarted)
+        order = await self._record_order(restarted)
+
+        await self.plugin.on_loaded()
+
+        self.assertTrue(restarted.is_kb_connected)
+        self.assertEqual(order, ["connect", "recover", "cleanup", "scheduler"])
+        self.assertEqual(await restarted.link_manager.count_links(), 0)
+
+
+class PendingWriteRecoveryTests(_KvPluginCase):
+    async def test_offline_pending_writes_flush_into_real_kb_after_recovery(self):
+        await self.start_kv_stack()
+        event = real_message_event(
+            umo="qq:FriendMessage:u1", sender_id="u1", sender_name="小明"
+        )
+        self.mgr._rebuilding = True
+        uri = await self.mgr.store_memory(event, "用户喜欢喝手冲咖啡", "facts")
+        self.assertEqual([item["uri"] for item in self.mgr._pending_writes], [uri])
+        persisted = await self.plugin.get_kv_data("rebuild_pending_writes", None)
+        self.assertEqual(
+            [item["content"] for item in persisted], ["用户喜欢喝手冲咖啡"]
+        )
+        self.assertEqual(await self.active_docs(), [])
+        self.mgr._rebuilding = False
+
+        # 模拟进程重启：新管理器连上真实 KB 后从 KV 恢复缓冲写入
+        restarted = MemoryManager(self.context.kb_manager, dict(self.config))
+        restarted.initialize()
+        await restarted.connect_kb()
+        self.wire_kv(restarted)
+        await self.plugin.on_loaded()
+
+        self.assertEqual(restarted._pending_writes, [])
+        self.assertIsNone(await self.plugin.get_kv_data("rebuild_pending_writes", None))
+        docs = await restarted.vec_db.document_storage.get_documents(
+            metadata_filters={"uri": uri}, limit=5
+        )
+        self.assertEqual(len(docs), 1)
+        metadata = _doc_metadata(docs[0])
+        self.assertTrue(metadata.get("is_memory_record"))
+        self.assertIn("手冲咖啡", docs[0]["text"])
+        hits = await restarted.vec_db.retrieve("手冲咖啡", k=3)
+        self.assertEqual({_doc_metadata(hit.data)["uri"] for hit in hits}, {uri})
+
+
+class RebuildLifecycleTests(_KvPluginCase):
+    async def test_rebuild_keeps_active_memories_and_link_edges(self):
+        await self.start_kv_stack()
+        kb_id = self.mgr._kb_helper.kb.kb_id
+        for doc_id, uri, content in (
+            ("doc-coffee", "facts://coffee", "用户喜欢喝手冲咖啡"),
+            ("doc-city", "facts://city", "用户常驻杭州"),
+        ):
+            await self.mgr.vec_db.insert(
+                content,
+                make_memory_meta(uri, kb_id=kb_id, created_at=RECENT_CREATED_AT),
+                doc_id,
             )
-            self.assertEqual(
-                await dedup(
-                    "喜欢咖啡",
-                    "personal",
-                    "u1",
-                    "qq:private:u1",
-                    owners=["qq_u1", "qq_u2"],
-                ),
-                "facts://shared",
-            )
-            # 同文不同主不命中（不跨归属查重）
-            self.assertIsNone(
-                await dedup("喜欢咖啡", "personal", "u3", "qq:private:u3", "qq_u3")
-            )
-            # 群分区只命中本群记忆
-            self.assertEqual(
-                await dedup("喜欢咖啡", "group", "g1", "qq:group:g1"),
-                "facts://c",
-            )
-            self.assertIsNone(await dedup("喜欢咖啡", "group", "g2", "qq:group:g2"))
-            # 低相似度不命中
-            self.assertIsNone(
-                await dedup("讨厌跑步", "personal", "u1", "qq:private:u1", "qq_u1")
-            )
-            # global_memory=False 时 personal 查重限定同一会话
-            mgr.config["global_memory"] = False
-            self.assertEqual(
-                await dedup("喜欢咖啡", "personal", "u1", "qq:private:u1", "qq_u1"),
-                "facts://a",
-            )
-            self.assertIsNone(
-                await dedup("喜欢咖啡", "personal", "u1", "qq:group:g9", "qq_u1")
-            )
+        await self.mgr.link_manager.add_link(
+            "facts://coffee", "facts://city", "related", reason="同一用户"
+        )
+        self.assertEqual(await self.mgr.link_manager.count_links(), 1)
+
+        result = await self.mgr.rebuild_memories()
+
+        self.assertFalse(self.mgr.is_rebuilding)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["success"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["verification"]["passed"])
+        documents = await self.active_docs()
+        self.assertEqual(
+            {_doc_metadata(doc)["uri"] for doc in documents},
+            {"facts://coffee", "facts://city"},
+        )
+        hits = await self.mgr.vec_db.retrieve("手冲咖啡", k=5)
+        self.assertTrue(hits)
+        self.assertEqual(await self.mgr.link_manager.count_links(), 1)
+        links = await self.mgr.link_manager.get_links_for_uri(
+            "facts://coffee", injectable_only=False, min_confidence=0.0, limit=10
+        )
+        self.assertEqual(
+            [(link["target_uri"], link["relation_type"]) for link in links],
+            [("facts://city", "related")],
+        )
 
 
 if __name__ == "__main__":

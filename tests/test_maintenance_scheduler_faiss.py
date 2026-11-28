@@ -1,11 +1,9 @@
 """后台整理调度与 FAISS 向量读取回归测试。"""
 
-import json
 import sys
 import unittest
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import faiss
 import numpy as np
@@ -15,6 +13,7 @@ if str(PROJECT_PARENT) not in sys.path:
     sys.path.insert(0, str(PROJECT_PARENT))
 
 from astrbot_plugin_simple_long_memory.memory_manager import MemoryManager  # noqa: E402
+from real_stack import EMBED_DIM, RealStackTestCase, make_memory_meta  # noqa: E402
 
 from maintenance.scheduler import (  # noqa: E402
     _is_in_maintenance_window,
@@ -92,46 +91,33 @@ class FaissIDMapRegressionTests(unittest.TestCase):
         self.assertIn("999", detail)
 
 
-class ActiveMemoryVectorLoadTests(unittest.IsolatedAsyncioTestCase):
+class ActiveMemoryVectorLoadTests(RealStackTestCase):
     async def test_active_memory_fetch_loads_id_map_vectors_and_counts_missing(self):
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(3))
-        index.add_with_ids(
-            np.asarray([[4.0, 5.0, 6.0]], dtype=np.float32),
-            np.asarray([303], dtype=np.int64),
+        await self.start_stack(with_decision=False)
+        await self.mgr.vec_db.insert(
+            "with vector",
+            make_memory_meta("facts://with-vector"),
+            "doc-with-vector",
+        )
+        # 只写 SQLite 文档不写 FAISS 向量，模拟索引与文档不同步
+        await self.mgr.vec_db.document_storage.insert_document(
+            "doc-without-vector",
+            "without vector",
+            make_memory_meta("facts://without-vector"),
         )
 
-        class DocumentStorage:
-            async def get_documents(self, **kwargs):
-                self.filters = kwargs
-                return [
-                    {
-                        "id": 303,
-                        "text": "with vector",
-                        "metadata": json.dumps({"uri": "memory://303"}),
-                    },
-                    {
-                        "id": 999,
-                        "text": "without vector",
-                        "metadata": json.dumps({"uri": "memory://999"}),
-                    },
-                ]
-
-        vec_db = SimpleNamespace(
-            document_storage=DocumentStorage(),
-            embedding_storage=SimpleNamespace(index=index),
-        )
-        manager = MemoryManager(kb_mgr=None, config={})
-        manager._kb_helper = SimpleNamespace(vec_db=vec_db)
-        memories = await manager.get_all_active_memories(limit=10)
-
-        self.assertEqual(memories[0]["vector"], [4.0, 5.0, 6.0])
-        self.assertIsNone(memories[1]["vector"])
-        self.assertEqual(manager.last_active_memory_stats["vectors_loaded"], 1)
-        self.assertEqual(manager.last_active_memory_stats["vectors_missing"], 1)
+        memories = await self.mgr.get_all_active_memories(limit=10)
+        vectors = {memory["uri"]: memory["vector"] for memory in memories}
         self.assertEqual(
-            manager.last_active_memory_stats["missing_by_reason"],
-            {"id_not_found": 1},
+            set(vectors), {"facts://with-vector", "facts://without-vector"}
         )
+        self.assertEqual(len(vectors["facts://with-vector"]), EMBED_DIM)
+        self.assertIsNone(vectors["facts://without-vector"])
+
+        stats = self.mgr.last_active_memory_stats
+        self.assertEqual(stats["vectors_loaded"], 1)
+        self.assertEqual(stats["vectors_missing"], 1)
+        self.assertEqual(stats["missing_by_reason"], {"id_not_found": 1})
 
 
 if __name__ == "__main__":
